@@ -48,6 +48,44 @@ kubectl run -it --rm redis-cli --image=redis:alpine --restart=Never -- \
     redis-cli -h marekvs
 ```
 
+## Routing clients to the nearest node
+
+Because any marekvs node serves any key, *which* pod a client lands on never
+affects correctness — only latency. Better: it compounds. The node a client
+talks to read-through-caches every key that client touches and subscribes to
+its updates (interest leases), so consistently routing a client to the same
+nearby node builds a working set exactly where it is used.
+
+The example's client service ships with:
+
+```yaml
+trafficDistribution: PreferClose        # same zone first (k8s ≥ 1.31)
+```
+
+Three tiers, pick per cluster version and appetite:
+
+| Setting | Semantics | Needs |
+|---|---|---|
+| `trafficDistribution: PreferClose` | same-zone endpoints first, falls back anywhere | k8s ≥ 1.31 (GA 1.33) |
+| `trafficDistribution: PreferSameNode` | same-node first, then closest, falls back anywhere | k8s ≥ 1.34 (beta, on by default) |
+| `marekvs-local` service (`internalTrafficPolicy: Local`) | same node **only** — connection refused if the node runs no marekvs pod | any k8s; every client node must run marekvs |
+
+On k8s ≥ 1.34, flip the value in `services.yaml` to `PreferSameNode` — that
+is the "client pods use the marekvs on their own node when there is one"
+behavior with a safe fallback. The strict `marekvs-local` service exists for
+setups where marekvs runs on every node clients run on (replicas ≈ node
+count); its failure mode is a refused connection, not a slower one, so
+treat it as an opt-in for latency-critical clients.
+
+Two caveats:
+
+- Routing is decided **per TCP connection**. Redis clients pool and hold
+  connections, so a pod gets its locality at connect time and keeps it —
+  restarts/reconnects re-resolve to the then-closest pod.
+- Read-your-writes holds per connection. A client alternating between two
+  connections to *different* nodes can briefly read stale values — same AP
+  semantics as always, locality routing doesn't change it.
+
 ## Scaling — the rules that keep your data
 
 Two invariants do all the work:

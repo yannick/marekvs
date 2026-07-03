@@ -1,5 +1,6 @@
 # Client entry point — one stable name; any node serves any key (AP design),
-# so plain round-robin across ready pods is correct.
+# so locality-based routing is purely a latency optimization, never a
+# correctness concern.
 apiVersion: v1
 kind: Service
 metadata:
@@ -13,8 +14,34 @@ spec:
     - port: 6379
       targetPort: resp
       name: resp
+  # Route new connections to the topologically closest marekvs pod.
+  #   PreferClose      — same zone first (k8s ≥ 1.31, GA 1.33)
+  #   PreferSameNode   — same node first, then closest (k8s ≥ 1.34, beta)
+  # marekvs rewards this: the node a client talks to read-through-caches and
+  # subscribes to exactly the keys that client uses (see k8s/README.md).
+  trafficDistribution: PreferClose
   # sessionAffinity: ClientIP — optional; TCP connections are already sticky,
   # affinity only helps clients that reconnect often (read-your-writes UX).
+---
+# OPTIONAL strict node-local entry: only ever routes to a marekvs pod on the
+# SAME node as the client — and REFUSES the connection if that node runs no
+# marekvs pod (no fallback!). Use only when every client node also runs
+# marekvs (e.g. replicas ≥ node count, or a DaemonSet-shaped cluster), and
+# point latency-critical clients at "marekvs-local" instead of "marekvs".
+apiVersion: v1
+kind: Service
+metadata:
+  name: marekvs-local
+  labels:
+    app: marekvs
+spec:
+  selector:
+    app: marekvs
+  internalTrafficPolicy: Local
+  ports:
+    - port: 6379
+      targetPort: resp
+      name: resp
 ---
 # Headless service — gossip seed discovery + StatefulSet pod identity.
 apiVersion: v1
