@@ -210,6 +210,22 @@ k8s-delete:
     kubectl delete -k {{k8s_dir}}
     @printf '{{yellow}}PVCs kept. To destroy data: kubectl delete pvc -l app=marekvs{{reset}}\n'
 
+# regenerate k8s/operator/crd.yaml from the Rust types
+[group('kubernetes')]
+operator-crd:
+    cargo run -q -p marekvs-operator -- crd > {{k8s_dir}}/operator/crd.yaml
+    @printf '{{bold}}{{green}}✓ {{k8s_dir}}/operator/crd.yaml regenerated{{reset}}\n'
+
+# install the operator (CRD + RBAC + deployment); example CR: k8s/operator/example-cluster.yaml
+[group('kubernetes')]
+operator-apply:
+    kubectl apply -k {{k8s_dir}}/operator
+
+# remove the operator; NOTE: deleting the CRD deletes all MarekvsClusters!
+[group('kubernetes')]
+operator-delete:
+    kubectl delete -k {{k8s_dir}}/operator
+
 # ══ bench (marekvs vs KeyDB) ═════════════════════════════════════════════
 
 bench_requests := env_var_or_default("BENCH_REQUESTS", "20000")

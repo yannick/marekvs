@@ -1,8 +1,17 @@
 # marekvs on Kubernetes — example deployment
 
-A minimal, production-shaped deployment: a 3-node marekvs cluster with
-replication factor 2, per-pod persistent volumes, graceful drain, and a
-disruption budget. Full rationale lives in
+Two ways to run marekvs:
+
+1. **Plain manifests** (this directory) — a 3-node cluster you scale by
+   hand, following the runbook below. Zero moving parts beyond Kubernetes.
+2. **The operator** ([`operator/`](operator/)) — a `MarekvsCluster` CRD
+   whose controller automates that runbook and adds **autoscaling**. See
+   [the operator section](#the-operator-automated--autoscaled) below and
+   [design/12-operator.md](../design/12-operator.md).
+
+The plain example: a minimal, production-shaped deployment with replication
+factor 2, per-pod persistent volumes, graceful drain, and a disruption
+budget. Full rationale lives in
 [design/07-kubernetes.md](../design/07-kubernetes.md).
 
 ```sh
@@ -186,6 +195,39 @@ on different hosts and zones to begin with.
 Each pod drains (preStop → Leaving), restarts with its PVC, and rejoins via
 the fast path — no bulk data movement. The readiness probe gates the next
 pod, so the update naturally respects the health rule.
+
+## The operator: automated + autoscaled
+
+Everything under "Scaling" above is a runbook — the operator in
+[`operator/`](operator/) executes it for you and adds load-based sizing:
+
+```sh
+just operator-apply                              # CRD + RBAC + controller
+kubectl apply -f k8s/operator/example-cluster.yaml
+kubectl get mkv                                  # watch it work
+# NAME   DESIRED  READY  UNDERREP  OPS/S    PHASE
+# demo   3        3      0         4231.0   Healthy
+```
+
+A `MarekvsCluster` resource replaces the hand-written StatefulSet, Services
+and PDB (the controller generates them — same shape as this directory's
+manifests). With `spec.autoscale` set, the controller sizes the cluster to
+`ceil(total_ops / targetOpsPerNode)` within `[minNodes, maxNodes]`:
+
+- **scale-up** happens immediately (one cooldown between steps) and jumps
+  straight to the needed size — adding nodes never endangers data;
+- **scale-down** removes one node per stabilization window, with hysteresis
+  (only when there is real headroom), and each removal passes the same
+  gate you would check by hand: all pods ready and
+  `underreplicated_partitions == 0`. When the gate fails, the CR reports
+  `phase: Blocked` with the reason instead of proceeding.
+
+PVCs of scaled-away nodes are kept by default (scale-up resumes from them);
+set `reclaimPvcs: true` to have the controller delete them once the cluster
+is provably whole again.
+
+Without `spec.autoscale`, the operator manages a fixed `spec.nodes` — you
+still get the safe stepping, PVC handling, and status reporting.
 
 ## Caveats
 

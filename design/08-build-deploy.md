@@ -45,7 +45,7 @@ static). This is a known hot decision; benchmarked in
 
 ```dockerfile
 # ---- build stage ----------------------------------------------------------
-FROM rust:1.86-alpine AS build
+FROM rust:1-alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 # cache dependency graph

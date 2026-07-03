@@ -8,6 +8,7 @@ members = [
     "crates/marekvs-cluster",
     "crates/marekvs-repl",
     "crates/marekvs-server",
+    "crates/marekvs-operator",
 ]
 
 [workspace.package]

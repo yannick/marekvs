@@ -6,18 +6,21 @@
 #   just apple-build      (Apple container CLI)
 
 # ---- build stage ----------------------------------------------------------
-FROM rust:1.87-alpine AS build
+FROM rust:1-alpine AS build
 RUN apk add --no-cache musl-dev build-base
 WORKDIR /src
 COPY ondadb/ ondadb/
 COPY marekvs/ marekvs/
 WORKDIR /src/marekvs
-RUN cargo build --release -p marekvs-server \
- && cp target/release/marekvs-server /marekvs
+RUN cargo build --release -p marekvs-server -p marekvs-operator \
+ && cp target/release/marekvs-server /marekvs \
+ && cp target/release/marekvs-operator /marekvs-operator
 
 # ---- runtime stage --------------------------------------------------------
 FROM scratch
 COPY --from=build /marekvs /marekvs
+# Operator in the same image: deployments set command: ["/marekvs-operator"].
+COPY --from=build /marekvs-operator /marekvs-operator
 # No USER baked in: docker named volumes mount root-owned, and scratch has no
 # way to chown. Kubernetes deployments set runAsUser/fsGroup via
 # securityContext instead (design/07).

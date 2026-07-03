@@ -1,0 +1,27 @@
+# A MarekvsCluster with autoscaling: the operator sizes the cluster between
+# 3 and 8 nodes so that each node carries ~5000 commands/sec, scaling down
+# one node at a time and only while every partition is fully replicated.
+apiVersion: marekvs.io/v1alpha1
+kind: MarekvsCluster
+metadata:
+  name: demo
+spec:
+  image: ghcr.io/yannick/marekvs:latest
+  replicationFactor: 2
+  storage:
+    size: 10Gi
+    # className: local-nvme
+  resources:
+    cpu: "1"
+    memory: 1Gi
+  autoscale:
+    minNodes: 3
+    maxNodes: 8
+    targetOpsPerNode: 5000
+    scaleDownStabilizationSeconds: 300
+    scaleUpCooldownSeconds: 60
+  # Keep volumes of scaled-away nodes (default). Set true to have the
+  # operator delete them once the cluster is fully replicated again.
+  reclaimPvcs: false
+  extraEnv:
+    RUST_LOG: info

@@ -20,6 +20,8 @@ via the [ondaDB](../ondadb) LSM engine — no in-memory dataset.
 - **Lua scripting**: EVAL/EVALSHA with Redis-grade atomicity for scripts
   whose keys co-locate (hash tags `{...}`); script *effects* replicate, never
   the script ([scripting](design/11-lua-scripting.md))
+- **Kubernetes operator**: `MarekvsCluster` CRD with safe one-node-at-a-time
+  scale-down and ops/s-based autoscaling ([operator](design/12-operator.md))
 - **OS-less images**: static binary in a `FROM scratch` container
 
 Full design documentation lives in [design/](design/README.md).
@@ -47,6 +49,7 @@ just ci             # fmt-check + clippy + tests
 
 just k8s-apply      # example Kubernetes deployment (see k8s/README.md
 just k8s-status     # for safe dynamic scale-up/down without data loss)
+just operator-apply # CRD-based operator with autoscaling (design/12)
 
 just bench          # benchmark vs KeyDB (both in docker) → bench/report.md
 just bench-report   # re-render the report from accumulated results
@@ -87,6 +90,7 @@ redis-cli smembers tags
 | `marekvs-cluster` | chitchat gossip, HRW placement |
 | `marekvs-repl` | replication ring, peer mesh, interest leases, Merkle anti-entropy, bootstrap |
 | `marekvs-server` | binary: config + wiring |
+| `marekvs-operator` | binary: Kubernetes operator — `MarekvsCluster` CRD, safe scaling, autoscaling |
 
 ## Consistency notes (read before production use)
 

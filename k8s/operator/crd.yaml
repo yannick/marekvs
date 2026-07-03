@@ -1,0 +1,190 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: marekvsclusters.marekvs.io
+spec:
+  group: marekvs.io
+  names:
+    categories: []
+    kind: MarekvsCluster
+    plural: marekvsclusters
+    shortNames:
+    - mkv
+    singular: marekvscluster
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.desiredNodes
+      name: Desired
+      type: integer
+    - jsonPath: .status.readyNodes
+      name: Ready
+      type: integer
+    - jsonPath: .status.underreplicatedPartitions
+      name: Underrep
+      type: integer
+    - jsonPath: .status.opsPerSecond
+      name: Ops/s
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for MarekvsClusterSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              autoscale:
+                description: Enable ops/s-driven autoscaling.
+                nullable: true
+                properties:
+                  maxNodes:
+                    description: Ceiling.
+                    format: int32
+                    type: integer
+                  minNodes:
+                    description: Floor. Clamped up to replicationFactor+1 regardless of this value.
+                    format: int32
+                    type: integer
+                  scaleDownStabilizationSeconds:
+                    default: 300
+                    description: |-
+                      How long the load must stay low before removing a node (also the
+                      minimum gap between two scale-downs).
+                    format: int64
+                    type: integer
+                  scaleUpCooldownSeconds:
+                    default: 60
+                    description: Minimum gap between two scale-ups.
+                    format: int64
+                    type: integer
+                  targetOpsPerNode:
+                    description: |-
+                      Sustained commands/sec one node should carry. The controller sizes
+                      the cluster as ceil(total_ops / target) with hysteresis.
+                    format: double
+                    type: number
+                required:
+                - maxNodes
+                - minNodes
+                - targetOpsPerNode
+                type: object
+              extraEnv:
+                additionalProperties:
+                  type: string
+                description: Extra environment for the marekvs container (e.g. RUST_LOG).
+                type: object
+              image:
+                description: Container image for the marekvs nodes.
+                type: string
+              nodes:
+                default: 3
+                description: |-
+                  Desired node count. With `autoscale` set this is only the initial
+                  size; the controller then owns the count within [minNodes, maxNodes].
+                format: int32
+                type: integer
+              reclaimPvcs:
+                default: false
+                description: |-
+                  Delete the PVCs of scaled-away ordinals once the cluster is fully
+                  replicated again. Default false: volumes are kept so a later
+                  scale-up resumes from existing data.
+                type: boolean
+              replicationFactor:
+                default: 2
+                description: |-
+                  MAREKVS_REPLICAS_N: how many nodes hold each partition. The
+                  controller never lets the cluster shrink below replicationFactor+1.
+                format: int32
+                type: integer
+              resources:
+                default: {}
+                description: |-
+                  Container resources (memory request is also used as the limit — no
+                  burst-OOM surprises; CPU is a request only, never a limit).
+                properties:
+                  cpu:
+                    description: CPU request (no limit is ever set — throttling hurts tail latency).
+                    nullable: true
+                    type: string
+                  memory:
+                    description: Memory request AND limit.
+                    nullable: true
+                    type: string
+                type: object
+              storage:
+                default:
+                  size: 10Gi
+                properties:
+                  className:
+                    description: StorageClass; cluster default when unset. Prefer local NVMe.
+                    nullable: true
+                    type: string
+                  size:
+                    default: 10Gi
+                    description: PVC size per node.
+                    type: string
+                type: object
+            required:
+            - image
+            type: object
+          status:
+            nullable: true
+            properties:
+              desiredNodes:
+                description: |-
+                  The controller's current node-count target (spec.nodes or the
+                  autoscaler's decision).
+                format: int32
+                nullable: true
+                type: integer
+              lastOpsTotal:
+                description: Rate-sample state (survives controller restarts).
+                format: double
+                nullable: true
+                type: number
+              lastSampleEpoch:
+                format: int64
+                nullable: true
+                type: integer
+              lastScaleEpoch:
+                description: |-
+                  Unix seconds of the last completed scale operation; gates the
+                  autoscaler's cooldown/stabilization windows.
+                format: int64
+                nullable: true
+                type: integer
+              message:
+                nullable: true
+                type: string
+              opsPerSecond:
+                description: |-
+                  Cluster-wide command rate from the last two metric samples,
+                  stringified to keep the CRD schema integer-free (printer column).
+                nullable: true
+                type: string
+              phase:
+                description: Reconciling | Healthy | ScalingUp | ScalingDown | Blocked
+                nullable: true
+                type: string
+              readyNodes:
+                format: int32
+                nullable: true
+                type: integer
+              underreplicatedPartitions:
+                description: Worst value observed across nodes; 0 = safe to scale down.
+                format: int64
+                nullable: true
+                type: integer
+            type: object
+        required:
+        - spec
+        title: MarekvsCluster
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

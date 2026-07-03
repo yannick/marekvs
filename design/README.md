@@ -19,6 +19,7 @@ Kubernetes-native, built for performance.
 | [09-performance.md](09-performance.md) | Targets, hot paths, ondadb tuning, benchmark plan |
 | [10-testing.md](10-testing.md) | Merge-law property tests, Jepsen, chaos, churn tests |
 | [11-lua-scripting.md](11-lua-scripting.md) | EVAL/EVALSHA: atomic same-pid scripts, distributed caveats + solutions |
+| [12-operator.md](12-operator.md) | Kubernetes operator: MarekvsCluster CRD, safe scaling, ops/s autoscaling |
 
 Reading order for newcomers: 00 → 01 → 02 → 04 → 05. The single source of
 truth for all tunables is the defaults table in

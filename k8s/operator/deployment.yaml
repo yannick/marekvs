@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: marekvs-operator
+  labels:
+    app: marekvs-operator
+spec:
+  replicas: 1 # reconciliation is idempotent but not leader-elected yet
+  selector:
+    matchLabels:
+      app: marekvs-operator
+  template:
+    metadata:
+      labels:
+        app: marekvs-operator
+    spec:
+      serviceAccountName: marekvs-operator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+      containers:
+        - name: operator
+          # same image as the server — it carries both binaries
+          image: ghcr.io/yannick/marekvs:latest
+          command: ["/marekvs-operator"]
+          env:
+            - name: RUST_LOG
+              value: info,kube=warn
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
