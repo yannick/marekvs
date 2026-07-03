@@ -143,6 +143,7 @@ docker-build: _stage-ctx
 # start a 3-node cluster via docker compose (ports 16379-16381)
 [group('docker')]
 docker-up:
+    ./tests/preflight.sh 16379 16380 16381
     docker compose -f {{compose}} up -d --build
     ./tests/wait_ready.sh localhost 16379 16380 16381
 
@@ -152,11 +153,15 @@ docker-down:
     docker compose -f {{compose}} down -v
 
 # convergence + replication tests against the compose cluster
+# (teardown runs even on failure — a leftover cluster leaks counter state
+# into the next run and every assertion inherits garbage)
 [group('docker')]
 docker-test: docker-up
+    #!/usr/bin/env bash
+    set -euo pipefail
+    trap 'just docker-down' EXIT
     ./tests/cluster_test.sh localhost 16379 16380 16381
-    just docker-down
-    @printf '{{bold}}{{green}}✓ docker cluster test passed{{reset}}\n'
+    printf '{{bold}}{{green}}✓ docker cluster test passed{{reset}}\n'
 
 # ══ apple containers ═════════════════════════════════════════════════════
 
@@ -177,11 +182,14 @@ apple-down:
     ./tests/apple_cluster.sh down
 
 # convergence + replication tests against the apple-container cluster
+# (teardown runs even on failure, same reasoning as docker-test)
 [group('apple')]
 apple-test: apple-up
+    #!/usr/bin/env bash
+    set -euo pipefail
+    trap './tests/apple_cluster.sh down' EXIT
     ./tests/apple_cluster.sh test
-    just apple-down
-    @printf '{{bold}}{{green}}✓ apple cluster test passed{{reset}}\n'
+    printf '{{bold}}{{green}}✓ apple cluster test passed{{reset}}\n'
 
 # ══ kubernetes ═══════════════════════════════════════════════════════════
 
@@ -233,6 +241,7 @@ bench_requests := env_var_or_default("BENCH_REQUESTS", "20000")
 # start both engines in docker (marekvs :16391, keydb :16390)
 [group('bench')]
 bench-up: docker-build
+    ./tests/preflight.sh 16390 16391
     docker run -d --rm --name bench-keydb -p 16390:6379 eqalpha/keydb:latest \
         keydb-server --server-threads 4 --appendonly no
     docker run -d --rm --name bench-marekvs -p 16391:6379 \
@@ -248,12 +257,16 @@ bench-down:
     docker volume rm bench-marekvs-data 2>/dev/null || true
 
 # run the workload matrix on both engines, then render the report
+# (bench-down always runs; a leftover engine skews the next campaign)
 [group('bench')]
 bench: bench-up
+    #!/usr/bin/env bash
+    set -euo pipefail
+    trap 'just bench-down' EXIT
+    ./tests/preflight.sh
     mkdir -p bench
     ./bench/run_workloads.sh keydb   localhost 16390 {{bench_requests}} >> bench/results.csv
     ./bench/run_workloads.sh marekvs localhost 16391 {{bench_requests}} >> bench/results.csv
-    just bench-down
     just bench-report
 
 # re-render bench/report.md from accumulated bench/results.csv

@@ -10,6 +10,8 @@
 set -euo pipefail
 
 BIN=${1:?usage: replicaof.sh <marekvs-server-binary>}
+
+"$(dirname "$0")/preflight.sh"
 MASTER_PORT=16400
 MAREK_PORT=16401
 DIR=$(mktemp -d)

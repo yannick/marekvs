@@ -4,6 +4,8 @@
 set -euo pipefail
 
 HOST=${1:?}; P0=${2:?}; P1=${3:?}; P2=${4:?}
+
+"$(dirname "$0")/preflight.sh"   # stray-hog + load sanity; cluster ports are in use by design
 R0="redis-cli -h $HOST -p $P0"
 R1="redis-cli -h $HOST -p $P1"
 R2="redis-cli -h $HOST -p $P2"

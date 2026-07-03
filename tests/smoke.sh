@@ -8,6 +8,8 @@ PORT=${2:-16379}
 DIR=$(mktemp -d)
 R="redis-cli -p $PORT"
 
+"$(dirname "$0")/preflight.sh" "$PORT" 17373 19122
+
 cleanup() { kill "$SRV" 2>/dev/null || true; rm -rf "$DIR"; }
 trap cleanup EXIT
 
