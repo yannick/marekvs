@@ -1,0 +1,14 @@
+# Blocks voluntary evictions (node drains, cluster upgrades) from taking the
+# cluster below the safe floor. With MAREKVS_REPLICAS_N=2, two live nodes are
+# the minimum that keeps every partition replicated.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: marekvs
+  labels:
+    app: marekvs
+spec:
+  minAvailable: 2 # keep ≥ MAREKVS_REPLICAS_N pods up at all times
+  selector:
+    matchLabels:
+      app: marekvs

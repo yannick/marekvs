@@ -1,18 +1,38 @@
-# marekvs — all project commands. `just --list` for overview.
+# marekvs — all project commands. Run `just` for the menu.
 
 set shell := ["bash", "-cu"]
 
 image   := "marekvs:dev"
 compose := "deploy/compose.yaml"
+k8s_dir := "k8s"
 
+# ── ANSI palette ─────────────────────────────────────────────────────────
+reset  := '\033[0m'
+bold   := '\033[1m'
+dim    := '\033[2m'
+red    := '\033[31m'
+green  := '\033[32m'
+yellow := '\033[33m'
+blue   := '\033[34m'
+purple := '\033[35m'
+cyan   := '\033[36m'
+
+# colorful command menu (also: `just --list`)
+[private]
 default:
-    @just --list
+    @printf '{{bold}}{{purple}}\n  ┌─────────────────────────────────────────────────┐\n'
+    @printf '  │  marekvs — distributed Redis-compatible KV      │\n'
+    @printf '  │  AP · disk-native (ondadb) · Kubernetes-native  │\n'
+    @printf '  └─────────────────────────────────────────────────┘{{reset}}\n\n'
+    @just --list --unsorted --list-heading '' --color always
+    @printf '\n{{dim}}docs: design/README.md · k8s example: k8s/README.md{{reset}}\n'
 
-# ── ondadb source selection ──────────────────────────────────────────────
+# ══ build ════════════════════════════════════════════════════════════════
 
 # ondadb comes from git (Cargo.toml) unless a sibling checkout exists at
 # ../ondadb, in which case a [patch] in .cargo/config.toml redirects to it.
 # Regenerated before every build so the state always matches reality.
+[private]
 _cargo-config:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -23,67 +43,84 @@ _cargo-config:
         rm -f .cargo/config.toml
     fi
 
-# ── build ────────────────────────────────────────────────────────────────
-
 # debug build of the whole workspace
+[group('build')]
 build: _cargo-config
+    @printf '{{bold}}{{blue}}▸ building workspace (debug){{reset}}\n'
     cargo build --workspace
 
 # optimized release build
+[group('build')]
 release: _cargo-config
+    @printf '{{bold}}{{blue}}▸ building workspace (release){{reset}}\n'
     cargo build --workspace --release
 
 # type-check quickly without codegen
+[group('build')]
 check: _cargo-config
     cargo check --workspace --all-targets
 
-# ── quality ──────────────────────────────────────────────────────────────
+# ══ quality ══════════════════════════════════════════════════════════════
 
+# auto-format all crates (rustfmt)
+[group('quality')]
 fmt:
     cargo fmt --all
 
+# verify formatting without changing files (CI mode)
+[group('quality')]
 fmt-check:
     cargo fmt --all --check
 
+# lint the whole workspace; warnings are errors
+[group('quality')]
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
 
 # fmt-check + clippy + tests: the CI gate
+[group('quality')]
 ci: fmt-check clippy test
+    @printf '{{bold}}{{green}}✓ CI gate passed{{reset}}\n'
 
-# ── test ─────────────────────────────────────────────────────────────────
+# ══ test ═════════════════════════════════════════════════════════════════
 
 # unit + integration tests for all crates
+[group('test')]
 test: _cargo-config
     cargo test --workspace
 
 # merge-law property tests only (design/10 §10.1)
+[group('test')]
 test-merge:
     cargo test -p marekvs-core --test merge_laws
 
 # single-node end-to-end smoke test via redis-cli against a local server
+[group('test')]
 test-smoke: build
     ./tests/smoke.sh target/debug/marekvs-server
 
 # REPLICAOF: follow a real redis master (redis-server, or redis in docker)
+[group('test')]
 test-replicaof: build
     ./tests/replicaof.sh target/debug/marekvs-server
 
-# ── run ──────────────────────────────────────────────────────────────────
+# ══ run ══════════════════════════════════════════════════════════════════
 
 # run a single local node (data in ./.data/n0)
+[group('run')]
 run *ARGS:
     MAREKVS_DATA_DIR=.data/n0 cargo run -p marekvs-server -- {{ARGS}}
 
 # run a local 3-node cluster on ports 6379/6380/6381 (foreground, ctrl-c stops all)
+[group('run')]
 run-cluster: build
     ./tests/local_cluster.sh target/debug/marekvs-server 3
 
-# ── docker ───────────────────────────────────────────────────────────────
+# ══ docker ═══════════════════════════════════════════════════════════════
 
-# Stage a clean build context containing marekvs + the ondadb sibling.
-# The staged tree always gets the [patch] config so the container build uses
-# the copied ondadb and never needs git credentials (the repo is private).
+# Stage a clean build context containing marekvs + the ondadb sibling, with
+# the [patch] config so the container build uses the copied ondadb.
+[private]
 _stage-ctx:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -98,46 +135,87 @@ _stage-ctx:
     printf '[patch."https://github.com/yannick/ondadb.git"]\nondadb = { path = "../ondadb" }\n' > .build-ctx/marekvs/.cargo/config.toml
 
 # build the FROM-scratch image (native arch)
+[group('docker')]
 docker-build: _stage-ctx
+    @printf '{{bold}}{{cyan}}▸ docker build → {{image}}{{reset}}\n'
     docker build -f .build-ctx/marekvs/Dockerfile -t {{image}} .build-ctx
 
-# 3-node cluster via docker compose
+# start a 3-node cluster via docker compose (ports 16379-16381)
+[group('docker')]
 docker-up:
     docker compose -f {{compose}} up -d --build
     ./tests/wait_ready.sh localhost 16379 16380 16381
 
+# stop the compose cluster and delete its volumes
+[group('docker')]
 docker-down:
     docker compose -f {{compose}} down -v
 
-# smoke + convergence tests against the compose cluster
+# convergence + replication tests against the compose cluster
+[group('docker')]
 docker-test: docker-up
     ./tests/cluster_test.sh localhost 16379 16380 16381
     just docker-down
+    @printf '{{bold}}{{green}}✓ docker cluster test passed{{reset}}\n'
 
-# ── apple containers (container CLI) ─────────────────────────────────────
+# ══ apple containers ═════════════════════════════════════════════════════
 
-# build the image with Apple's container CLI
+# build the image with Apple's `container` CLI
+[group('apple')]
 apple-build: _stage-ctx
     container system start || true
     container build -f .build-ctx/marekvs/Dockerfile -t {{image}} .build-ctx
 
-# 3-node cluster using apple containers
+# start a 3-node cluster using apple containers
+[group('apple')]
 apple-up: apple-build
     ./tests/apple_cluster.sh up {{image}}
 
+# stop and remove the apple-container cluster
+[group('apple')]
 apple-down:
     ./tests/apple_cluster.sh down
 
-# smoke + convergence tests against the apple-container cluster
+# convergence + replication tests against the apple-container cluster
+[group('apple')]
 apple-test: apple-up
     ./tests/apple_cluster.sh test
     just apple-down
+    @printf '{{bold}}{{green}}✓ apple cluster test passed{{reset}}\n'
 
-# ── benchmarks (marekvs vs KeyDB) ────────────────────────────────────────
+# ══ kubernetes ═══════════════════════════════════════════════════════════
+
+# apply the example deployment from k8s/ (see k8s/README.md)
+[group('kubernetes')]
+k8s-apply:
+    kubectl apply -k {{k8s_dir}}
+
+# pods, PVCs and replication health of the running deployment
+[group('kubernetes')]
+k8s-status:
+    kubectl get statefulset,pods,pvc -l app=marekvs
+    @printf '{{dim}}replication health — 0 means fully replicated:{{reset}}\n'
+    -kubectl run marekvs-probe --rm -i --restart=Never --quiet --image=curlimages/curl -- \
+        -s http://marekvs-0.marekvs-headless:9121/metrics \
+        | grep -E '^marekvs_cluster_(underreplicated_partitions|effective_rf_min|members)'
+
+# scale the cluster to N nodes (data-safe; see k8s/README.md for the rules)
+[group('kubernetes')]
+k8s-scale n:
+    kubectl scale statefulset marekvs --replicas={{n}}
+
+# delete the example deployment (keeps PVCs — data survives)
+[group('kubernetes')]
+k8s-delete:
+    kubectl delete -k {{k8s_dir}}
+    @printf '{{yellow}}PVCs kept. To destroy data: kubectl delete pvc -l app=marekvs{{reset}}\n'
+
+# ══ bench (marekvs vs KeyDB) ═════════════════════════════════════════════
 
 bench_requests := env_var_or_default("BENCH_REQUESTS", "20000")
 
 # start both engines in docker (marekvs :16391, keydb :16390)
+[group('bench')]
 bench-up: docker-build
     docker run -d --rm --name bench-keydb -p 16390:6379 eqalpha/keydb:latest \
         keydb-server --server-threads 4 --appendonly no
@@ -147,11 +225,14 @@ bench-up: docker-build
         -v bench-marekvs-data:/data {{image}}
     ./tests/wait_ready.sh localhost 16390 16391
 
+# stop both bench engines and delete the bench volume
+[group('bench')]
 bench-down:
     docker rm -f bench-keydb bench-marekvs 2>/dev/null || true
     docker volume rm bench-marekvs-data 2>/dev/null || true
 
 # run the workload matrix on both engines, then render the report
+[group('bench')]
 bench: bench-up
     mkdir -p bench
     ./bench/run_workloads.sh keydb   localhost 16390 {{bench_requests}} >> bench/results.csv
@@ -160,19 +241,25 @@ bench: bench-up
     just bench-report
 
 # re-render bench/report.md from accumulated bench/results.csv
+[group('bench')]
 bench-report:
     python3 bench/report.py bench/results.csv bench/report.md
+    @printf '{{bold}}{{green}}✓ report → bench/report.md{{reset}}\n'
 
 # wipe accumulated results before a fresh campaign
+[group('bench')]
 bench-clean:
     rm -f bench/results.csv bench/report.md
 
-# ── misc ─────────────────────────────────────────────────────────────────
+# ══ housekeeping ═════════════════════════════════════════════════════════
 
+# remove build artifacts and local run data
+[group('housekeeping')]
 clean:
     cargo clean
     rm -rf .data
 
-# wipe local run data only
+# wipe local run data only (keeps compiled artifacts)
+[group('housekeeping')]
 clean-data:
     rm -rf .data

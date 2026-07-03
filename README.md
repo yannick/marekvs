@@ -45,6 +45,9 @@ just apple-test     # 3-node apple-container cluster + convergence tests
 
 just ci             # fmt-check + clippy + tests
 
+just k8s-apply      # example Kubernetes deployment (see k8s/README.md
+just k8s-status     # for safe dynamic scale-up/down without data loss)
+
 just bench          # benchmark vs KeyDB (both in docker) → bench/report.md
 just bench-report   # re-render the report from accumulated results
 ```

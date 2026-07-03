@@ -1,0 +1,40 @@
+# Client entry point — one stable name; any node serves any key (AP design),
+# so plain round-robin across ready pods is correct.
+apiVersion: v1
+kind: Service
+metadata:
+  name: marekvs
+  labels:
+    app: marekvs
+spec:
+  selector:
+    app: marekvs
+  ports:
+    - port: 6379
+      targetPort: resp
+      name: resp
+  # sessionAffinity: ClientIP — optional; TCP connections are already sticky,
+  # affinity only helps clients that reconnect often (read-your-writes UX).
+---
+# Headless service — gossip seed discovery + StatefulSet pod identity.
+apiVersion: v1
+kind: Service
+metadata:
+  name: marekvs-headless
+  labels:
+    app: marekvs
+spec:
+  clusterIP: None
+  # CRITICAL: a Joining pod is unready by design but must still resolve its
+  # peers through this name to bootstrap.
+  publishNotReadyAddresses: true
+  selector:
+    app: marekvs
+  ports:
+    - port: 7946
+      name: gossip
+      protocol: UDP
+    - port: 7373
+      name: mesh
+    - port: 9121
+      name: metrics

@@ -1,0 +1,115 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: marekvs
+  labels:
+    app: marekvs
+spec:
+  serviceName: marekvs-headless
+  replicas: 3 # never scale below MAREKVS_REPLICAS_N + 1 (see README)
+  podManagementPolicy: Parallel # join/leave ordering is gossip's job, not k8s's
+  selector:
+    matchLabels:
+      app: marekvs
+  template:
+    metadata:
+      labels:
+        app: marekvs
+    spec:
+      # SIGTERM → Leaving phase → last ring entries flush → exit (~3s);
+      # the generous budget covers slow gossip propagation under load.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534 # image is FROM scratch; only /data must be writable
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: marekvs
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: marekvs
+      containers:
+        - name: marekvs
+          # Build and push your own: `just docker-build` then retag, or use CI.
+          image: ghcr.io/yannick/marekvs:latest
+          ports:
+            - containerPort: 6379
+              name: resp
+            - containerPort: 7373
+              name: mesh
+            - containerPort: 7946
+              name: gossip
+              protocol: UDP
+            - containerPort: 9121
+              name: metrics
+          env:
+            # NodeId comes from the pod hostname ordinal (marekvs-3 → 3);
+            # no MAREKVS_NODE_ID needed in a StatefulSet.
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # chitchat re-resolves this DNS name, so one seed entry covers
+            # every pod behind the headless service.
+            - name: MAREKVS_SEEDS
+              value: "marekvs-headless.$(NAMESPACE).svc.cluster.local:7946"
+            - name: MAREKVS_ADVERTISE_IP
+              value: "auto" # self-detects the pod IP
+            - name: MAREKVS_REPLICAS_N
+              value: "2" # replication factor; every partition on 2 nodes
+            - name: MAREKVS_DATA_DIR
+              value: /data
+            - name: RUST_LOG
+              value: info
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              memory: 1Gi # request = limit: no burst-OOM surprises
+              # no CPU limit: throttling hurts tail latency
+          lifecycle:
+            preStop:
+              httpGet:
+                port: metrics
+                path: /drain # phase → Leaving before SIGTERM lands
+          startupProbe:
+            httpGet:
+              port: metrics
+              path: /ready
+            failureThreshold: 180 # up to 6 min for long bootstraps
+            periodSeconds: 2
+          readinessProbe:
+            httpGet:
+              port: metrics
+              path: /ready # 200 while Active|Leaving (serves during drain)
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              port: metrics
+              path: /alive # process + shard threads responsive
+            initialDelaySeconds: 10
+            periodSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app: marekvs
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 10Gi
+        # storageClassName: local-nvme  # prefer local PVs for performance
