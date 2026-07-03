@@ -1,0 +1,24 @@
+[package]
+name = "marekvs-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+marekvs-core.workspace = true
+marekvs-resp.workspace = true
+ondadb.workspace = true
+tokio.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+prometheus.workspace = true
+xxhash-rust.workspace = true
+mlua.workspace = true
+sha1_smol.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

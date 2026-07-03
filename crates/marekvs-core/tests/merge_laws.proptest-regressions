@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d8d690be2e8c08cd68442c9b03b064a746ad8169bf086044902fd76a3ca38a5c # shrinks to a = Add { hlc: 8, origin: 3, val: [] }, b = Rm { hlc: 1, origin: 0, observed: [Dot { hlc: 8, origin: 3 }] }
+cc 26f28754edeac09b55b6f50d1833a15d67cf0692948a248b1f48998b5667dc06 # shrinks to ops = [Add { hlc: 47, origin: 1, val: [] }, Rm { hlc: 1, origin: 0, observed: [Dot { hlc: 47, origin: 1 }] }, Add { hlc: 1, origin: 0, val: [] }]
+cc f5df897500bf521d40ddb0f248c0731ceb239d92cbe0403728d5d260a827e983 # shrinks to a = Add { hlc: 8, origin: 3, val: [] }, b = Add { hlc: 1, origin: 0, val: [] }, c = Rm { hlc: 1, origin: 0, observed: [Dot { hlc: 8, origin: 3 }] }
+cc ae204fdf55e3649f5cd33a290df782d7e0c240f402953c33b4a3105db516710c # shrinks to a = Add { hlc: 46, origin: 3, val: [] }, b = Add { hlc: 46, origin: 3, val: [0] }

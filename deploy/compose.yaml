@@ -1,0 +1,67 @@
+# 3-node marekvs cluster for local testing: `just docker-up` / `just docker-test`.
+name: marekvs
+
+x-common: &common
+  image: marekvs:dev
+  networks:
+    mkv:
+  environment: &common-env
+    MAREKVS_REPLICAS_N: "2"
+    RUST_LOG: info,chitchat=warn
+
+services:
+  marekvs-0:
+    <<: *common
+    container_name: marekvs-0
+    environment:
+      <<: *common-env
+      MAREKVS_NODE_ID: "0"
+      MAREKVS_ADVERTISE_IP: 172.28.5.10
+      MAREKVS_SEEDS: 172.28.5.10:7946,172.28.5.11:7946,172.28.5.12:7946
+      MAREKVS_DATA_DIR: /data
+    networks:
+      mkv:
+        ipv4_address: 172.28.5.10
+    ports: ["16379:6379"]
+    volumes: [mkv0:/data]
+
+  marekvs-1:
+    <<: *common
+    container_name: marekvs-1
+    environment:
+      <<: *common-env
+      MAREKVS_NODE_ID: "1"
+      MAREKVS_ADVERTISE_IP: 172.28.5.11
+      MAREKVS_SEEDS: 172.28.5.10:7946,172.28.5.11:7946,172.28.5.12:7946
+      MAREKVS_DATA_DIR: /data
+    networks:
+      mkv:
+        ipv4_address: 172.28.5.11
+    ports: ["16380:6379"]
+    volumes: [mkv1:/data]
+
+  marekvs-2:
+    <<: *common
+    container_name: marekvs-2
+    environment:
+      <<: *common-env
+      MAREKVS_NODE_ID: "2"
+      MAREKVS_ADVERTISE_IP: 172.28.5.12
+      MAREKVS_SEEDS: 172.28.5.10:7946,172.28.5.11:7946,172.28.5.12:7946
+      MAREKVS_DATA_DIR: /data
+    networks:
+      mkv:
+        ipv4_address: 172.28.5.12
+    ports: ["16381:6379"]
+    volumes: [mkv2:/data]
+
+networks:
+  mkv:
+    ipam:
+      config:
+        - subnet: 172.28.5.0/24
+
+volumes:
+  mkv0:
+  mkv1:
+  mkv2:

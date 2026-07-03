@@ -1,0 +1,841 @@
+//! marekvs-repl — asynchronous replication (design/04) and anti-entropy
+//! (design/05): commit-hook → ring → per-peer fan-out, interest-based
+//! read-through with leases, Merkle repair, partition bootstrap.
+
+pub mod ae;
+pub mod mesh;
+pub mod ring;
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use marekvs_cluster::Cluster;
+use marekvs_core::envelope::Envelope;
+use marekvs_core::ikey::{self, Pid};
+use marekvs_core::NodeId;
+use marekvs_engine::store::{self, Store};
+use marekvs_engine::{Engine, ReadThrough};
+use marekvs_proto::{PeerMsg, ReplBatch, ReplOp};
+use mesh::Mesh;
+use parking_lot::Mutex;
+use ring::Ring;
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, oneshot};
+
+pub const INTEREST_LEASE: Duration = Duration::from_secs(60);
+pub const FETCH_TIMEOUT: Duration = Duration::from_millis(300);
+pub const AE_ROUND: Duration = Duration::from_secs(5);
+const BATCH_MAX_OPS: usize = 256;
+
+type InterestMap = HashMap<Pid, HashMap<Vec<u8>, HashMap<NodeId, Instant>>>;
+
+pub struct ReplEngine {
+    pub store: Arc<Store>,
+    pub engine: Arc<Engine>,
+    pub cluster: Arc<Cluster>,
+    pub mesh: Arc<Mesh>,
+    pub ring: Arc<Ring>,
+    /// Home side: who is interested in which key (design/04 §Interest).
+    interest: Mutex<InterestMap>,
+    /// Subscriber side: freshness leases per user key.
+    leases: Mutex<HashMap<Vec<u8>, Instant>>,
+    /// In-flight fetch/check requests.
+    pending: Mutex<HashMap<u64, oneshot::Sender<PeerMsg>>>,
+    next_req: AtomicU64,
+    /// Per-peer cursor into OUR ring (advances on send; reset by ResumeFrom).
+    cursors: Mutex<HashMap<NodeId, u64>>,
+}
+
+impl ReplEngine {
+    /// Wire everything and spawn the background tasks. `mesh_listener` is the
+    /// bound peer-mesh TCP listener.
+    pub async fn start(
+        store: Arc<Store>,
+        engine: Arc<Engine>,
+        cluster: Arc<Cluster>,
+        mesh_listener: TcpListener,
+        standalone_cfg: bool,
+    ) -> Arc<ReplEngine> {
+        let (incoming_tx, incoming_rx) = mpsc::channel(8192);
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let mesh = Mesh::new(
+            store.node_id,
+            incoming_tx,
+            events_tx,
+            Some((
+                engine.metrics.mesh_input_bytes_total.clone(),
+                engine.metrics.mesh_output_bytes_total.clone(),
+            )),
+        );
+        let ring = Ring::new();
+        ring.standalone_cfg
+            .store(standalone_cfg, std::sync::atomic::Ordering::Relaxed);
+
+        let repl = Arc::new(ReplEngine {
+            store: store.clone(),
+            engine: engine.clone(),
+            cluster: cluster.clone(),
+            mesh: mesh.clone(),
+            ring: ring.clone(),
+            interest: Mutex::new(HashMap::new()),
+            leases: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            next_req: AtomicU64::new(1),
+            cursors: Mutex::new(HashMap::new()),
+        });
+
+        // 1. Commit hook: every committed batch enters the ring (skip the
+        //    node-local zset score index, tag 'Z').
+        {
+            let ring = ring.clone();
+            store.set_commit_hook(Some(Arc::new(move |seq: u64, ops: &[ondadb::CommitOp]| {
+                // Configured-standalone with no discovered members → nobody
+                // will ever read the ring; skip the per-record clones. See
+                // Ring::buffering_needed for why this must NOT be gated on
+                // runtime connectivity.
+                if !ring.buffering_needed() {
+                    return;
+                }
+                let mut grouped: Vec<(u16, Vec<ReplOp>)> = Vec::new();
+                for op in ops {
+                    if matches!(ikey::parse(&op.key), Some(p) if p.tag == b'Z') {
+                        continue;
+                    }
+                    let origin = Envelope::decode(&op.value).map_or(u16::MAX, |(e, _)| e.origin);
+                    let rop = ReplOp {
+                        ikey: op.key.clone(),
+                        value: op.value.clone(),
+                    };
+                    match grouped.last_mut() {
+                        Some((o, v)) if *o == origin => v.push(rop),
+                        _ => grouped.push((origin, vec![rop])),
+                    }
+                }
+                for (origin, ops) in grouped {
+                    ring.push(origin, Some(seq), ops);
+                }
+            })));
+        }
+
+        // 2. Mesh listener + dialers driven by membership view.
+        tokio::spawn(mesh.clone().run_listener(mesh_listener));
+        repl.clone().spawn_view_watcher();
+
+        // 3. Incoming message pump.
+        repl.clone().spawn_incoming(incoming_rx);
+
+        // 4. Peer (re)connect events: send ResumeFrom on connect.
+        repl.clone().spawn_peer_events(events_rx);
+
+        // 5. Sender loop: drain the ring to peers.
+        repl.clone().spawn_sender();
+
+        // 6. Anti-entropy rounds.
+        repl.clone().spawn_ae();
+
+        // 7. Pub/sub cluster fan-out.
+        {
+            let mesh = mesh.clone();
+            engine
+                .pubsub
+                .set_cluster_hook(Box::new(move |channel, payload| {
+                    mesh.broadcast_ctl(&PeerMsg::Publish {
+                        channel: channel.to_vec(),
+                        payload: payload.to_vec(),
+                    });
+                }));
+        }
+
+        // 8. Read-through hook for the engine.
+        engine.set_read_through(repl.clone());
+
+        // 9. Metrics stats task: ring/cluster/mesh gauges every 2 s.
+        repl.clone().spawn_stats();
+
+        repl
+    }
+
+    fn spawn_stats(self: Arc<Self>) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let m = &self.engine.metrics;
+                let (ops, bytes) = self.ring.occupancy();
+                m.ring_ops.set(ops as i64);
+                m.ring_bytes.set(bytes as i64);
+                m.mesh_peers.set(self.mesh.connected_peers().len() as i64);
+                let stats = self.cluster.cluster_stats();
+                m.cluster_members.set(stats.members as i64);
+                m.cluster_underreplicated_partitions
+                    .set(stats.underreplicated_partitions as i64);
+                m.cluster_effective_rf_min
+                    .set(stats.effective_rf_min as i64);
+                m.cluster_owned_partitions
+                    .set(self.cluster.owned_pids().len() as i64);
+            }
+        });
+    }
+
+    fn req_id(&self) -> u64 {
+        self.next_req.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn pseudo_rand(&self) -> u64 {
+        // xxh3 of a monotonic value: good enough for peer picking/jitter.
+        xxhash_rust::xxh3::xxh3_64(&store::now_ms().to_le_bytes())
+            ^ self.next_req.fetch_add(1, Ordering::Relaxed)
+    }
+
+    // ------------------------------------------------------------------
+    // background tasks
+    // ------------------------------------------------------------------
+
+    fn spawn_view_watcher(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut watch = self.cluster.watch();
+            let mut dialed: HashMap<NodeId, ()> = HashMap::new();
+            loop {
+                let view = self.cluster.view();
+                self.ring
+                    .members
+                    .store(view.members.len(), std::sync::atomic::Ordering::Relaxed);
+                for m in &view.members {
+                    // Lower id dials (design/04 §Transport).
+                    if m.node > self.store.node_id && !dialed.contains_key(&m.node) {
+                        dialed.insert(m.node, ());
+                        self.mesh.clone().maintain_peer(m.node, m.mesh_addr).await;
+                    }
+                }
+                self.request_bootstraps(&view).await;
+                if watch.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// For newly-owned, locally-empty partitions ask an existing owner for a
+    /// bootstrap stream (design/06 §Join).
+    async fn request_bootstraps(&self, view: &marekvs_cluster::View) {
+        let n = self.cluster.replicas_n;
+        for pid in self.cluster.future_owned_pids() {
+            let owners = view.owners(pid, n);
+            let Some(source) = owners.iter().find(|o| **o != self.store.node_id) else {
+                continue;
+            };
+            let empty = self
+                .store
+                .run(pid, move |ctx| {
+                    let mut any = false;
+                    store::scan_prefix(ctx, &ikey::partition_prefix(pid), |_, _| {
+                        any = true;
+                        false
+                    });
+                    !any
+                })
+                .await;
+            if empty {
+                self.mesh
+                    .send_bulk(*source, PeerMsg::BootstrapReq { pid })
+                    .await;
+            }
+        }
+    }
+
+    fn spawn_peer_events(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<(NodeId, bool)>) {
+        tokio::spawn(async move {
+            while let Some((peer, connected)) = rx.recv().await {
+                if connected {
+                    // Tell the peer where we are in THEIR sequence stream.
+                    let seq = self.applied_seq(peer).await;
+                    self.mesh.send_ctl(
+                        peer,
+                        PeerMsg::ResumeFrom {
+                            origin: self.store.node_id,
+                            seq,
+                        },
+                    );
+                } else {
+                    // Their leases die with the connection (design/04).
+                    self.interest.lock().values_mut().for_each(|keys| {
+                        keys.values_mut().for_each(|subs| {
+                            subs.remove(&peer);
+                        });
+                    });
+                }
+            }
+        });
+    }
+
+    fn spawn_sender(self: Arc<Self>) {
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = self.ring.notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+                self.pump_peers();
+            }
+        });
+    }
+
+    /// Drain new ring entries to every connected peer under the fan-out rule.
+    fn pump_peers(&self) {
+        let peers = self.mesh.connected_peers();
+        if peers.is_empty() {
+            return;
+        }
+        let view = self.cluster.view();
+        let n = self.cluster.replicas_n;
+        let last = self.ring.last_seq();
+        for peer in peers {
+            let cursor = *self.cursors.lock().entry(peer).or_insert(last);
+            if cursor >= last {
+                continue;
+            }
+            let (entries, gap) = self.ring.read_after(cursor, BATCH_MAX_OPS);
+            if gap {
+                tracing::warn!(peer, "ring gap for peer; relying on anti-entropy");
+            }
+            if entries.is_empty() {
+                continue;
+            }
+            let first_seq = entries.first().unwrap().seq;
+            let interest = self.interest.lock();
+            // Walk entries, deciding per entry whether it goes to `peer`.
+            // CRITICAL: an entry whose partition has an EMPTY owner set means
+            // the membership view has not converged (e.g. peers still gossiped
+            // as Joining right after boot) — advancing the cursor past it
+            // would drop the push permanently and demote convergence to
+            // anti-entropy latency. Defer instead: stop here, keep the cursor
+            // before this entry, retry on the next pump with a fresher view.
+            let mut ops: Vec<ReplOp> = Vec::new();
+            let mut new_cursor = cursor;
+            for e in entries {
+                let Some(p) = ikey::parse(&e.op.ikey) else {
+                    new_cursor = e.seq;
+                    continue;
+                };
+                let owners = view.owners(p.pid, n);
+                if owners.is_empty() || (owners.len() == 1 && owners[0] == self.store.node_id) {
+                    let others = view.members.iter().any(|m| m.node != self.store.node_id);
+                    if others {
+                        // Members exist but none placement-eligible yet:
+                        // unconverged view → defer this entry.
+                        break;
+                    }
+                    // Genuinely alone: nothing to push, safe to advance.
+                    new_cursor = e.seq;
+                    continue;
+                }
+                new_cursor = e.seq;
+                let is_h1 = view.h1(p.pid, n) == Some(self.store.node_id);
+                // homes: only ops we originated
+                let mut send = e.origin == self.store.node_id
+                    && owners.contains(&peer)
+                    && peer != self.store.node_id;
+                // interest fan-out: only H1 forwards, never back to origin
+                if !send && is_h1 && e.origin != peer && !owners.contains(&peer) {
+                    if let Some(subs) = interest.get(&p.pid).and_then(|keys| keys.get(p.userkey)) {
+                        if subs.get(&peer).is_some_and(|exp| *exp > Instant::now()) {
+                            send = true;
+                        }
+                    }
+                }
+                if send {
+                    ops.push(e.op);
+                }
+            }
+            drop(interest);
+            self.cursors.lock().insert(peer, new_cursor);
+            if ops.is_empty() {
+                tracing::debug!(peer, cursor, new_cursor, "pump: entries filtered to zero");
+                continue;
+            }
+            tracing::debug!(peer, n = ops.len(), "pump: sending ReplBatch");
+            self.engine.metrics.repl_batches_sent_total.inc();
+            self.engine
+                .metrics
+                .repl_ops_sent_total
+                .inc_by(ops.len() as u64);
+            self.mesh.send_ctl(
+                peer,
+                PeerMsg::Repl(ReplBatch {
+                    origin: self.store.node_id,
+                    first_seq,
+                    ops,
+                    implicit_sub: false,
+                }),
+            );
+        }
+    }
+
+    fn spawn_ae(self: Arc<Self>) {
+        tokio::spawn(async move {
+            loop {
+                let jitter = self.pseudo_rand() % 2000;
+                tokio::time::sleep(AE_ROUND + Duration::from_millis(jitter)).await;
+                self.gc_interest();
+                self.engine.metrics.ae_rounds_total.inc();
+                let owned = self.cluster.owned_pids();
+                let view = self.cluster.view();
+                let n = self.cluster.replicas_n;
+                for pid in owned {
+                    let owners = view.owners(pid, n);
+                    let others: Vec<NodeId> = owners
+                        .into_iter()
+                        .filter(|o| *o != self.store.node_id)
+                        .collect();
+                    if others.is_empty() {
+                        continue;
+                    }
+                    let peer = others[(self.pseudo_rand() % others.len() as u64) as usize];
+                    let root = ae::partition_root(&self.store, pid).await;
+                    self.mesh.send_ctl(peer, PeerMsg::MerkleRoot { pid, root });
+                }
+            }
+        });
+    }
+
+    fn gc_interest(&self) {
+        let now = Instant::now();
+        let mut interest = self.interest.lock();
+        interest.retain(|_, keys| {
+            keys.retain(|_, subs| {
+                subs.retain(|_, exp| *exp > now);
+                !subs.is_empty()
+            });
+            !keys.is_empty()
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // incoming messages
+    // ------------------------------------------------------------------
+
+    fn spawn_incoming(self: Arc<Self>, mut rx: mpsc::Receiver<(NodeId, PeerMsg)>) {
+        tokio::spawn(async move {
+            while let Some((peer, msg)) = rx.recv().await {
+                self.handle(peer, msg).await;
+            }
+        });
+    }
+
+    async fn handle(self: &Arc<Self>, peer: NodeId, msg: PeerMsg) {
+        match msg {
+            PeerMsg::Hello { .. } => {}
+            PeerMsg::Repl(batch) => {
+                tracing::debug!(peer, n = batch.ops.len(), "recv ReplBatch");
+                self.engine.metrics.repl_batches_received_total.inc();
+                self.engine
+                    .metrics
+                    .repl_ops_applied_total
+                    .inc_by(batch.ops.len() as u64);
+                let count = batch.ops.len() as u64;
+                for op in &batch.ops {
+                    self.apply_op(op.clone()).await;
+                }
+                if batch.implicit_sub {
+                    self.register_interest_ops(peer, &batch.ops);
+                }
+                self.store_applied_seq(peer, batch.first_seq + count.saturating_sub(1))
+                    .await;
+                self.mesh.send_ctl(
+                    peer,
+                    PeerMsg::AckSeq {
+                        origin: self.store.node_id,
+                        seq: batch.first_seq + count - 1,
+                    },
+                );
+            }
+            PeerMsg::AckSeq { .. } => {}
+            PeerMsg::ResumeFrom { seq, .. } => {
+                self.cursors.lock().insert(peer, seq);
+            }
+            PeerMsg::Fetch { id, ikey } => {
+                let k = ikey.clone();
+                let value = self
+                    .store
+                    .run(ikey::parse(&ikey).map(|p| p.pid).unwrap_or(0), move |ctx| {
+                        store::get_raw(ctx, &k)
+                    })
+                    .await;
+                self.mesh.send_ctl(
+                    peer,
+                    PeerMsg::FetchResp {
+                        id,
+                        value,
+                        lease_ms: INTEREST_LEASE.as_millis() as u64,
+                    },
+                );
+            }
+            PeerMsg::FetchCollection { id, userkey } => {
+                self.engine.metrics.fetches_served_total.inc();
+                let ops = self.collect_userkey_records(&userkey).await;
+                self.register_interest(peer, &userkey);
+                self.mesh.send_ctl(
+                    peer,
+                    PeerMsg::FetchCollectionResp {
+                        id,
+                        ops,
+                        lease_ms: INTEREST_LEASE.as_millis() as u64,
+                    },
+                );
+            }
+            PeerMsg::Check { id, ikey, hlc } => {
+                let k = ikey.clone();
+                let newer = self
+                    .store
+                    .run(ikey::parse(&ikey).map(|p| p.pid).unwrap_or(0), move |ctx| {
+                        store::get_raw(ctx, &k)
+                            .filter(|v| Envelope::decode(v).is_some_and(|(e, _)| e.hlc > hlc))
+                    })
+                    .await;
+                self.mesh.send_ctl(
+                    peer,
+                    PeerMsg::CheckResp {
+                        id,
+                        newer,
+                        lease_ms: INTEREST_LEASE.as_millis() as u64,
+                    },
+                );
+            }
+            PeerMsg::FetchResp { id, .. }
+            | PeerMsg::FetchCollectionResp { id, .. }
+            | PeerMsg::CheckResp { id, .. } => {
+                if let Some(tx) = self.pending.lock().remove(&id) {
+                    let _ = tx.send(msg);
+                }
+            }
+            PeerMsg::InterestRenew { keys, .. } => {
+                for k in keys {
+                    self.register_interest(peer, &k);
+                }
+            }
+            PeerMsg::MerkleRoot { pid, root } => {
+                let ours = ae::partition_root(&self.store, pid).await;
+                if ours != root {
+                    let digests = ae::bucket_digests(&self.store, pid).await;
+                    self.mesh
+                        .send_ctl(peer, PeerMsg::MerkleBuckets { pid, digests });
+                }
+            }
+            PeerMsg::MerkleBuckets { pid, digests } => {
+                let ours = ae::bucket_digests(&self.store, pid).await;
+                for (bucket, (a, b)) in ours.iter().zip(digests.iter()).enumerate() {
+                    if a != b {
+                        let entries = ae::bucket_entries(&self.store, pid, bucket as u8).await;
+                        self.mesh.send_ctl(
+                            peer,
+                            PeerMsg::BucketKeys {
+                                pid,
+                                bucket: bucket as u8,
+                                entries,
+                            },
+                        );
+                    }
+                }
+            }
+            PeerMsg::BucketKeys {
+                pid,
+                bucket,
+                entries,
+            } => {
+                let (push, want) = ae::diff_bucket(&self.store, pid, bucket, &entries).await;
+                if !push.is_empty() {
+                    self.mesh
+                        .send_ctl(peer, PeerMsg::RepairOps { pid, ops: push });
+                }
+                if !want.is_empty() {
+                    self.mesh.send_ctl(
+                        peer,
+                        PeerMsg::RequestKeys {
+                            pid,
+                            bucket,
+                            ikey_hashes: want,
+                        },
+                    );
+                }
+            }
+            PeerMsg::RequestKeys {
+                pid,
+                bucket,
+                ikey_hashes,
+            } => {
+                let ops = ae::records_by_hash(&self.store, pid, bucket, &ikey_hashes).await;
+                if !ops.is_empty() {
+                    self.mesh.send_ctl(peer, PeerMsg::RepairOps { pid, ops });
+                }
+            }
+            PeerMsg::RepairOps { ops, .. } => {
+                self.engine
+                    .metrics
+                    .ae_repair_ops_total
+                    .inc_by(ops.len() as u64);
+                for op in ops {
+                    self.apply_op(op).await;
+                }
+            }
+            PeerMsg::BootstrapReq { pid } => {
+                self.stream_partition(peer, pid).await;
+            }
+            PeerMsg::BootstrapChunk { ops, .. } => {
+                for op in ops {
+                    self.apply_op(op).await;
+                }
+            }
+            PeerMsg::BootstrapDone { pid, .. } => {
+                tracing::info!(pid, peer, "partition bootstrap complete");
+            }
+            PeerMsg::HandoffAck { .. } => {}
+            PeerMsg::Publish { channel, payload } => {
+                self.engine.pubsub.publish_local(&channel, &payload);
+            }
+            PeerMsg::Ping { nonce } => {
+                self.mesh.send_ctl(peer, PeerMsg::Pong { nonce });
+            }
+            PeerMsg::Pong { .. } => {}
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // apply / fetch plumbing
+    // ------------------------------------------------------------------
+
+    /// Merge a remote record into local storage on its shard thread.
+    /// Zset member records also rebuild the local score index.
+    pub async fn apply_op(&self, op: ReplOp) {
+        let Some(p) = ikey::parse(&op.ikey) else {
+            return;
+        };
+        // HLC receive rule (Kulkarni): observe every ingested record's
+        // timestamp so our next local write sorts after everything we have
+        // seen. Without this, a peer with a lagging wall clock loses LWW
+        // merges against values it causally read first — exposed by Apple
+        // containers, where every container is its own VM with its own
+        // clock (Docker shares one VM clock and can't catch it).
+        if let Some((env, _)) = Envelope::decode(&op.value) {
+            if self.store.hlc.is_drifted(env.hlc) {
+                tracing::warn!(hlc = env.hlc, "clamping far-future remote HLC");
+            }
+            self.store.hlc.observe(env.hlc);
+        }
+        let pid = p.pid;
+        let (userkey, suffix, tag) = (p.userkey.to_vec(), p.suffix.to_vec(), p.tag);
+        self.store
+            .run(pid, move |ctx| {
+                if tag == b'z' {
+                    marekvs_engine::cmd::zset::apply_member_record(
+                        ctx, &userkey, &suffix, &op.value,
+                    );
+                } else {
+                    store::write_merged(ctx, &op.ikey, &op.value);
+                    // List elements carry a node-local head/tail position hint
+                    // that write_merged does not maintain; drop it so the next
+                    // local list op re-derives the range including this record.
+                    if tag == b'q' {
+                        marekvs_engine::cmd::list::invalidate_hint(ctx, &userkey);
+                    }
+                }
+            })
+            .await;
+    }
+
+    /// All records of one user key (string + list + head + elements),
+    /// verbatim — for FetchCollection responses and bootstrap.
+    async fn collect_userkey_records(&self, userkey: &[u8]) -> Vec<ReplOp> {
+        let uk = userkey.to_vec();
+        self.store
+            .run_key(userkey, move |ctx| {
+                let mut ops = Vec::new();
+                for k in [
+                    ikey::string_key(&uk),
+                    ikey::list_key(&uk),
+                    ikey::head_key(&uk),
+                ] {
+                    if let Some(v) = store::get_raw(ctx, &k) {
+                        ops.push(ReplOp { ikey: k, value: v });
+                    }
+                }
+                for tag in [
+                    ikey::Tag::HashField,
+                    ikey::Tag::SetMember,
+                    ikey::Tag::ZsetMember,
+                    ikey::Tag::ListElem,
+                    ikey::Tag::StreamEntry,
+                    ikey::Tag::HllRegister,
+                ] {
+                    store::scan_prefix(ctx, &ikey::collection_prefix(tag, &uk), |k, v| {
+                        ops.push(ReplOp {
+                            ikey: k.to_vec(),
+                            value: v.to_vec(),
+                        });
+                        true
+                    });
+                }
+                ops
+            })
+            .await
+    }
+
+    fn register_interest(&self, peer: NodeId, userkey: &[u8]) {
+        let pid = marekvs_core::pid_of(userkey);
+        self.interest
+            .lock()
+            .entry(pid)
+            .or_default()
+            .entry(userkey.to_vec())
+            .or_default()
+            .insert(peer, Instant::now() + INTEREST_LEASE);
+    }
+
+    fn register_interest_ops(&self, peer: NodeId, ops: &[ReplOp]) {
+        for op in ops {
+            if let Some(p) = ikey::parse(&op.ikey) {
+                self.register_interest(peer, p.userkey);
+            }
+        }
+    }
+
+    async fn applied_seq(&self, origin: NodeId) -> u64 {
+        let key = format!("cur:{origin}").into_bytes();
+        self.store
+            .run(0, move |ctx| match ctx.db.get(&ctx.meta, &key) {
+                Ok(v) if v.len() == 8 => u64::from_be_bytes(v.try_into().unwrap()),
+                _ => 0,
+            })
+            .await
+    }
+
+    async fn store_applied_seq(&self, origin: NodeId, seq: u64) {
+        let key = format!("cur:{origin}").into_bytes();
+        self.store
+            .run(0, move |ctx| {
+                let _ = ctx
+                    .db
+                    .put(&ctx.meta, &key, &seq.to_be_bytes(), Duration::ZERO);
+            })
+            .await;
+    }
+
+    /// Stream a partition to a joining/repairing peer (design/06 §Bootstrap).
+    async fn stream_partition(&self, peer: NodeId, pid: Pid) {
+        let mut sent = 0usize;
+        loop {
+            let offset = sent;
+            let chunk: Vec<ReplOp> = self
+                .store
+                .run(pid, move |ctx| {
+                    let mut ops = Vec::new();
+                    let mut skipped = 0usize;
+                    store::scan_prefix(ctx, &ikey::partition_prefix(pid), |k, v| {
+                        if matches!(ikey::parse(k), Some(p) if p.tag == b'Z') {
+                            return true;
+                        }
+                        if skipped < offset {
+                            skipped += 1;
+                            return true;
+                        }
+                        ops.push(ReplOp {
+                            ikey: k.to_vec(),
+                            value: v.to_vec(),
+                        });
+                        ops.len() < 256
+                    });
+                    ops
+                })
+                .await;
+            if chunk.is_empty() {
+                break;
+            }
+            sent += chunk.len();
+            if !self
+                .mesh
+                .send_bulk(peer, PeerMsg::BootstrapChunk { pid, ops: chunk })
+                .await
+            {
+                return;
+            }
+        }
+        self.mesh
+            .send_bulk(
+                peer,
+                PeerMsg::BootstrapDone {
+                    pid,
+                    as_of_seq: self.ring.last_seq(),
+                },
+            )
+            .await;
+        tracing::info!(pid, peer, records = sent, "partition streamed");
+    }
+
+    /// Request/response over ctl with timeout.
+    async fn request(&self, peer: NodeId, id: u64, msg: PeerMsg) -> Option<PeerMsg> {
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().insert(id, tx);
+        if !self.mesh.send_ctl(peer, msg) {
+            self.pending.lock().remove(&id);
+            return None;
+        }
+        match tokio::time::timeout(FETCH_TIMEOUT, rx).await {
+            Ok(Ok(resp)) => Some(resp),
+            _ => {
+                self.pending.lock().remove(&id);
+                None
+            }
+        }
+    }
+}
+
+impl ReadThrough for ReplEngine {
+    /// Read path steps 2–4 of design/04: home → serve local; lease-valid →
+    /// serve local; else fetch the whole user key from H1 and subscribe.
+    fn fetch<'a>(&'a self, userkey: &'a [u8]) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            let pid = marekvs_core::pid_of(userkey);
+            if self.cluster.is_home(pid) {
+                return false;
+            }
+            // Lease still fresh? Serve the local copy.
+            if let Some(exp) = self.leases.lock().get(userkey) {
+                if *exp > Instant::now() {
+                    return false;
+                }
+            }
+            let view = self.cluster.view();
+            let n = self.cluster.replicas_n;
+            let mut targets = view.owners(pid, n);
+            targets.retain(|t| *t != self.store.node_id);
+            if let Some(h1) = view.h1(pid, n) {
+                if let Some(pos) = targets.iter().position(|t| *t == h1) {
+                    targets.swap(0, pos);
+                }
+            }
+            for target in targets {
+                let id = self.req_id();
+                self.engine.metrics.fetches_issued_total.inc();
+                let msg = PeerMsg::FetchCollection {
+                    id,
+                    userkey: userkey.to_vec(),
+                };
+                if let Some(PeerMsg::FetchCollectionResp { ops, lease_ms, .. }) =
+                    self.request(target, id, msg).await
+                {
+                    for op in &ops {
+                        self.apply_op(op.clone()).await;
+                    }
+                    self.leases.lock().insert(
+                        userkey.to_vec(),
+                        Instant::now() + Duration::from_millis(lease_ms),
+                    );
+                    return !ops.is_empty();
+                }
+            }
+            false
+        })
+    }
+}

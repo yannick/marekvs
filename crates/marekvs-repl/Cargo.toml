@@ -1,0 +1,19 @@
+[package]
+name = "marekvs-repl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+marekvs-core.workspace = true
+marekvs-proto.workspace = true
+marekvs-engine.workspace = true
+marekvs-cluster.workspace = true
+ondadb.workspace = true
+tokio.workspace = true
+parking_lot.workspace = true
+xxhash-rust.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+prometheus.workspace = true
