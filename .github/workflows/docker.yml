@@ -141,6 +141,9 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha
             type=semver,pattern={{version}}
+            # Flux image-automation tag: <branch>-<sha7>-<unix ts>, sortable
+            # by the trailing timestamp (same convention as console-mono).
+            type=raw,value={{branch}}-{{sha}}-{{date 'X'}},enable={{is_default_branch}}
 
       - name: debug tags
         id: meta-debug
@@ -151,6 +154,7 @@ jobs:
             type=raw,value=debug,enable={{is_default_branch}}
             type=sha,prefix=debug-sha-
             type=semver,pattern={{version}},prefix=debug-
+            type=raw,value=debug-{{branch}}-{{sha}}-{{date 'X'}},enable={{is_default_branch}}
 
       - name: create production manifest list
         working-directory: /tmp/digests/prod
