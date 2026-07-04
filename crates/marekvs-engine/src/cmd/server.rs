@@ -444,7 +444,38 @@ pub fn time() -> Reply {
     ])
 }
 
-pub async fn debug(args: &[Vec<u8>]) -> Reply {
+pub async fn debug(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    // DEBUG COUNTERSTATE <key>: raw PN state — base(hlc,origin,val) + slots.
+    // Reads strictly locally (no read-through) so divergence is observable.
+    if args.len() == 3 && eq_ignore_case(&args[1], "COUNTERSTATE") {
+        let key = args[2].clone();
+        return engine
+            .store
+            .run_key(&args[2], move |ctx| {
+                match crate::store::read_lww(ctx, &marekvs_core::ikey::string_key(&key), 0) {
+                    Some((env, payload))
+                        if env.rtype() == marekvs_core::envelope::RecordType::Counter =>
+                    {
+                        match marekvs_core::counter::CounterState::decode(&payload) {
+                            Some(st) => {
+                                let mut out = format!(
+                                    "hlc={} origin={} base=({},{},{})",
+                                    env.hlc, env.origin, st.base_hlc, st.base_origin, st.base
+                                );
+                                for (node, pos, neg) in &st.slots {
+                                    out.push_str(&format!(" n{node}:+{pos}-{neg}"));
+                                }
+                                Reply::Bulk(out.into_bytes())
+                            }
+                            None => Reply::err("ERR undecodable counter payload"),
+                        }
+                    }
+                    Some(_) => Reply::err("ERR not a counter record"),
+                    None => Reply::Null,
+                }
+            })
+            .await;
+    }
     if args.len() >= 2 && eq_ignore_case(&args[1], "SLEEP") {
         if let Some(secs) = args
             .get(2)

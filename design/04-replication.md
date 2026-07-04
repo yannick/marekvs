@@ -71,6 +71,28 @@ client ──► X: stamp HLC → envelope → ondaDB commit (one Txn per comman
 5. **Duplicates are harmless** — every merge is idempotent
    ([02-data-model.md](02-data-model.md#merge-rules-the-heart-of-convergence)).
 
+### Crash-safety of the push path (chaos findings)
+
+The ring is in-memory and its seq numbers are meaningful to consumers
+(they persist "applied up to S per origin" and reconnect with
+`ResumeFrom{S}`). Three mechanisms keep acked writes from stranding on
+their origin — each one closes a hole the chaos suite actually caught:
+
+1. **Seq space survives restarts.** The ring high-water mark is persisted
+   (~1 s cadence); a restart resumes at `hw + 1e6`. Without this, a
+   restarted origin re-numbers from 1, every stale consumer cursor looks
+   "caught up" (`cursor >= last_seq`), and the pump silently ships nothing
+   the node accepts until seqs pass the stale cursor again.
+2. **Boot re-offer.** After the view settles (and again on every view
+   epoch change), a node pushes every record it holds for partitions it
+   does NOT own to a current owner. This heals strands created by SIGKILL
+   (unshipped ring entries die with the process) and by ownership moves —
+   which owners-only Merkle AE can never repair, because the owners AGREE
+   with each other and the gauge reads 0.
+3. **Backlog-aware drain.** SIGTERM waits (bounded) for all peer cursors
+   to reach the ring head before exiting, instead of a fixed grace sleep —
+   the last-moment ack window otherwise leaves with the process.
+
 ### Wire format
 
 Postcard-encoded after the frame header ([framing](#transport)):

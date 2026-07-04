@@ -145,6 +145,21 @@ pub struct Store {
     pub hlc: Arc<Hlc>,
     pub node_id: NodeId,
     shards: Vec<Sender<Job>>,
+    shard_handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Store {
+    /// Release the shard threads and the ondadb directory lock — ondadb
+    /// holds an advisory lock on <dir>/LOCK for the life of the open, so a
+    /// process (or test) reopening the same directory needs the previous
+    /// instance to close, not merely drop.
+    fn drop(&mut self) {
+        self.shards.clear(); // closing the channels ends the shard loops
+        for h in self.shard_handles.drain(..) {
+            let _ = h.join(); // no in-flight job may race db.close()
+        }
+        let _ = self.db.close();
+    }
 }
 
 impl Store {
@@ -168,6 +183,7 @@ impl Store {
         SHARD_TOTAL.store(cfg.shard_threads, std::sync::atomic::Ordering::Relaxed);
 
         let mut shards = Vec::with_capacity(cfg.shard_threads);
+        let mut shard_handles = Vec::with_capacity(cfg.shard_threads);
         for shard in 0..cfg.shard_threads {
             let (tx, rx): (Sender<Job>, Receiver<Job>) = crossbeam_channel::bounded(4096);
             let ctx = ShardCtx {
@@ -179,9 +195,10 @@ impl Store {
                 shard,
                 pop_hints: std::cell::RefCell::new(std::collections::HashMap::new()),
             };
-            std::thread::Builder::new()
+            let handle = std::thread::Builder::new()
                 .name(format!("mkv-shard-{shard}"))
                 .spawn(move || shard_loop(ctx, rx))?;
+            shard_handles.push(handle);
             shards.push(tx);
         }
 
@@ -192,6 +209,7 @@ impl Store {
             hlc,
             node_id: cfg.node_id,
             shards,
+            shard_handles,
         }))
     }
 

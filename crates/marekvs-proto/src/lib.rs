@@ -110,6 +110,10 @@ pub enum PeerMsg {
         pid: Pid,
         bucket: u8,
         entries: Vec<(u64, u64)>,
+        /// True when the sender is NOT an owner of `pid` (stranded-record
+        /// offer): the receiver must only REQUEST what it lacks, never push
+        /// backfill — a non-owner's cache must not accumulate the partition.
+        no_backfill: bool,
     }, // (ikey_hash, hlc)
     /// Repair payload in either direction.
     RepairOps {

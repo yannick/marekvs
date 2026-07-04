@@ -30,6 +30,9 @@ pub const INTEREST_LEASE: Duration = Duration::from_secs(60);
 pub const FETCH_TIMEOUT: Duration = Duration::from_millis(300);
 pub const AE_ROUND: Duration = Duration::from_secs(5);
 const BATCH_MAX_OPS: usize = 256;
+/// Seq-space jump applied on restart: must exceed ops accepted between two
+/// high-water persists (1s apart) with generous margin.
+const RING_SEQ_RESTART_JUMP: u64 = 1_000_000;
 
 type InterestMap = HashMap<Pid, HashMap<Vec<u8>, HashMap<NodeId, Instant>>>;
 
@@ -71,7 +74,19 @@ impl ReplEngine {
                 engine.metrics.mesh_output_bytes_total.clone(),
             )),
         );
-        let ring = Ring::new();
+        // Resume the ring seq space ABOVE anything consumers may have seen
+        // from a previous incarnation (see Ring::new_starting_at). The jump
+        // covers ops pushed after the last high-water persist.
+        let ring_hw = {
+            let store = store.clone();
+            store
+                .run(0, |ctx| match ctx.db.get(&ctx.meta, b"ring:hw") {
+                    Ok(v) if v.len() == 8 => u64::from_be_bytes(v.as_slice().try_into().unwrap()),
+                    _ => 0,
+                })
+                .await
+        };
+        let ring = Ring::new_starting_at(ring_hw + RING_SEQ_RESTART_JUMP);
         ring.standalone_cfg
             .store(standalone_cfg, std::sync::atomic::Ordering::Relaxed);
 
@@ -133,6 +148,7 @@ impl ReplEngine {
 
         // 5. Sender loop: drain the ring to peers.
         repl.clone().spawn_sender();
+        repl.clone().spawn_ring_hw();
 
         // 6. Anti-entropy rounds.
         repl.clone().spawn_ae();
@@ -271,6 +287,32 @@ impl ReplEngine {
         });
     }
 
+    /// Periodically persist the ring high-water mark so a restart can resume
+    /// the seq space above every consumer cursor (paired with the restart
+    /// jump in ReplEngine::start).
+    fn spawn_ring_hw(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut persisted = 0u64;
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let last = self.ring.last_seq();
+                if last != persisted {
+                    persisted = last;
+                    self.store
+                        .run(0, move |ctx| {
+                            let _ = ctx.db.put(
+                                &ctx.meta,
+                                b"ring:hw",
+                                &last.to_be_bytes(),
+                                Duration::ZERO,
+                            );
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
     fn spawn_sender(self: Arc<Self>) {
         tokio::spawn(async move {
             loop {
@@ -374,17 +416,34 @@ impl ReplEngine {
         }
     }
 
+    /// Max unshipped ring backlog across connected peers (0 = fully drained).
+    /// The SIGTERM drain polls this so a leaving node does not exit with
+    /// acked-but-unshipped writes only it holds.
+    pub fn pending_backlog(&self) -> u64 {
+        let last = self.ring.last_seq();
+        let cursors = self.cursors.lock();
+        self.mesh
+            .connected_peers()
+            .iter()
+            .map(|p| last.saturating_sub(*cursors.get(p).unwrap_or(&last)))
+            .max()
+            .unwrap_or(0)
+    }
+
     fn spawn_ae(self: Arc<Self>) {
         tokio::spawn(async move {
+            let mut round = 0u64;
             loop {
                 let jitter = self.pseudo_rand() % 2000;
                 tokio::time::sleep(AE_ROUND + Duration::from_millis(jitter)).await;
                 self.gc_interest();
                 self.engine.metrics.ae_rounds_total.inc();
+                round = round.wrapping_add(1);
                 let owned = self.cluster.owned_pids();
                 let view = self.cluster.view();
                 let n = self.cluster.replicas_n;
-                for pid in owned {
+                for pid in &owned {
+                    let pid = *pid;
                     let owners = view.owners(pid, n);
                     let others: Vec<NodeId> = owners
                         .into_iter()
@@ -396,6 +455,31 @@ impl ReplEngine {
                     let peer = others[(self.pseudo_rand() % others.len() as u64) as usize];
                     let root = ae::partition_root(&self.store, pid).await;
                     self.mesh.send_ctl(peer, PeerMsg::MerkleRoot { pid, root });
+                }
+                // Stranded-record AE (chaos findings): every few rounds, also
+                // exchange roots for pids we hold data for but do NOT own.
+                // Owners-only AE has a structural blind spot — when unshipped
+                // ring entries die with a crashed process, the owners AGREE
+                // with each other and the origin's copy is invisible forever.
+                // The exchange is push-only (no_backfill) so a non-owner
+                // never accumulates partition data it merely offered to.
+                if round % 3 == 0 {
+                    let owned_set: std::collections::HashSet<Pid> = owned.iter().copied().collect();
+                    for pid in 0..marekvs_core::PARTITIONS as Pid {
+                        if owned_set.contains(&pid) {
+                            continue;
+                        }
+                        let owners = view.owners(pid, n);
+                        if owners.is_empty() {
+                            continue;
+                        }
+                        let root = ae::partition_root(&self.store, pid).await;
+                        if root == 0 {
+                            continue; // no local data for this pid
+                        }
+                        let peer = owners[(self.pseudo_rand() % owners.len() as u64) as usize];
+                        self.mesh.send_ctl(peer, PeerMsg::MerkleRoot { pid, root });
+                    }
                 }
             }
         });
@@ -526,6 +610,7 @@ impl ReplEngine {
             }
             PeerMsg::MerkleBuckets { pid, digests } => {
                 let ours = ae::bucket_digests(&self.store, pid).await;
+                let we_own = self.cluster.owned_pids().contains(&pid);
                 for (bucket, (a, b)) in ours.iter().zip(digests.iter()).enumerate() {
                     if a != b {
                         let entries = ae::bucket_entries(&self.store, pid, bucket as u8).await;
@@ -535,6 +620,7 @@ impl ReplEngine {
                                 pid,
                                 bucket: bucket as u8,
                                 entries,
+                                no_backfill: !we_own,
                             },
                         );
                     }
@@ -544,9 +630,10 @@ impl ReplEngine {
                 pid,
                 bucket,
                 entries,
+                no_backfill,
             } => {
                 let (push, want) = ae::diff_bucket(&self.store, pid, bucket, &entries).await;
-                if !push.is_empty() {
+                if !push.is_empty() && !no_backfill {
                     self.mesh
                         .send_ctl(peer, PeerMsg::RepairOps { pid, ops: push });
                 }

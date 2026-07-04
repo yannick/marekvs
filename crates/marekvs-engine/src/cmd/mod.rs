@@ -50,7 +50,7 @@ pub async fn dispatch(
             sess.should_close = true;
             std::process::exit(0)
         }
-        "DEBUG" => server::debug(&args).await,
+        "DEBUG" => server::debug(engine, &args).await,
 
         // --- generic / keyspace ---
         "DEL" | "UNLINK" => generic::del(engine, &args).await,

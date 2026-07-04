@@ -38,24 +38,74 @@ f64 order (including ±0, subnormals, infinities).
 
 ## 10.3 Membership churn & Jepsen <a name="103"></a>
 
-A Jepsen checkout exists at `../jepsen`; write a marekvs test harness
-(Clojure) with:
+Status: **implemented** as a bash harness (`tests/chaos/`, `just
+chaos-docker` / `just chaos-apple`) that ports the Jepsen acceptance
+algorithms directly (checker.clj: counter :828, set :324) rather than
+driving Clojure Jepsen. The original plan said the counter workload
+"documents (not asserts) lost increments" — v1.1's PN counters made
+counters exact, so the harness now *asserts* them.
 
-- **Workloads**: register (per-key LWW linearizability is *expected to fail* —
-  the checker instead validates **eventual convergence within the staleness
-  bound** and session guarantees per connection: read-your-writes, monotonic
-  reads); OR-set workload (concurrent SADD/SREM across nodes → final member
-  set matches the ORSWOT-lite model checker); counter workload documents
-  (not asserts) lost increments.
-- **Nemeses**: network partitions (majority/minority/bridge), partition +
-  heal, node kill/restart (PVC preserved), node kill + data wipe (bootstrap
-  path), clock skew ±(1 s, 10 s) (HLC clamp), **membership churn** — rolling
-  join/leave during load (assumption 1: dual-H1 / zero-H1 windows), slow-peer
-  (tc netem) to force ring overrun → dirty-pair → Merkle repair.
-- **Invariants checked after heal**: all homes byte-identical per partition
-  within 15 s (the published bound — measured, not assumed); no tombstone
-  resurrection after `gc_grace` scenarios (down node rejoins pull-only); no
-  duplicate/lost stream ids.
+- **History model**: every op is acked / failed / indeterminate; single-
+  writer logs per workload. Counter reads are windowed Jepsen-style:
+  `lower` (acked at read invoke) `<= value <= upper` (acked+indeterminate
+  at completion), checked mid-run and on the final converged read of every
+  node. Set checker: acked-but-absent = LOST, never-attempted-but-present
+  = PHANTOM, multiplicity > 1 = DUPLICATE (all fail); indeterminate adds
+  that landed are "recovered" (legal).
+- **Nemeses**: SIGKILL crash + revive (data preserved); SIGSTOP freeze/
+  thaw (Jepsen hammer-time); graceful SIGTERM churn (the k8s rollout
+  path); **true partitions** on the docker backend — every node joins a
+  "mesh" net (gossip/replication, advertised) and an "edge" net (client
+  ports), and a partition disconnects only the mesh, so clients write to
+  BOTH sides of the split; wipe-replace (data destroyed → fresh bootstrap
+  via AE); membership churn (node joins mid-load, takes ownership, leaves).
+- **Clock faults**: the apple-container backend runs one lightweight VM
+  per node with an independent clock — the environment that originally
+  caught the missing HLC receive rule. Freeze/thaw doubles as a clock-jump
+  fault from the process's perspective. (Jepsen's bump/strobe need
+  clock_settime inside the node; FROM-scratch images have no exec, so
+  deliberate skew injection is future work.)
+- **Scenarios** (`tests/chaos/chaos_test.sh`): crash_restart,
+  partition_divergence, partition_no_resurrect (SREM/DEL on the majority
+  side while an island holds the record — resurrection is the classic AP
+  bug), freeze_thaw, rolling_churn, wipe_replace, membership_churn, and a
+  bank test (atomic same-hash-tag Lua transfers; total conserved on every
+  node's final read through graceful churn).
+- **Invariants after every scenario**: Jepsen counter/set acceptance on
+  every node, total convergence, and
+  `marekvs_cluster_underreplicated_partitions` back to 0 (the operator's
+  scale-safety signal must recover from every fault).
+
+### Bugs the suite found (first two days of existence)
+
+1. **ondadb: read-your-own-writes violation** (fixed in ondadb
+   `de50da9`). `visible_seq` advances gap-free, so during a concurrent
+   commit a thread's own completed commit sat above the watermark — a
+   get() right after put() on the same thread returned the previous
+   value. INCR built on the stale state and the PN merge silently
+   swallowed the increment (~2-6% of acked increments lost under load,
+   no faults needed). Fix: per-thread commit floor;
+   ReadCommitted reads use `max(visible_seq, own_floor)`.
+2. **Ring seq space reset on restart.** Consumers persist "applied up to
+   S per origin" and resume with ResumeFrom{S}; a restarted origin
+   re-numbered from 1, every stale cursor looked caught-up, and the pump
+   silently shipped nothing until seqs passed S — every write the node
+   accepted after restart stranded locally. Fix: persisted high-water
+   mark + restart jump.
+3. **Owners-only AE blind spot.** SIGKILL destroys the in-memory ring's
+   unshipped entries; the record survives in ondadb on the origin, but
+   Merkle AE ran only among owners — who AGREED with each other — so the
+   strand was permanent and `underreplicated_partitions` read 0
+   throughout. Fix: non-owned data-bearing pids join the Merkle exchange
+   every few rounds, push-only (`no_backfill`) so a non-owner never
+   accumulates partition data.
+4. **Fixed-sleep drain.** SIGTERM slept 3 s and exited regardless of the
+   ring backlog; a write acked in the last moment left with the process.
+   Fix: drain until all peer cursors reach the ring head (bounded).
+
+Not yet ported from the plan: bridge/majority-ring partition topologies
+(need iptables inside nodes), tc-netem slow-peer, deliberate clock
+bump/strobe. These need a debug image with a shell.
 
 ## 10.4 Kubernetes chaos <a name="104"></a>
 

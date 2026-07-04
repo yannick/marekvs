@@ -115,11 +115,15 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Storage + engine.
-    let store = Store::open(&StoreConfig {
+    let mut store_cfg = StoreConfig {
         data_dir,
         node_id,
         ..StoreConfig::default()
-    })?;
+    };
+    if let Ok(v) = std::env::var("MAREKVS_SHARDS") {
+        store_cfg.shard_threads = v.parse().expect("MAREKVS_SHARDS must be a number");
+    }
+    let store = Store::open(&store_cfg)?;
     let engine = Engine::new(store.clone());
 
     // Cluster membership.
@@ -140,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
     // Standalone = statically configured single node (no seeds, N=1): only
     // then may the replication ring skip buffering (see ring.rs).
     let standalone_cfg = seeds_empty && replicas_n <= 1;
-    let _repl = ReplEngine::start(
+    let repl = ReplEngine::start(
         store.clone(),
         engine.clone(),
         cluster.clone(),
@@ -186,9 +190,14 @@ async fn main() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_secs(2)).await;
     cluster.set_phase(NodePhase::Active).await;
 
-    // Graceful drain on SIGTERM.
+    // Graceful drain on SIGTERM: enter Leaving (gossiped; peers stop
+    // targeting us), then hold until the replication ring is fully shipped —
+    // exiting with unshipped entries strands acked writes on this node only
+    // (chaos finding; the boot re-offer is the backstop, but a removed node
+    // never boots again). Bounded by a hard cap for hung peers.
     {
         let cluster = cluster.clone();
+        let repl = repl.clone();
         tokio::spawn(async move {
             let mut sigterm =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -196,7 +205,17 @@ async fn main() -> anyhow::Result<()> {
             sigterm.recv().await;
             tracing::info!("SIGTERM: entering Leaving phase");
             cluster.set_phase(NodePhase::Leaving).await;
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            // Minimum window for the phase to gossip out.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(7);
+            loop {
+                let backlog = repl.pending_backlog();
+                if backlog == 0 || tokio::time::Instant::now() >= deadline {
+                    tracing::info!(backlog, "drain complete; exiting");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             std::process::exit(0);
         });
     }

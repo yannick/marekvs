@@ -55,11 +55,23 @@ impl Ring {
 
 impl Ring {
     pub fn new() -> Arc<Ring> {
+        Self::new_starting_at(1)
+    }
+
+    /// Sequence numbers MUST be strictly increasing across process restarts:
+    /// consumers persist "applied up to seq S per origin" and resume with
+    /// ResumeFrom{S}. A ring restarting at 1 makes every stale cursor S look
+    /// "caught up" (cursor >= last), so the pump silently ships NOTHING this
+    /// node accepts until seq passes S again — acked writes strand on the
+    /// origin (chaos finding: crash_restart el-3600). The caller seeds the
+    /// start from a persisted high-water mark plus a jump that covers the
+    /// unpersisted tail.
+    pub fn new_starting_at(first_seq: u64) -> Arc<Ring> {
         Arc::new(Ring {
             inner: Mutex::new(Inner {
                 buf: VecDeque::new(),
                 bytes: 0,
-                next_local_seq: 1,
+                next_local_seq: first_seq.max(1),
             }),
             notify: Notify::new(),
             standalone_cfg: std::sync::atomic::AtomicBool::new(false),

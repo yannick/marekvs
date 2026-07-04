@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# Chaos + churn test suite for marekvs — Jepsen-style scenarios (design/10).
+#
+#   BACKEND=docker tests/chaos/chaos_test.sh [scenario ...]   # full menu
+#   BACKEND=apple  tests/chaos/chaos_test.sh [scenario ...]   # no partitions,
+#                                                             # real VM clocks
+#
+# Each scenario follows the Jepsen phase structure: run workloads and the
+# nemesis concurrently (sleep → fault → sleep → heal cycles), then stop the
+# nemesis, HEAL EVERYTHING, quiesce, take final reads, and run the checkers
+# against the logged history. Default: all scenarios valid for the backend.
+set -euo pipefail
+
+cd "$(dirname "$0")/../.."
+"./tests/preflight.sh"
+source tests/chaos/lib.sh
+
+SCENARIOS=("$@")
+[ ${#SCENARIOS[@]} -gt 0 ] || {
+  SCENARIOS=(crash_restart freeze_thaw rolling_churn wipe_replace membership_churn bank)
+  [ "$BACKEND" = docker ] && SCENARIOS+=(partition_divergence partition_no_resurrect)
+}
+
+trap cluster_down EXIT
+
+scenario_banner() {
+  echo
+  echo "━━━ scenario: $1 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+fresh_cluster() {
+  cluster_down
+  cluster_up
+  sleep 2 # membership settle
+}
+
+# ── scenario: crash_restart ──────────────────────────────────────────────
+# Jepsen kill nemesis: SIGKILL a random node mid-write, revive, repeat.
+# Acked writes must survive (they were committed to ondadb before the ack).
+crash_restart() {
+  fresh_cluster
+  counter_workload chaos:cnt 45 & local W1=$!
+  set_workload chaos:set 45 & local W2=$!
+  local round
+  for round in 0 1 2; do
+    sleep 5
+    crash $(( (round + 1) % N ))
+    sleep 5
+    revive $(( (round + 1) % N ))
+  done
+  wait $W1 $W2
+  sleep 3 # quiesce
+  check_counter chaos:cnt
+  check_set chaos:set
+  check_converged "counter" 30 get chaos:cnt
+  check_replication_healed 60
+}
+
+# ── scenario: partition_divergence (docker) ──────────────────────────────
+# Jepsen partition-random-node: isolate node 1 from the mesh while clients
+# write to BOTH sides (edge network stays up → true split-brain), heal,
+# assert convergence and the CRDT merge laws end-to-end.
+partition_divergence() {
+  fresh_cluster
+  counter_workload chaos:cnt 40 & local W1=$!
+  set_workload chaos:set 40 & local W2=$!
+  register_workload chaos:reg 40 & local W3=$!
+  sleep 5
+  partition 1
+  sleep 12   # divergent writes accumulate on both sides
+  heal 1
+  sleep 5
+  partition 2
+  sleep 8
+  heal 2
+  wait $W1 $W2 $W3
+  sleep 3
+  check_counter chaos:cnt
+  check_set chaos:set
+  check_converged "LWW register" 40 get chaos:reg
+  check_converged "counter" 40 get chaos:cnt
+  check_replication_healed 60
+}
+
+# ── scenario: partition_no_resurrect (docker) ────────────────────────────
+# Element removed on the majority side while the isolated node still holds
+# it: after heal the removal must win everywhere, forever (OR-set delete
+# semantics + tombstone gating — resurrection is THE classic AP bug).
+partition_no_resurrect() {
+  fresh_cluster
+  rcli 0 sadd res:s doomed keeper >/dev/null
+  check_set_converged "seed set" res:s 20 "doomed keeper"
+  partition 1
+  sleep 2
+  rcli 0 srem res:s doomed >/dev/null            # remove on majority side
+  rcli 1 sadd res:s partition-born >/dev/null    # concurrent add on island
+  sleep 3
+  heal 1
+  check_set_converged "post-heal set" res:s 40 "keeper partition-born"
+  # the removed element must be gone on every node; the island add survives
+  local i
+  for i in $(seq 0 $((N - 1))); do
+    local m; m=$(rcli "$i" smembers res:s | sort | tr '\n' ' ' | sed 's/ *$//')
+    if [ "$m" = "keeper partition-born" ]; then
+      chk 0 "node $i: removal held, island add survived [$m]"
+    else
+      chk 1 "node $i set contents" "expected [keeper partition-born] got [$m]"
+    fi
+  done
+  # DEL of a whole key across a partition
+  rcli 0 set res:k alive >/dev/null
+  check_converged "key seeded" 20 get res:k
+  partition 2
+  rcli 0 del res:k >/dev/null
+  sleep 2
+  heal 2
+  check_converged "deleted key stays deleted" 40 get res:k
+  local v; v=$(rcli 2 get res:k)
+  [ -z "$v" ] && chk 0 "node 2: DEL survived its partition" \
+              || chk 1 "node 2 resurrected key" "got [$v]"
+}
+
+# ── scenario: freeze_thaw ────────────────────────────────────────────────
+# Jepsen hammer-time: SIGSTOP a node for 20s under load. On apple the VM
+# clock keeps running while the process is frozen → on thaw the node's HLC
+# must absorb the jump (receive rule) without losing or inventing updates.
+freeze_thaw() {
+  fresh_cluster
+  counter_workload chaos:cnt 40 & local W1=$!
+  set_workload chaos:set 40 & local W2=$!
+  sleep 5
+  freeze 1
+  sleep 20
+  thaw 1
+  wait $W1 $W2
+  sleep 3
+  check_counter chaos:cnt
+  check_set chaos:set
+  check_converged "counter" 40 get chaos:cnt
+  check_replication_healed 60
+}
+
+# ── scenario: rolling_churn ──────────────────────────────────────────────
+# Rolling graceful restarts under load (the k8s rollout path: SIGTERM →
+# Leaving → drain → restart with data → cursor resume).
+rolling_churn() {
+  fresh_cluster
+  counter_workload chaos:cnt 50 & local W1=$!
+  set_workload chaos:set 50 & local W2=$!
+  sleep 5
+  local i
+  for i in 0 1 2; do
+    graceful_restart "$i"
+    sleep 4
+  done
+  wait $W1 $W2
+  sleep 3
+  check_counter chaos:cnt
+  check_set chaos:set
+  check_converged "counter" 30 get chaos:cnt
+  check_replication_healed 60
+}
+
+# ── scenario: wipe_replace ───────────────────────────────────────────────
+# Total data loss on one node → fresh replacement bootstraps from peers.
+# All acked data must be readable ON THE FRESH NODE (anti-entropy backfill),
+# and the replication gauge must recover.
+wipe_replace() {
+  fresh_cluster
+  counter_workload chaos:cnt 20 & local W1=$!
+  set_workload chaos:set 20 & local W2=$!
+  wait $W1 $W2
+  sleep 2 # pump flush
+  echo "  --- pre-wipe state (must already satisfy the acked bounds):"
+  check_counter chaos:cnt
+  check_set chaos:set
+  wipe_node 2
+  check_replication_healed 120
+  # interest-free reads on the fresh node: read-through must fetch or the
+  # data must have been re-replicated — either way, nothing may be missing.
+  check_counter chaos:cnt
+  check_set chaos:set
+}
+
+# ── scenario: membership_churn ───────────────────────────────────────────
+# Scale up (node 3 joins mid-workload), let it take ownership, then remove
+# it gracefully. No acked write may be lost across the ownership moves.
+membership_churn() {
+  fresh_cluster
+  counter_workload chaos:cnt 40 & local W1=$!
+  set_workload chaos:set 40 & local W2=$!
+  sleep 5
+  echo "  nemesis: node 3 joins the cluster"
+  if [ "$BACKEND" = docker ]; then
+    docker run -d --name chaos-3 \
+      --network "$EDGE_NET" --ip "$(edge_ip 3)" \
+      -p "$(resp_port 3):6379" -p "$(metrics_port 3):9121" \
+      -e MAREKVS_NODE_ID=3 -e MAREKVS_REPLICAS_N=2 \
+      -e MAREKVS_DATA_DIR=/data -e MAREKVS_ADVERTISE_IP="$(mesh_ip 3)" \
+      -e MAREKVS_SEEDS="$(seeds)" -e RUST_LOG=info,chitchat=warn \
+      "$IMAGE" >/dev/null
+    docker network connect --ip "$(mesh_ip 3)" "$MESH_NET" chaos-3
+  else
+    container run -d --name chaos-3 \
+      -e MAREKVS_NODE_ID=3 -e MAREKVS_REPLICAS_N=2 \
+      -e MAREKVS_DATA_DIR=/data -e MAREKVS_ADVERTISE_IP=auto \
+      -e MAREKVS_SEEDS="$(apple_ip chaos-0):7946" -e RUST_LOG=info,chitchat=warn \
+      "$IMAGE" >/dev/null
+  fi
+  N=4 wait_ready 3
+  sleep 12   # let placement shift and writes land on the newcomer
+  echo "  nemesis: node 3 leaves gracefully"
+  crt stop chaos-3 >/dev/null
+  crt rm -f chaos-3 >/dev/null 2>&1 || true
+  wait $W1 $W2
+  sleep 3
+  check_counter chaos:cnt
+  check_set chaos:set
+  check_converged "counter" 40 get chaos:cnt
+  check_replication_healed 90
+}
+
+# ── scenario: bank ───────────────────────────────────────────────────────
+# Jepsen bank test adapted to AP: transfers between two accounts in one
+# hash tag run as atomic Lua scripts; reads snapshot both balances in one
+# script (same shard → atomic). Total must be conserved on every node's
+# final converged read, through graceful churn. (SIGKILL mid-script could
+# legitimately half-apply — Redis semantics — so this scenario uses
+# graceful restarts only.)
+bank() {
+  fresh_cluster
+  local TOTAL=1000
+  rcli 0 mset '{bank}:a' 500 '{bank}:b' 500 >/dev/null
+  check_converged "bank seeded" 20 get '{bank}:a'
+  local XFER="local amt = tonumber(ARGV[1])
+redis.call('DECRBY', KEYS[1], amt)
+redis.call('INCRBY', KEYS[2], amt)
+return 1"
+  local dur=40 t0=$SECONDS n=0
+  (
+    while [ $((SECONDS - t0)) -lt $dur ]; do
+      wi=$((n % N)); amt=$(( (n % 5) + 1 ))
+      if [ $((n % 2)) = 0 ]; then
+        rcli "$wi" -t 2 eval "$XFER" 2 '{bank}:a' '{bank}:b' "$amt" >/dev/null 2>&1 || true
+      else
+        rcli "$wi" -t 2 eval "$XFER" 2 '{bank}:b' '{bank}:a' "$amt" >/dev/null 2>&1 || true
+      fi
+      n=$((n + 1))
+    done
+  ) & local W=$!
+  sleep 5
+  graceful_restart 1
+  sleep 5
+  graceful_restart 2
+  wait $W
+  sleep 3
+  check_converged "account a" 40 get '{bank}:a'
+  check_converged "account b" 40 get '{bank}:b'
+  local i
+  for i in $(seq 0 $((N - 1))); do
+    local a b sum
+    a=$(rcli "$i" get '{bank}:a'); b=$(rcli "$i" get '{bank}:b')
+    sum=$((a + b))
+    if [ "$sum" = "$TOTAL" ]; then
+      chk 0 "bank total conserved on node $i ($a + $b = $sum)"
+    else
+      chk 1 "bank total on node $i" "$a + $b = $sum, expected $TOTAL — $((sum - TOTAL)) CREATED/DESTROYED"
+    fi
+  done
+}
+
+# ── run ──────────────────────────────────────────────────────────────────
+CHAOS_ROOT=$CHAOS_DIR
+for s in "${SCENARIOS[@]}"; do
+  scenario_banner "$s"
+  CHAOS_DIR="$CHAOS_ROOT/$s"
+  mkdir -p "$CHAOS_DIR"
+  fail_before=$fail
+  "$s"
+  [ "$fail" != "$fail_before" ] && capture_logs "$s"
+done
+CHAOS_DIR=$CHAOS_ROOT
+
+cluster_down
+echo
+if [ "$fail" = 0 ]; then
+  echo "CHAOS TEST PASSED (backend=$BACKEND, scenarios: ${SCENARIOS[*]})"
+else
+  echo "CHAOS TEST FAILED (history preserved in $CHAOS_DIR)"
+  exit 1
+fi
