@@ -28,7 +28,15 @@
 set -euo pipefail
 
 BACKEND=${BACKEND:-docker}
-IMAGE=${IMAGE:-marekvs:dev}
+# CHAOS_DEBUG=1: use the debug image (same binary over alpine + iptables/tc/
+# GNU date, see Dockerfile.debug) and grant the fault-injection caps. The
+# grudge/netem/clock nemeses require it; everything else runs on scratch.
+CHAOS_DEBUG=${CHAOS_DEBUG:-0}
+if [ "$CHAOS_DEBUG" = 1 ]; then
+  IMAGE=${IMAGE:-marekvs:debug}
+else
+  IMAGE=${IMAGE:-marekvs:dev}
+fi
 N=${N:-3}
 MESH_NET=chaos-mesh
 EDGE_NET=chaos-edge
@@ -93,7 +101,9 @@ seeds() {
 node_run() { # <i> — create + start node i
   local i=$1
   if [ "$BACKEND" = docker ]; then
-    docker run -d --name "chaos-$i" \
+    local caps=()
+    [ "$CHAOS_DEBUG" = 1 ] && caps=(--cap-add NET_ADMIN --cap-add SYS_TIME)
+    docker run -d --name "chaos-$i" "${caps[@]}" \
       --network "$EDGE_NET" --ip "$(edge_ip "$i")" \
       -p "$(resp_port "$i"):6379" -p "$(metrics_port "$i"):9121" \
       -e MAREKVS_NODE_ID="$i" -e MAREKVS_REPLICAS_N=2 \
@@ -102,9 +112,10 @@ node_run() { # <i> — create + start node i
       "$IMAGE" >/dev/null
     docker network connect --ip "$(mesh_ip "$i")" "$MESH_NET" "chaos-$i"
   else
-    local aseeds=""
+    local aseeds="" caps=()
     if [ "$i" != 0 ]; then aseeds="$(apple_ip chaos-0):7946"; fi
-    container run -d --name "chaos-$i" \
+    [ "$CHAOS_DEBUG" = 1 ] && caps=(--cap-add CAP_SYS_TIME --cap-add CAP_NET_ADMIN)
+    container run -d --name "chaos-$i" "${caps[@]}" \
       -e MAREKVS_NODE_ID="$i" -e MAREKVS_REPLICAS_N=2 \
       -e MAREKVS_DATA_DIR=/data -e MAREKVS_ADVERTISE_IP=auto \
       -e MAREKVS_SEEDS="$aseeds" -e RUST_LOG=info,chitchat=warn \
@@ -150,6 +161,26 @@ cluster_down() {
   if [ "$BACKEND" = docker ]; then
     docker network rm "$MESH_NET" "$EDGE_NET" >/dev/null 2>&1 || true
   fi
+}
+
+# ── debug-image helpers ──────────────────────────────────────────────────
+
+# Run a command inside node i (debug image only — scratch has no shell).
+nexec() { # <i> <cmd...>
+  crt exec "chaos-$1" "${@:2}"
+}
+
+require_debug() { # <what>
+  if [ "$CHAOS_DEBUG" != 1 ]; then
+    echo "ERROR: $1 needs the debug image — rerun with CHAOS_DEBUG=1 (just chaos-debug / chaos-clock)" >&2
+    exit 2
+  fi
+}
+
+# The interface on the MESH subnet inside node i (nodes have two nics on
+# docker; tc/iptables must hit the mesh one, matched by address).
+mesh_nic() { # <i>
+  nexec "$1" sh -c "ip -o -4 addr show | awk '/172\.29\.10\./ {print \$2; exit}'"
 }
 
 # ── nemeses (jepsen/src/jepsen/nemesis.clj) ──────────────────────────────
@@ -205,6 +236,106 @@ heal() { # <i> — idempotent: docker's disconnect can lag, so tolerate an
     docker network inspect "$MESH_NET" 2>/dev/null | grep -q "\"chaos-$1\"" ||
       docker network connect --ip "$(mesh_ip "$1")" "$MESH_NET" "chaos-$1"
   }
+}
+
+# ── grudge partitions (debug image, iptables) ────────────────────────────
+# Realize a Jepsen grudge (tests/chaos/grudge.py) as symmetric iptables DROP
+# rules on the MESH subnet: node a drops packets from/to node b's mesh IP,
+# both directions, for every cut in the grudge. Clients on the edge net are
+# untouched, so writes continue on every side of the split.
+
+grudge_apply() { # <topology> — halves|bridge|ring, over N nodes
+  require_debug "grudge partitions"
+  echo "  nemesis: grudge partition ($1) over $N nodes"
+  local a b
+  while read -r a b; do
+    [ -n "$a" ] || continue
+    # a refuses b's mesh address in both directions.
+    nexec "$a" iptables -A INPUT  -s "$(mesh_ip "$b")" -j DROP 2>/dev/null || true
+    nexec "$a" iptables -A OUTPUT -d "$(mesh_ip "$b")" -j DROP 2>/dev/null || true
+  done < <(python3 "$(dirname "${BASH_SOURCE[0]}")/grudge.py" "$1" "$N")
+}
+
+grudge_heal() { # flush all grudge rules on every node
+  echo "  nemesis: heal grudge partition"
+  local i
+  for i in $(seq 0 $((N - 1))); do
+    nexec "$i" iptables -F 2>/dev/null || true
+  done
+}
+
+# ── tc-netem packet faults (debug image) ─────────────────────────────────
+# Shape the mesh nic of one node. root qdisc, so a second call replaces the
+# first; net_clear removes it.
+
+net_netem() { # <i> <netem-args...>
+  require_debug "tc-netem packet faults"
+  local nic; nic=$(mesh_nic "$1")
+  nexec "$1" tc qdisc replace dev "$nic" root netem "${@:2}"
+}
+net_delay()   { echo "  nemesis: netem delay ${2}ms on node $1";  net_netem "$1" delay "${2}ms" "${3:-0}ms"; }
+net_loss()    { echo "  nemesis: netem ${2}% loss on node $1";     net_netem "$1" loss "${2}%"; }
+net_corrupt() { echo "  nemesis: netem ${2}% corrupt on node $1";  net_netem "$1" corrupt "${2}%"; }
+net_reorder() { echo "  nemesis: netem reorder on node $1";        net_netem "$1" delay 20ms reorder "${2:-25}%"; }
+net_clear() { # <i>
+  echo "  nemesis: clear netem on node $1"
+  local nic; nic=$(mesh_nic "$1")
+  nexec "$1" tc qdisc del dev "$nic" root 2>/dev/null || true
+}
+
+# ── clock faults (debug image, apple backend) ────────────────────────────
+# Each apple container is its own VM with its own clock, so `date -s` inside
+# node i skews ONLY that node — the vehicle for real HLC clock-skew tests
+# (docker shares one VM clock; can't skew a single node). Needs SYS_TIME /
+# VM root. The static-musl marekvs binary rules out libfaketime.
+
+assert_skewed() { # <i> <ref> — fail the test unless node i's clock differs
+  local a b
+  a=$(nexec "$1" date +%s 2>/dev/null || echo 0)
+  b=$(nexec "$2" date +%s 2>/dev/null || echo 0)
+  local d=$(( a > b ? a - b : b - a ))
+  if [ "$d" -ge 3 ]; then
+    chk 0 "clock skew active: node $1 is ${d}s from node $2"
+  else
+    chk 1 "clock skew injection" "node $1 within ${d}s of node $2 — bump was a NO-OP (missing CAP_SYS_TIME?); test would be vacuous"
+  fi
+}
+
+clock_offset_ok() { # verify a skew actually took effect: node i vs node 0
+  local skew; skew=$(nexec "$1" date +%s 2>/dev/null)
+  local base; base=$(nexec 0 date +%s 2>/dev/null)
+  [ -n "$skew" ] && [ -n "$base" ] && [ "$skew" != "$base" ]
+}
+
+clock_bump() { # <i> <±seconds> — step node i's wall clock by delta
+  require_debug "clock skew"
+  echo "  nemesis: bump node $1 clock by ${2}s"
+  nexec "$1" sh -c "date -s @\$(( \$(date +%s) + ($2) ))" >/dev/null 2>&1 ||
+    echo "  WARNING: clock bump on node $1 failed (needs SYS_TIME / VM root)" >&2
+}
+
+clock_reset() { # <i> — resync node i to the harness host clock
+  echo "  nemesis: reset node $1 clock to true time"
+  nexec "$1" sh -c "date -s @$(date +%s)" >/dev/null 2>&1 || true
+}
+
+clock_strobe_run() { # <i> <delta_s> <period_ms> <duration_s>
+  require_debug "clock strobe"
+  echo "  nemesis: strobe node $1 clock ±${2}s every ${3}ms for ${4}s"
+  local i=$1 delta=$2 period=$3 dur=$4
+  ( local t0=$SECONDS weird=0
+    while [ $((SECONDS - t0)) -lt "$dur" ]; do
+      if [ "$weird" = 0 ]; then
+        nexec "$i" sh -c "date -s @\$(( \$(date +%s) + $delta ))" >/dev/null 2>&1 || true
+        weird=1
+      else
+        nexec "$i" sh -c "date -s @\$(( \$(date +%s) - $delta ))" >/dev/null 2>&1 || true
+        weird=0
+      fi
+      sleep "0.$(printf '%03d' "$period")" 2>/dev/null || sleep 0.5
+    done
+    nexec "$i" sh -c "date -s @$(date +%s)" >/dev/null 2>&1 || true
+  ) &
 }
 
 wipe_node() { # <i> — destroy node incl. its data, boot a fresh replacement

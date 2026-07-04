@@ -221,6 +221,41 @@ chaos-apple: apple-build
 chaos +scenarios: docker-build
     BACKEND=docker ./tests/chaos/chaos_test.sh {{scenarios}}
 
+# build the DEBUG image (same binary, alpine userland + iptables/tc/date)
+[group('chaos')]
+debug-build: _stage-ctx
+    docker build -f .build-ctx/marekvs/Dockerfile.debug -t marekvs:debug .build-ctx
+
+# build the debug image with Apple's container CLI
+[group('chaos')]
+debug-apple-build: _stage-ctx
+    container system start || true
+    container build -f .build-ctx/marekvs/Dockerfile.debug -t marekvs:debug .build-ctx
+
+# privileged-fault suite on docker: grudge partitions (bridge, majority
+# ring) + tc-netem packet faults. Needs the debug image + NET_ADMIN.
+[group('chaos')]
+chaos-debug: debug-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    trap 'CHAOS_DEBUG=1 BACKEND=docker bash -c "source tests/chaos/lib.sh; cluster_down"' EXIT
+    CHAOS_DEBUG=1 BACKEND=docker ./tests/chaos/chaos_test.sh bridge_partition majority_ring slow_peer lossy_writes
+    printf '{{bold}}{{green}}✓ debug fault suite passed{{reset}}\n'
+
+# clock-fault suite on apple containers (per-VM clocks): bump + strobe
+[group('chaos')]
+chaos-clock: debug-apple-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    trap 'CHAOS_DEBUG=1 BACKEND=apple bash -c "source tests/chaos/lib.sh; cluster_down"' EXIT
+    CHAOS_DEBUG=1 BACKEND=apple ./tests/chaos/chaos_test.sh clock_bump_skew clock_strobe
+    printf '{{bold}}{{green}}✓ clock fault suite passed{{reset}}\n'
+
+# self-test the pure grudge topology builders (no cluster needed)
+[group('chaos')]
+grudge-test:
+    python3 tests/chaos/grudge.py --test
+
 # ══ kubernetes ═══════════════════════════════════════════════════════════
 
 # apply the example deployment from k8s/ (see k8s/README.md)

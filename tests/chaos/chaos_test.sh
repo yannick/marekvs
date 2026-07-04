@@ -269,6 +269,140 @@ return 1"
   done
 }
 
+# ── scenario: bridge_partition (debug, docker) ───────────────────────────
+# Jepsen bridge nemesis: two halves that can't see each other, plus a lone
+# bridge node that sees both — writes flow through the bridge and diverge on
+# the two sides. Heal, assert CRDT convergence + counter/set correctness.
+# Needs N=5 for a meaningful bridge (2 | 2 + bridge).
+bridge_partition() {
+  N=5 fresh_cluster
+  N=5 counter_workload chaos:cnt 40 & local W1=$!
+  N=5 set_workload chaos:set 40 & local W2=$!
+  N=5 register_workload chaos:reg 40 & local W3=$!
+  sleep 5
+  N=5 grudge_apply bridge
+  sleep 15
+  N=5 grudge_heal
+  wait $W1 $W2 $W3
+  sleep 3
+  N=5 check_counter chaos:cnt
+  N=5 check_set chaos:set
+  N=5 check_converged "LWW register" 45 get chaos:reg
+  N=5 check_replication_healed 90
+}
+
+# ── scenario: majority_ring (debug, docker) ──────────────────────────────
+# Jepsen majorities-ring: every node sees a (different) majority; no clean
+# two-component split, so placement/AE are maximally stressed. N=5.
+majority_ring() {
+  N=5 fresh_cluster
+  N=5 counter_workload chaos:cnt 40 & local W1=$!
+  N=5 set_workload chaos:set 40 & local W2=$!
+  sleep 5
+  N=5 grudge_apply ring
+  sleep 15
+  N=5 grudge_heal
+  wait $W1 $W2
+  sleep 3
+  N=5 check_counter chaos:cnt
+  N=5 check_set chaos:set
+  N=5 check_converged "counter" 45 get chaos:cnt
+  N=5 check_replication_healed 90
+}
+
+# ── scenario: slow_peer (debug, docker) ──────────────────────────────────
+# design/10 §10.3: delay one node's mesh nic hard enough that the 128 MiB
+# replication ring overruns and the pump hits a GAP — Merkle anti-entropy
+# must then repair. Verifies the ring-gap→AE fallback end to end (today it
+# is only a tracing::warn on the push path).
+slow_peer() {
+  fresh_cluster
+  counter_workload chaos:cnt 50 & local W1=$!
+  set_workload chaos:set 50 & local W2=$!
+  sleep 5
+  net_delay 1 800 200   # 800ms±200ms: replication falls far behind
+  sleep 25
+  net_clear 1
+  wait $W1 $W2
+  sleep 5
+  check_counter chaos:cnt 90       # AE repair is slower than push
+  check_set chaos:set 90
+  check_converged "counter" 90 get chaos:cnt
+  check_replication_healed 120
+}
+
+# ── scenario: lossy_writes (debug, docker) ───────────────────────────────
+# 25% packet loss on one node's mesh nic during load. Retries make ops
+# indeterminate (the checker envelope absorbs that), but nothing acked may
+# be lost and the cluster must converge once loss clears.
+lossy_writes() {
+  fresh_cluster
+  counter_workload chaos:cnt 40 & local W1=$!
+  set_workload chaos:set 40 & local W2=$!
+  sleep 5
+  net_loss 1 25
+  net_corrupt 2 5
+  sleep 18
+  net_clear 1; net_clear 2
+  wait $W1 $W2
+  sleep 5
+  check_counter chaos:cnt 90
+  check_set chaos:set 90
+  check_converged "counter" 90 get chaos:cnt
+  check_replication_healed 120
+}
+
+# ── scenario: clock_bump_skew (debug, apple) ─────────────────────────────
+# Per-VM clocks (apple) let us skew ONE node's wall clock while it takes
+# writes. The HLC receive rule must absorb it: a node bumped +N seconds must
+# not make its LWW writes win forever, and counters/sets stay exact. This is
+# the regression test the receive rule never had.
+clock_bump_skew() {
+  require_debug "clock skew"
+  [ "$BACKEND" = apple ] || { echo "  (skipped: clock skew needs the apple backend)"; return 0; }
+  fresh_cluster
+  counter_workload chaos:cnt 45 & local W1=$!
+  set_workload chaos:set 45 & local W2=$!
+  register_workload chaos:reg 45 & local W3=$!
+  sleep 5
+  clock_bump 1 10      # node 1 jumps +10s
+  assert_skewed 1 0    # fail loudly if the bump was a no-op (vacuous test)
+  sleep 5
+  clock_bump 2 -10     # node 2 jumps -10s (into the past)
+  sleep 8
+  clock_bump 1 100     # node 1 far future
+  sleep 5
+  clock_reset 1; clock_reset 2
+  wait $W1 $W2 $W3
+  sleep 3
+  check_counter chaos:cnt
+  check_set chaos:set
+  check_converged "LWW register after skew" 45 get chaos:reg
+  check_replication_healed 90
+}
+
+# ── scenario: clock_strobe (debug, apple) ────────────────────────────────
+# Strobe one node's clock ±4s for 20s under load (Jepsen strobe): rapid
+# back-and-forth jumps, the harshest test of HLC monotonicity.
+clock_strobe() {
+  require_debug "clock strobe"
+  [ "$BACKEND" = apple ] || { echo "  (skipped: clock strobe needs the apple backend)"; return 0; }
+  fresh_cluster
+  counter_workload chaos:cnt 45 & local W1=$!
+  set_workload chaos:set 45 & local W2=$!
+  sleep 5
+  clock_bump 1 8       # prove skew works before strobing
+  assert_skewed 1 0
+  clock_strobe_run 1 4 500 20   # ±4s, toggle every 500ms, for 20s
+  wait $W1 $W2
+  clock_reset 1
+  sleep 3
+  check_counter chaos:cnt
+  check_set chaos:set
+  check_converged "counter after strobe" 45 get chaos:cnt
+  check_replication_healed 90
+}
+
 # ── run ──────────────────────────────────────────────────────────────────
 CHAOS_ROOT=$CHAOS_DIR
 for s in "${SCENARIOS[@]}"; do
