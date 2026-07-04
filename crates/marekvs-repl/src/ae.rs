@@ -17,15 +17,26 @@ use xxhash_rust::xxh3::xxh3_64;
 
 pub const BUCKETS: usize = 256;
 
-fn entry_hash(ikey: &[u8], hlc: u64) -> u64 {
-    let mut buf = Vec::with_capacity(ikey.len() + 8);
+fn entry_hash(ikey: &[u8], hlc: u64, vhash: u64) -> u64 {
+    let mut buf = Vec::with_capacity(ikey.len() + 16);
     buf.extend_from_slice(ikey);
     buf.extend_from_slice(&hlc.to_be_bytes());
+    buf.extend_from_slice(&vhash.to_be_bytes());
     xxh3_64(&buf)
 }
 
 fn record_hlc(value: &[u8]) -> u64 {
     Envelope::decode(value).map_or(0, |(e, _)| e.hlc)
+}
+
+/// Content hash of the whole stored record. Digests and bucket entries must
+/// be CONTENT-aware, not just version-aware: merged CRDT records (PN
+/// counters, HLL registers) can hold DIFFERENT slot sets under the SAME
+/// envelope version (= symmetric max), so an (ikey, hlc)-only digest calls
+/// two divergent replicas identical and Merkle repair never fires (chaos
+/// clock_bump finding: nodes stuck at different counter values forever).
+fn record_vhash(value: &[u8]) -> u64 {
+    xxh3_64(value)
 }
 
 /// XOR-fold digests of all 256 buckets of a partition.
@@ -38,7 +49,7 @@ pub async fn bucket_digests(store: &Arc<Store>, pid: Pid) -> Vec<u64> {
                     return true;
                 }
                 let bucket = (xxh3_64(k) & 0xFF) as usize;
-                digests[bucket] ^= entry_hash(k, record_hlc(v));
+                digests[bucket] ^= entry_hash(k, record_hlc(v), record_vhash(v));
                 true
             });
             digests
@@ -55,8 +66,8 @@ pub async fn partition_root(store: &Arc<Store>, pid: Pid) -> u64 {
     xxh3_64(&bytes)
 }
 
-/// (ikey_hash, hlc) for every record in one bucket.
-pub async fn bucket_entries(store: &Arc<Store>, pid: Pid, bucket: u8) -> Vec<(u64, u64)> {
+/// (ikey_hash, hlc, value_hash) for every record in one bucket.
+pub async fn bucket_entries(store: &Arc<Store>, pid: Pid, bucket: u8) -> Vec<(u64, u64, u64)> {
     store
         .run(pid, move |ctx| {
             let mut entries = Vec::new();
@@ -65,7 +76,7 @@ pub async fn bucket_entries(store: &Arc<Store>, pid: Pid, bucket: u8) -> Vec<(u6
                     return true;
                 }
                 if (xxh3_64(k) & 0xFF) as u8 == bucket {
-                    entries.push((xxh3_64(k), record_hlc(v)));
+                    entries.push((xxh3_64(k), record_hlc(v), record_vhash(v)));
                 }
                 true
             });
@@ -80,9 +91,12 @@ pub async fn diff_bucket(
     store: &Arc<Store>,
     pid: Pid,
     bucket: u8,
-    theirs: &[(u64, u64)],
+    theirs: &[(u64, u64, u64)],
 ) -> (Vec<ReplOp>, Vec<u64>) {
-    let theirs: std::collections::HashMap<u64, u64> = theirs.iter().copied().collect();
+    let theirs: std::collections::HashMap<u64, (u64, u64)> = theirs
+        .iter()
+        .map(|(h, hlc, vh)| (*h, (*hlc, *vh)))
+        .collect();
     store
         .run(pid, move |ctx| {
             let mut push = Vec::new();
@@ -96,23 +110,29 @@ pub async fn diff_bucket(
                 }
                 let h = xxh3_64(k);
                 let hlc = record_hlc(v);
-                mine.insert(h, hlc);
-                match theirs.get(&h) {
-                    None => push.push(ReplOp {
+                let vh = record_vhash(v);
+                mine.insert(h, (hlc, vh));
+                // Push when we are strictly newer, OR same version but
+                // different content (divergent merged CRDT state — both
+                // sides push, both merge, digests converge).
+                let send = match theirs.get(&h) {
+                    None => true,
+                    Some((thlc, tvh)) => hlc > *thlc || (hlc == *thlc && vh != *tvh),
+                };
+                if send {
+                    push.push(ReplOp {
                         ikey: k.to_vec(),
                         value: v.to_vec(),
-                    }),
-                    Some(their_hlc) if hlc > *their_hlc => push.push(ReplOp {
-                        ikey: k.to_vec(),
-                        value: v.to_vec(),
-                    }),
-                    _ => {}
+                    });
                 }
                 true
             });
             let want: Vec<u64> = theirs
                 .iter()
-                .filter(|(h, their_hlc)| mine.get(*h).is_none_or(|m| m < their_hlc))
+                .filter(|(h, (thlc, tvh))| {
+                    mine.get(*h)
+                        .is_none_or(|(mhlc, mvh)| mhlc < thlc || (mhlc == thlc && mvh != tvh))
+                })
                 .map(|(h, _)| *h)
                 .collect();
             (push, want)

@@ -107,6 +107,7 @@ impl ReplEngine {
         //    node-local zset score index, tag 'Z').
         {
             let ring = ring.clone();
+            let self_node = store.node_id;
             store.set_commit_hook(Some(Arc::new(move |seq: u64, ops: &[ondadb::CommitOp]| {
                 // Configured-standalone with no discovered members → nobody
                 // will ever read the ring; skip the per-record clones. See
@@ -115,23 +116,24 @@ impl ReplEngine {
                 if !ring.buffering_needed() {
                     return;
                 }
-                let mut grouped: Vec<(u16, Vec<ReplOp>)> = Vec::new();
+                // Attribution comes from the COMMIT CONTEXT (which batch is
+                // being applied on this shard thread), not the record
+                // envelope: merged CRDT records carry the version winner's
+                // origin, which misattributes local commits under clock
+                // skew (see store::set_apply_origin).
+                let origin = marekvs_engine::store::current_apply_origin().unwrap_or(self_node);
+                let mut out: Vec<ReplOp> = Vec::new();
                 for op in ops {
                     if matches!(ikey::parse(&op.key), Some(p) if p.tag == b'Z') {
                         continue;
                     }
-                    let origin = Envelope::decode(&op.value).map_or(u16::MAX, |(e, _)| e.origin);
-                    let rop = ReplOp {
+                    out.push(ReplOp {
                         ikey: op.key.clone(),
                         value: op.value.clone(),
-                    };
-                    match grouped.last_mut() {
-                        Some((o, v)) if *o == origin => v.push(rop),
-                        _ => grouped.push((origin, vec![rop])),
-                    }
+                    });
                 }
-                for (origin, ops) in grouped {
-                    ring.push(origin, Some(seq), ops);
+                if !out.is_empty() {
+                    ring.push(origin, Some(seq), out);
                 }
             })));
         }
@@ -525,7 +527,7 @@ impl ReplEngine {
                     .inc_by(batch.ops.len() as u64);
                 let count = batch.ops.len() as u64;
                 for op in &batch.ops {
-                    self.apply_op(op.clone()).await;
+                    self.apply_op_from(op.clone(), Some(batch.origin)).await;
                 }
                 if batch.implicit_sub {
                     self.register_interest_ops(peer, &batch.ops);
@@ -668,7 +670,7 @@ impl ReplEngine {
                     .ae_repair_ops_total
                     .inc_by(ops.len() as u64);
                 for op in ops {
-                    self.apply_op(op).await;
+                    self.apply_op_from(op, Some(peer)).await;
                 }
             }
             PeerMsg::BootstrapReq { pid } => {
@@ -676,7 +678,7 @@ impl ReplEngine {
             }
             PeerMsg::BootstrapChunk { ops, .. } => {
                 for op in ops {
-                    self.apply_op(op).await;
+                    self.apply_op_from(op, Some(peer)).await;
                 }
             }
             PeerMsg::BootstrapDone { pid, .. } => {
@@ -700,6 +702,14 @@ impl ReplEngine {
     /// Merge a remote record into local storage on its shard thread.
     /// Zset member records also rebuild the local score index.
     pub async fn apply_op(&self, op: ReplOp) {
+        self.apply_op_from(op, None).await
+    }
+
+    /// Apply a replicated record, attributing the resulting commit to
+    /// `origin` (the node whose seq space delivered it) for ring
+    /// echo-suppression. None = unknown source (counts as remote: u16::MAX
+    /// suppresses the origin==self home push without claiming a peer).
+    pub async fn apply_op_from(&self, op: ReplOp, origin: Option<NodeId>) {
         let Some(p) = ikey::parse(&op.ikey) else {
             return;
         };
@@ -717,8 +727,10 @@ impl ReplEngine {
         }
         let pid = p.pid;
         let (userkey, suffix, tag) = (p.userkey.to_vec(), p.suffix.to_vec(), p.tag);
+        let attr = origin.unwrap_or(u16::MAX);
         self.store
             .run(pid, move |ctx| {
+                let _guard = store::set_apply_origin(attr);
                 if tag == b'z' {
                     marekvs_engine::cmd::zset::apply_member_record(
                         ctx, &userkey, &suffix, &op.value,
@@ -917,7 +929,7 @@ impl ReadThrough for ReplEngine {
                     self.request(target, id, msg).await
                 {
                     for op in &ops {
-                        self.apply_op(op.clone()).await;
+                        self.apply_op_from(op.clone(), Some(target)).await;
                     }
                     self.leases.lock().insert(
                         userkey.to_vec(),

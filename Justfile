@@ -80,9 +80,9 @@ fmt-check:
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
 
-# fmt-check + clippy + tests: the CI gate
+# fmt-check + clippy + tests + grudge-topology self-test: the CI gate
 [group('quality')]
-ci: fmt-check clippy test
+ci: fmt-check clippy test grudge-test
     @printf '{{bold}}{{green}}✓ CI gate passed{{reset}}\n'
 
 # ══ test ═════════════════════════════════════════════════════════════════

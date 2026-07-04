@@ -108,7 +108,7 @@ node_run() { # <i> — create + start node i
       -p "$(resp_port "$i"):6379" -p "$(metrics_port "$i"):9121" \
       -e MAREKVS_NODE_ID="$i" -e MAREKVS_REPLICAS_N=2 \
       -e MAREKVS_DATA_DIR=/data -e MAREKVS_ADVERTISE_IP="$(mesh_ip "$i")" \
-      -e MAREKVS_SEEDS="$(seeds)" -e RUST_LOG=info,chitchat=warn \
+      -e MAREKVS_SEEDS="$(seeds)" -e RUST_LOG=${CHAOS_LOG:-info},chitchat=warn \
       "$IMAGE" >/dev/null
     docker network connect --ip "$(mesh_ip "$i")" "$MESH_NET" "chaos-$i"
   else
@@ -118,7 +118,7 @@ node_run() { # <i> — create + start node i
     container run -d --name "chaos-$i" "${caps[@]}" \
       -e MAREKVS_NODE_ID="$i" -e MAREKVS_REPLICAS_N=2 \
       -e MAREKVS_DATA_DIR=/data -e MAREKVS_ADVERTISE_IP=auto \
-      -e MAREKVS_SEEDS="$aseeds" -e RUST_LOG=info,chitchat=warn \
+      -e MAREKVS_SEEDS="$aseeds" -e RUST_LOG=${CHAOS_LOG:-info},chitchat=warn \
       "$IMAGE" >/dev/null
   fi
 }

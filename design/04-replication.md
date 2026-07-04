@@ -92,6 +92,25 @@ their origin — each one closes a hole the chaos suite actually caught:
 3. **Backlog-aware drain.** SIGTERM waits (bounded) for all peer cursors
    to reach the ring head before exiting, instead of a fixed grace sleep —
    the last-moment ack window otherwise leaves with the process.
+4. **Commit-context attribution, not envelope origin.** Each ring entry's
+   origin (used by the fan-out rule to suppress echo) is the origin of the
+   *batch being applied on the shard thread* — a thread-local set around
+   the apply job — not the record envelope's origin. A merged CRDT record
+   keeps the version winner's origin, so envelope-based attribution made a
+   node that held a clock-skewed peer's future-stamped counter attribute
+   its OWN later increments to that peer, and the `origin == self` home
+   push dropped them for the duration of the skew. See design/10 finding 5.
+
+### Anti-entropy digests are content-aware
+
+The Merkle bucket digest and diff key on `(ikey, hlc, value_hash)`, not
+just `(ikey, hlc)`. Merged CRDT records (PN counters, HLL registers) can
+carry the **same** envelope version (version = symmetric max) with
+**different** payloads on two replicas; a version-only digest calls them
+equal and AE never repairs the divergence. The value hash makes
+equal-version/different-content records repair in both directions — the
+backstop that guarantees convergence even when the push path mis-fires
+(design/10 finding 6).
 
 ### Wire format
 
