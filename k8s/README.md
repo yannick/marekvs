@@ -22,8 +22,10 @@ just k8s-delete       # remove the deployment, keep the data
 ```
 
 The image reference in `statefulset.yaml` points at
-`ghcr.io/yannick/marekvs:latest` — build your own with `just docker-build`
-and retag, or adjust the reference.
+`ghcr.io/yannick/marekvs:latest`, which CI publishes on every push to main
+(`.github/workflows/docker.yml`, linux/amd64 + linux/arm64; also
+`sha-<commit>` and `vX.Y.Z` tags — pin one of those for production, and
+`:debug` for the chaos-harness image).
 
 ## What's in the box
 
