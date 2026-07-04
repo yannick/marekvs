@@ -39,7 +39,8 @@ spec:
               app: marekvs
       containers:
         - name: marekvs
-          # Build and push your own: `just docker-build` then retag, or use CI.
+          # Published automatically by CI (.github/workflows/docker.yml)
+          # on every push to main; pin a sha-/vX.Y.Z tag for production.
           image: ghcr.io/yannick/marekvs:latest
           ports:
             - containerPort: 6379
