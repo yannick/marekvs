@@ -27,6 +27,26 @@ The image reference in `statefulset.yaml` points at
 `sha-<commit>` and `vX.Y.Z` tags — pin one of those for production, and
 `:debug` for the chaos-harness image).
 
+For **Flux image automation**, every main push also gets a sortable
+`main-<sha7>-<unix-timestamp>` tag (`debug-main-…` for the debug image).
+Pair it with:
+
+```yaml
+apiVersion: image.toolkit.fluxcd.io/v1beta2
+kind: ImagePolicy
+metadata:
+  name: marekvs
+spec:
+  imageRepositoryRef:
+    name: marekvs        # ImageRepository for ghcr.io/yannick/marekvs
+  filterTags:
+    pattern: '^main-[a-f0-9]+-(?P<ts>[0-9]+)$'
+    extract: '$ts'
+  policy:
+    numerical:
+      order: asc
+```
+
 ## What's in the box
 
 | File | Contents |
