@@ -1,0 +1,31 @@
+# marekvs DEBUG image — the SAME binary as the production image (identical
+# build stage) over a small alpine userland with fault-injection tools:
+# iptables (grudge partitions), tc/iproute2 (netem packet faults), GNU date
+# (clock bump/strobe on Apple containers). Used only by the chaos harness
+# (CHAOS_DEBUG=1); the production image stays FROM scratch.
+#
+#   just debug-build        (docker,  tag marekvs:debug)
+#   just debug-apple-build  (Apple container CLI)
+#
+# Debug containers run with NET_ADMIN (+ SYS_TIME for clock faults) — never
+# run this image, or those caps, in production.
+
+# ---- build stage (identical to Dockerfile) --------------------------------
+FROM rust:1-alpine AS build
+RUN apk add --no-cache musl-dev build-base
+WORKDIR /src
+COPY ondadb/ ondadb/
+COPY marekvs/ marekvs/
+WORKDIR /src/marekvs
+RUN cargo build --release -p marekvs-server -p marekvs-operator \
+ && cp target/release/marekvs-server /marekvs \
+ && cp target/release/marekvs-operator /marekvs-operator
+
+# ---- debug runtime stage --------------------------------------------------
+FROM alpine:3.20
+# iproute2: tc (netem); iptables: grudge partitions; coreutils: GNU date -s.
+RUN apk add --no-cache iproute2 iptables coreutils
+COPY --from=build /marekvs /marekvs
+COPY --from=build /marekvs-operator /marekvs-operator
+EXPOSE 6379 7373 7946/udp 9121
+ENTRYPOINT ["/marekvs"]

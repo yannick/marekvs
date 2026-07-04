@@ -102,10 +102,51 @@ counters exact, so the harness now *asserts* them.
 4. **Fixed-sleep drain.** SIGTERM slept 3 s and exited regardless of the
    ring backlog; a write acked in the last moment left with the process.
    Fix: drain until all peer cursors reach the ring head (bounded).
+5. **Ring misattribution under clock skew** (found by the debug-image
+   clock-bump scenario). The commit hook attributed each ring entry to the
+   record ENVELOPE's origin. A merged CRDT record (PN counter, HLL) keeps
+   the version *winner's* origin — so once a node held a future-stamped
+   counter from a clock-bumped peer, every subsequent LOCAL increment it
+   committed was attributed to that peer, and the pump's `origin == self`
+   home-push rule dropped them all. Replication to a peer stalled for the
+   full skew (~100 s), losing 100s of acked increments cluster-wide. Fix:
+   attribute ring entries by the *commit context* (which batch is being
+   applied on the shard thread; `store::set_apply_origin`), not the
+   envelope.
+6. **Version-only AE digests miss CRDT divergence** (same scenario). The
+   Merkle bucket digest and diff keyed on (ikey, hlc). Two replicas can
+   hold the SAME counter version (envelope version = symmetric max) with
+   DIFFERENT slot sets, so the digests matched and anti-entropy — the
+   backstop that should have caught bug 5 — never fired. Fix: digests and
+   diffs are content-aware (add a value hash); equal-version-different-
+   content records repair in both directions.
 
-Not yet ported from the plan: bridge/majority-ring partition topologies
-(need iptables inside nodes), tc-netem slow-peer, deliberate clock
-bump/strobe. These need a debug image with a shell.
+### Debug-image faults (privileged, opt-in)
+
+Three faults need tooling inside the node container — `iptables`, `tc`,
+a settable clock — that the `FROM scratch` production image omits. A
+separate `Dockerfile.debug` (same binary over alpine + iproute2/iptables/
+coreutils) carries them; `CHAOS_DEBUG=1` selects it and adds `NET_ADMIN`
+(+ `CAP_SYS_TIME` on apple). Plan: `tests/chaos/DEBUG-PLAN.md`.
+
+- **Grudge partitions** (`just chaos-debug`, docker): Jepsen bridge and
+  majorities-ring topologies (`tests/chaos/grudge.py`, self-tested pure
+  builders) applied as symmetric iptables DROP rules on the mesh subnet —
+  arbitrary split-brain shapes, not just single-node isolation.
+- **tc-netem packet faults**: `slow_peer` delays one node's mesh nic hard
+  enough to overrun the replication ring and force the gap→AE repair path
+  (verified: 126 ring-gap warnings, data still converged); `lossy_writes`
+  runs 25 % loss + 5 % corruption under load.
+- **Clock bump/strobe** (`just chaos-clock`, apple): per-VM clocks let one
+  node's wall clock be skewed with `date -s` (CAP_SYS_TIME). Bugs 5 and 6
+  came from here. `assert_skewed` fails the run if the skew was a no-op, so
+  the test can never pass vacuously. Docker can't do single-node skew (one
+  shared VM clock; time namespaces virtualize only CLOCK_MONOTONIC), so
+  clock faults are apple-only by construction.
+
+Still not ported: bridge/ring for N>5 exact solutions, netem
+reorder/duplicate scenarios, and Jepsen's exponential bump/strobe offset
+distributions (we use fixed ±10/±100 s and a ±4 s strobe).
 
 ## 10.4 Kubernetes chaos <a name="104"></a>
 

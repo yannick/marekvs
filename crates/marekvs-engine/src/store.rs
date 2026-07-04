@@ -370,6 +370,39 @@ fn expiry_tombstone(env: &Envelope, payload: &[u8]) -> Vec<u8> {
 // ShardCtx storage helpers (used by command handlers and the apply path)
 // ---------------------------------------------------------------------------
 
+thread_local! {
+    /// Origin of the replication batch currently being applied on this
+    /// shard thread, if any. The ondadb commit hook attributes ring entries
+    /// to this — NOT to the record envelope's origin: a merged CRDT record
+    /// (PN counter, HLL) keeps the VERSION WINNER's origin in its envelope,
+    /// so a node holding a future-stamped record would misattribute all its
+    /// own subsequent commits to the skewed peer and the pump's
+    /// `origin == self` home-push rule would silently drop them (chaos
+    /// clock_bump finding: replication stalled for 100s after a +100s bump).
+    static APPLY_ORIGIN: std::cell::Cell<Option<NodeId>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Mark the current shard-thread commit(s) as an apply from `origin`
+/// (replication/AE/bootstrap ingest). Cleared by the guard's Drop.
+pub fn set_apply_origin(origin: NodeId) -> ApplyOriginGuard {
+    APPLY_ORIGIN.with(|c| c.set(Some(origin)));
+    ApplyOriginGuard
+}
+
+/// The commit attribution for the hook: the applying batch's origin, or
+/// None for a locally-initiated command (caller substitutes self).
+pub fn current_apply_origin() -> Option<NodeId> {
+    APPLY_ORIGIN.with(|c| c.get())
+}
+
+pub struct ApplyOriginGuard;
+impl Drop for ApplyOriginGuard {
+    fn drop(&mut self) {
+        APPLY_ORIGIN.with(|c| c.set(None));
+    }
+}
+
 /// Raw point read; NotFound → None.
 pub fn get_raw(ctx: &ShardCtx, ikey: &[u8]) -> Option<Vec<u8>> {
     match ctx.db.get(&ctx.data, ikey) {
