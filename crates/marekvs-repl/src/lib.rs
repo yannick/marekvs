@@ -213,16 +213,20 @@ impl ReplEngine {
     fn spawn_view_watcher(self: Arc<Self>) {
         tokio::spawn(async move {
             let mut watch = self.cluster.watch();
-            let mut dialed: HashMap<NodeId, ()> = HashMap::new();
+            let mut dialed: HashMap<NodeId, std::net::SocketAddr> = HashMap::new();
             loop {
                 let view = self.cluster.view();
                 self.ring
                     .members
                     .store(view.members.len(), std::sync::atomic::Ordering::Relaxed);
                 for m in &view.members {
-                    // Lower id dials (design/04 §Transport).
-                    if m.node > self.store.node_id && !dialed.contains_key(&m.node) {
-                        dialed.insert(m.node, ());
+                    // Lower id dials (design/04 §Transport). Re-dial when a
+                    // restarted peer gossips a NEW mesh address — the old
+                    // reconnect loops dial a dead IP forever otherwise
+                    // (chaos finding: mesh-orphaned node on Apple
+                    // containers, where every restart changes the IP).
+                    if m.node > self.store.node_id && dialed.get(&m.node) != Some(&m.mesh_addr) {
+                        dialed.insert(m.node, m.mesh_addr);
                         self.mesh.clone().maintain_peer(m.node, m.mesh_addr).await;
                     }
                 }

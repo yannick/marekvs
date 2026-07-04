@@ -35,6 +35,13 @@ EDGE_NET=chaos-edge
 MESH_SUBNET=172.29.10.0/24
 EDGE_SUBNET=172.29.11.0/24
 CHAOS_DIR=${CHAOS_DIR:-$(mktemp -d /tmp/marekvs-chaos.XXXXXX)}
+# Apple containers get a NEW IP on every restart (like k8s pods) and the
+# v1.0 CLI offers neither static IPs nor working DNS registration. Initial
+# seeding is therefore staged (node 0 boots first, the rest seed off its
+# current IP); RESTART survival comes from marekvs itself: every node
+# persists its peers'\'' gossip addresses (meta "peers:last") and merges them
+# into its seed list at boot, so a revived node re-finds the survivors at
+# their unchanged addresses and gossip heals the rest.
 
 mesh_ip() { echo "172.29.10.$((10 + $1))"; }
 edge_ip() { echo "172.29.11.$((10 + $1))"; }

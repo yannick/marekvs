@@ -28,6 +28,11 @@ pub struct Mesh {
     /// (bytes in, bytes out) counters from the engine's metrics registry.
     pub traffic: Option<(prometheus::IntCounter, prometheus::IntCounter)>,
     peers: RwLock<HashMap<NodeId, PeerHandle>>,
+    /// Current dial target per peer. A restarted peer can come back on a
+    /// NEW address (no static IPs / no DNS — chaos finding on Apple
+    /// containers); reconnect loops check this slot each iteration and exit
+    /// when superseded, and maintain_peer for the new address takes over.
+    dial_addrs: parking_lot::Mutex<HashMap<NodeId, SocketAddr>>,
     /// (peer, msg) stream consumed by the ReplEngine.
     pub incoming_tx: mpsc::Sender<(NodeId, PeerMsg)>,
     /// Peers connected/disconnected notifications (peer, connected).
@@ -45,6 +50,7 @@ impl Mesh {
             node_id,
             traffic,
             peers: RwLock::new(HashMap::new()),
+            dial_addrs: parking_lot::Mutex::new(HashMap::new()),
             incoming_tx,
             events_tx,
         })
@@ -125,11 +131,17 @@ impl Mesh {
     /// Dial loop: keep ctl+bulk connections to `peer` alive while it stays in
     /// the membership view. Only called for peers with id > self (lower dials).
     pub async fn maintain_peer(self: Arc<Self>, peer: NodeId, addr: SocketAddr) {
+        // Supersede any reconnect loops dialing an older address.
+        self.dial_addrs.lock().insert(peer, addr);
         for kind in [ConnKind::Ctl, ConnKind::Bulk] {
             let mesh = self.clone();
             tokio::spawn(async move {
                 let mut backoff = Duration::from_millis(100);
                 loop {
+                    if mesh.dial_addrs.lock().get(&peer) != Some(&addr) {
+                        tracing::info!(peer, %addr, "dial loop superseded by new address");
+                        return;
+                    }
                     match TcpStream::connect(addr).await {
                         Ok(mut stream) => {
                             backoff = Duration::from_millis(100);

@@ -10,6 +10,14 @@
   node finds itself isolated. Kubernetes is used **only** for seeding — the
   membership source of truth is gossip, so the data plane never depends on the
   apiserver.
+- **Persisted fallback seeds** (chaos finding): every node stores its
+  peers' gossip addresses in its meta CF (`peers:last`, updated on every
+  view change) and merges them into the seed list at boot. In environments
+  with neither stable IPs nor DNS registration — Apple containers hand out
+  a fresh IP on every restart — a revived node's configured seeds are all
+  stale; the persisted survivor addresses (unchanged, since the survivors
+  did not restart) let it rejoin, and gossip propagates its new address to
+  everyone else. On k8s this is a no-op safety net behind DNS.
 - Node KV payload gossiped: `state`, `mesh_addr` (ip:7373), `epoch`
   (incarnation, bumped every boot), `pubsub_summary` (channel list or bloom,
   versioned), `has_patterns`, `last_alive` heartbeat stamp.

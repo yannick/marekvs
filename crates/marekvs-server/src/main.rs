@@ -91,13 +91,13 @@ async fn main() -> anyhow::Result<()> {
     let gossip_addr: SocketAddr = env_or("MAREKVS_GOSSIP_ADDR", "0.0.0.0:7946").parse()?;
     let metrics_addr: SocketAddr = env_or("MAREKVS_METRICS_ADDR", "0.0.0.0:9121").parse()?;
     let advertise_ip = env_or("MAREKVS_ADVERTISE_IP", "127.0.0.1");
-    let seeds: Vec<String> = env_or("MAREKVS_SEEDS", "")
+    let env_seeds: Vec<String> = env_or("MAREKVS_SEEDS", "")
         .split(',')
         .filter(|s| !s.is_empty())
         .map(|s| s.trim().to_string())
         .collect();
     let replicas_n: usize = env_or("MAREKVS_REPLICAS_N", "3").parse()?;
-    let seeds_empty = seeds.is_empty();
+    let seeds_empty = env_seeds.is_empty();
 
     // The advertise address may be a hostname (compose service, pod DNS) —
     // resolve it to an IP once at startup.
@@ -109,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
         %resp_addr,
         %mesh_advertise,
         %gossip_advertise,
-        ?seeds,
+        seeds = ?env_seeds,
         replicas_n,
         "marekvs starting"
     );
@@ -124,6 +124,35 @@ async fn main() -> anyhow::Result<()> {
         store_cfg.shard_threads = v.parse().expect("MAREKVS_SHARDS must be a number");
     }
     let store = Store::open(&store_cfg)?;
+
+    // Last-known peer gossip addresses from the previous run: merged into
+    // the seed list so a restarted node can rejoin even when the configured
+    // seeds are stale (no static IPs / no DNS — e.g. Apple containers hand
+    // out a fresh IP on every restart; k8s covers this with DNS seeds).
+    let persisted_seeds: Vec<String> = {
+        let store = store.clone();
+        store
+            .run(0, |ctx| match ctx.db.get(&ctx.meta, b"peers:last") {
+                Ok(v) => String::from_utf8_lossy(&v)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect(),
+                Err(_) => Vec::new(),
+            })
+            .await
+    };
+    if !persisted_seeds.is_empty() {
+        tracing::info!(
+            ?persisted_seeds,
+            "merging last-known peer addresses into seeds"
+        );
+    }
+    let mut seeds = env_seeds.clone();
+    for p in persisted_seeds {
+        if !seeds.contains(&p) {
+            seeds.push(p);
+        }
+    }
     let engine = Engine::new(store.clone());
 
     // Cluster membership.
@@ -138,6 +167,43 @@ async fn main() -> anyhow::Result<()> {
         gossip_interval: Duration::from_millis(500),
     })
     .await?;
+
+    // Persist every OTHER member's gossip address on view changes — the
+    // "peers:last" fallback seeds read at boot (see above).
+    {
+        let cluster = cluster.clone();
+        let store = store.clone();
+        tokio::spawn(async move {
+            let mut watch = cluster.watch();
+            let mut last: String = String::new();
+            loop {
+                if watch.changed().await.is_err() {
+                    return;
+                }
+                let view = cluster.view();
+                let mut addrs: Vec<String> = view
+                    .members
+                    .iter()
+                    .filter(|m| m.node != node_id)
+                    .map(|m| m.gossip_addr.to_string())
+                    .collect();
+                addrs.sort();
+                addrs.dedup();
+                let joined = addrs.join("\n");
+                if joined.is_empty() || joined == last {
+                    continue;
+                }
+                last = joined.clone();
+                store
+                    .run(0, move |ctx| {
+                        let _ =
+                            ctx.db
+                                .put(&ctx.meta, b"peers:last", joined.as_bytes(), Duration::ZERO);
+                    })
+                    .await;
+            }
+        });
+    }
 
     // Replication over the peer mesh.
     let mesh_listener = TcpListener::bind(mesh_addr).await?;

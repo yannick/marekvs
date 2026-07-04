@@ -52,6 +52,11 @@ impl NodePhase {
 pub struct Member {
     pub node: NodeId,
     pub mesh_addr: SocketAddr,
+    /// The peer's gossip endpoint — persisted by the server as a fallback
+    /// seed so a restarted node can rejoin even when every configured seed
+    /// address went stale (environments without stable IPs or DNS, e.g.
+    /// Apple containers give every restart a fresh IP).
+    pub gossip_addr: SocketAddr,
     pub phase: NodePhase,
 }
 
@@ -254,6 +259,7 @@ impl Cluster {
             members.push(Member {
                 node,
                 mesh_addr: addr,
+                gossip_addr: id.gossip_advertise_addr,
                 phase,
             });
         }
