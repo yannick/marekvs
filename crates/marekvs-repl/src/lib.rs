@@ -6,14 +6,14 @@ pub mod ae;
 pub mod mesh;
 pub mod ring;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use marekvs_cluster::Cluster;
+use marekvs_cluster::{Cluster, NodePhase};
 use marekvs_core::envelope::Envelope;
 use marekvs_core::ikey::{self, Pid};
 use marekvs_core::NodeId;
@@ -41,6 +41,66 @@ type InterestMap = HashMap<Pid, HashMap<Vec<u8>, HashMap<NodeId, Instant>>>;
 
 /// Warn (once per stall) after a peer's window has been full this long.
 const STALL_WARN: Duration = Duration::from_secs(5);
+
+/// Re-request a pending bootstrap with no chunk progress after this long.
+const BOOTSTRAP_RETRY: Duration = Duration::from_secs(5);
+/// An all-Joining cohort (nobody Active anywhere) is treated as a cluster
+/// cold start once this much time has passed since ReplEngine start — there
+/// is no data to pull, everyone may flip Active. Distinguishes cold start
+/// from "gossip has not yet delivered the peers' Active state".
+const COLD_START_SETTLE: Duration = Duration::from_secs(6);
+/// Meta key holding the pids with unfinished bootstraps (u16 BE, packed).
+/// Survives a crash mid-bootstrap: those pids are re-requested at boot even
+/// though locally non-empty (chunks are merge-idempotent).
+const JOIN_PENDING_KEY: &[u8] = b"join:pending";
+
+/// Join-gate state (design/06 §Join): a node holds phase Joining — invisible
+/// to HRW placement, /ready 503, RESP not yet listening — until every
+/// future-owned partition is bootstrapped, instead of the v1 fixed 2 s sleep
+/// that let scale-ups serve empty reads cluster-wide.
+#[derive(Default)]
+struct JoinGate {
+    /// pid → last BootstrapReq send time.
+    bootstrap_pending: HashMap<Pid, Instant>,
+    bootstrap_done: HashSet<Pid>,
+    /// pid → last BootstrapChunk arrival (progress signal for retries).
+    last_chunk_at: HashMap<Pid, Instant>,
+    /// Unfinished bootstraps from a previous incarnation (JOIN_PENDING_KEY):
+    /// re-requested even though locally non-empty.
+    resume_pids: HashSet<Pid>,
+    /// Partitions the gc_grace rejoin still has to full-sync (item #3);
+    /// holds the gate exactly like pending bootstraps.
+    rejoin_pending: HashSet<Pid>,
+    /// A bootstrap sweep completed against a view containing ≥1 Active other
+    /// member — required before the gate may open in a populated cluster
+    /// (closes the race where the gate is polled before the first sweep).
+    swept_active_view: bool,
+}
+
+/// Pure gate predicate (unit-tested):
+/// - anything pending (bootstrap or rejoin) → not ready
+/// - Active others exist → ready only after a sweep against such a view
+/// - only Joining others exist → cold start, ready after the settle window
+/// - alone → ready
+fn join_ready(
+    pending: usize,
+    rejoin: usize,
+    swept_active_view: bool,
+    active_others: bool,
+    any_others: bool,
+    cold_settled: bool,
+) -> bool {
+    if pending > 0 || rejoin > 0 {
+        return false;
+    }
+    if active_others {
+        return swept_active_view;
+    }
+    if any_others {
+        return cold_settled;
+    }
+    true
+}
 
 /// Per-peer unacked send window (bytes). Design/05 defaults table: 4 MiB.
 fn repl_window_bytes() -> usize {
@@ -139,6 +199,9 @@ pub struct ReplEngine {
     /// Per-peer flow state into OUR ring (cursor + unacked send window;
     /// reset by ResumeFrom).
     flows: Mutex<HashMap<NodeId, PeerFlow>>,
+    /// Join gate: bootstrap/rejoin completion tracking (design/06 §Join).
+    gate: Mutex<JoinGate>,
+    started: Instant,
 }
 
 impl ReplEngine {
@@ -179,6 +242,28 @@ impl ReplEngine {
         ring.standalone_cfg
             .store(standalone_cfg, std::sync::atomic::Ordering::Relaxed);
 
+        // Bootstraps left unfinished by a previous incarnation: re-request
+        // them even though their partitions are locally non-empty.
+        let resume_pids: HashSet<Pid> = {
+            let store = store.clone();
+            store
+                .run(0, |ctx| match ctx.db.get(&ctx.meta, JOIN_PENDING_KEY) {
+                    Ok(v) => v
+                        .chunks(2)
+                        .filter(|c| c.len() == 2)
+                        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                        .collect(),
+                    _ => HashSet::new(),
+                })
+                .await
+        };
+        if !resume_pids.is_empty() {
+            tracing::info!(
+                pids = resume_pids.len(),
+                "resuming bootstraps unfinished at last shutdown"
+            );
+        }
+
         let repl = Arc::new(ReplEngine {
             store: store.clone(),
             engine: engine.clone(),
@@ -190,6 +275,11 @@ impl ReplEngine {
             pending: Mutex::new(HashMap::new()),
             next_req: AtomicU64::new(1),
             flows: Mutex::new(HashMap::new()),
+            gate: Mutex::new(JoinGate {
+                resume_pids,
+                ..JoinGate::default()
+            }),
+            started: Instant::now(),
         });
 
         // 1. Commit hook: every committed batch enters the ring (skip the
@@ -244,6 +334,9 @@ impl ReplEngine {
         // 6. Anti-entropy rounds.
         repl.clone().spawn_ae();
 
+        // 6b. Join-gate bootstrap retry tick.
+        repl.clone().spawn_join_retry();
+
         // 7. Pub/sub cluster fan-out.
         {
             let mesh = mesh.clone();
@@ -283,6 +376,10 @@ impl ReplEngine {
                         .max()
                         .unwrap_or(0) as i64,
                 );
+                m.join_gate_pending_pids.set({
+                    let g = self.gate.lock();
+                    (g.bootstrap_pending.len() + g.rejoin_pending.len()) as i64
+                });
                 let stats = self.cluster.cluster_stats();
                 m.cluster_members.set(stats.members as i64);
                 m.cluster_underreplicated_partitions
@@ -338,12 +435,34 @@ impl ReplEngine {
     }
 
     /// For newly-owned, locally-empty partitions ask an existing owner for a
-    /// bootstrap stream (design/06 §Join).
+    /// bootstrap stream (design/06 §Join). Tracks every request in the join
+    /// gate and re-requests stalled ones (donor died mid-stream, bulk conn
+    /// not up yet at the first view change) — callers re-run this on view
+    /// changes and on the 2 s retry tick.
     async fn request_bootstraps(&self, view: &marekvs_cluster::View) {
         let n = self.cluster.replicas_n;
+        let self_id = self.store.node_id;
+        let mut changed = false;
         for pid in self.cluster.future_owned_pids() {
+            let (skip, resume) = {
+                let now = Instant::now();
+                let g = self.gate.lock();
+                let recent = |t: Option<&Instant>| {
+                    t.is_some_and(|t| now.duration_since(*t) < BOOTSTRAP_RETRY)
+                };
+                // Done pids are never re-requested: nothing empties a
+                // partition today (no cold purge), so done-and-empty cannot
+                // occur; revisit when cold_purge lands.
+                let skip = g.bootstrap_done.contains(&pid)
+                    || recent(g.bootstrap_pending.get(&pid))
+                    || recent(g.last_chunk_at.get(&pid));
+                (skip, g.resume_pids.contains(&pid))
+            };
+            if skip {
+                continue;
+            }
             let owners = view.owners(pid, n);
-            let Some(source) = owners.iter().find(|o| **o != self.store.node_id) else {
+            let Some(source) = owners.iter().find(|o| **o != self_id).copied() else {
                 continue;
             };
             let empty = self
@@ -357,12 +476,137 @@ impl ReplEngine {
                     !any
                 })
                 .await;
-            if empty {
+            if empty || resume {
+                self.gate
+                    .lock()
+                    .bootstrap_pending
+                    .insert(pid, Instant::now());
+                changed = true;
                 self.mesh
-                    .send_bulk(*source, PeerMsg::BootstrapReq { pid })
+                    .send_bulk(source, PeerMsg::BootstrapReq { pid })
                     .await;
             }
         }
+        let active_others = view
+            .members
+            .iter()
+            .any(|m| m.node != self_id && m.phase == NodePhase::Active);
+        if active_others {
+            self.gate.lock().swept_active_view = true;
+        }
+        if changed {
+            self.persist_join_pending().await;
+        }
+    }
+
+    /// Persist the set of pids with unfinished bootstraps (crash resume).
+    async fn persist_join_pending(&self) {
+        let bytes: Vec<u8> = {
+            let g = self.gate.lock();
+            let mut pids: Vec<Pid> = g
+                .bootstrap_pending
+                .keys()
+                .chain(g.resume_pids.iter())
+                .copied()
+                .collect();
+            pids.sort_unstable();
+            pids.dedup();
+            pids.iter().flat_map(|p| p.to_be_bytes()).collect()
+        };
+        self.store
+            .run(0, move |ctx| {
+                let _ = ctx
+                    .db
+                    .put(&ctx.meta, JOIN_PENDING_KEY, &bytes, Duration::ZERO);
+            })
+            .await;
+    }
+
+    /// Evaluate the join gate against the current view (see `join_ready`).
+    fn join_gate_ready(&self) -> bool {
+        let view = self.cluster.view();
+        let self_id = self.store.node_id;
+        let (pending, rejoin, swept) = {
+            let g = self.gate.lock();
+            (
+                g.bootstrap_pending.len(),
+                g.rejoin_pending.len(),
+                g.swept_active_view,
+            )
+        };
+        let active_others = view
+            .members
+            .iter()
+            .any(|m| m.node != self_id && m.phase == NodePhase::Active);
+        let any_others = view.members.iter().any(|m| m.node != self_id);
+        join_ready(
+            pending,
+            rejoin,
+            swept,
+            active_others,
+            any_others,
+            self.started.elapsed() >= COLD_START_SETTLE,
+        )
+    }
+
+    /// Hold until every future-owned partition is bootstrapped (and, after a
+    /// gc_grace outage, re-synced). `timeout: None` waits forever — the safe
+    /// default: a node that cannot finish must stay Joining (unready) rather
+    /// than serve empty reads. Returns false on timeout.
+    pub async fn wait_join_ready(&self, timeout: Option<Duration>) -> bool {
+        let deadline = timeout.map(|t| Instant::now() + t);
+        loop {
+            if self.join_gate_ready() {
+                return true;
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Close the BootstrapDone→Active delta hole: entries committed on
+    /// donors while we were Joining were consumed past their cursors (we
+    /// were not an owner). One reactive AE round per bootstrapped pid
+    /// repairs the delta immediately instead of waiting for spawn_ae.
+    pub async fn kick_ae_bootstrapped(&self) {
+        let pids: Vec<Pid> = self.gate.lock().bootstrap_done.iter().copied().collect();
+        let view = self.cluster.view();
+        let n = self.cluster.replicas_n;
+        for pid in pids {
+            let others: Vec<NodeId> = view
+                .owners(pid, n)
+                .into_iter()
+                .filter(|o| *o != self.store.node_id)
+                .collect();
+            if others.is_empty() {
+                continue;
+            }
+            let peer = others[(self.pseudo_rand() % others.len() as u64) as usize];
+            let root = ae::partition_root(&self.store, pid).await;
+            self.mesh.send_ctl(peer, PeerMsg::MerkleRoot { pid, root });
+        }
+    }
+
+    /// Retry tick for the join gate: re-run the bootstrap sweep while
+    /// anything is pending, so a dead donor or a not-yet-dialed bulk conn
+    /// cannot stall the join forever.
+    fn spawn_join_retry(self: Arc<Self>) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let idle = {
+                    let g = self.gate.lock();
+                    g.bootstrap_pending.is_empty() && g.resume_pids.is_empty()
+                };
+                if idle {
+                    continue;
+                }
+                let view = self.cluster.view();
+                self.request_bootstraps(&view).await;
+            }
+        });
     }
 
     fn spawn_peer_events(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<(NodeId, bool)>) {
@@ -871,13 +1115,23 @@ impl ReplEngine {
             PeerMsg::BootstrapReq { pid } => {
                 self.stream_partition(peer, pid).await;
             }
-            PeerMsg::BootstrapChunk { ops, .. } => {
+            PeerMsg::BootstrapChunk { pid, ops } => {
                 for op in ops {
                     self.apply_op_from(op, Some(peer)).await;
                 }
+                self.gate.lock().last_chunk_at.insert(pid, Instant::now());
             }
             PeerMsg::BootstrapDone { pid, .. } => {
                 tracing::info!(pid, peer, "partition bootstrap complete");
+                {
+                    let mut g = self.gate.lock();
+                    g.bootstrap_pending.remove(&pid);
+                    g.last_chunk_at.remove(&pid);
+                    g.resume_pids.remove(&pid);
+                    g.bootstrap_done.insert(pid);
+                }
+                self.engine.metrics.bootstraps_completed_total.inc();
+                self.persist_join_pending().await;
             }
             PeerMsg::Publish { channel, payload } => {
                 self.engine.pubsub.publish_local(&channel, &payload);
@@ -1213,5 +1467,39 @@ mod flow_tests {
         f.on_ack(10);
         assert_eq!(f.acked, 10);
         assert_eq!(f.inflight_bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod join_gate_tests {
+    use super::join_ready;
+
+    #[test]
+    fn pending_work_holds_the_gate() {
+        assert!(!join_ready(1, 0, true, true, true, true));
+        assert!(!join_ready(0, 1, true, true, true, true));
+    }
+
+    #[test]
+    fn populated_cluster_requires_a_sweep() {
+        // Active others visible but no bootstrap sweep ran against that
+        // view yet: the gate must hold (the sweep may still find empty
+        // future-owned pids).
+        assert!(!join_ready(0, 0, false, true, true, true));
+        assert!(join_ready(0, 0, true, true, true, true));
+    }
+
+    #[test]
+    fn all_joining_cohort_is_cold_start_after_settle() {
+        // Others exist but nobody is Active: either a cluster cold start
+        // (no data anywhere — ready) or gossip lag (state keys not yet
+        // delivered — hold). The settle window separates the two.
+        assert!(!join_ready(0, 0, false, false, true, false));
+        assert!(join_ready(0, 0, false, false, true, true));
+    }
+
+    #[test]
+    fn alone_is_ready_immediately() {
+        assert!(join_ready(0, 0, false, false, false, false));
     }
 }

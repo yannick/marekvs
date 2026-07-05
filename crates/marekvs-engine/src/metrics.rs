@@ -53,6 +53,9 @@ pub struct Metrics {
     pub ae_repair_ops_total: IntCounter,
     pub ring_ops: IntGauge,
     pub ring_bytes: IntGauge,
+    pub join_gate_pending_pids: IntGauge,
+    pub bootstraps_completed_total: IntCounter,
+    pub join_gate_timeouts_total: IntCounter,
 
     // --- cluster (repl stats task) ---
     pub cluster_members: IntGauge,
@@ -244,6 +247,21 @@ impl Metrics {
                 "Replication ring occupancy (bytes)"
             ),
 
+            join_gate_pending_pids: gauge!(
+                registry,
+                "marekvs_join_gate_pending_pids",
+                "Partitions still holding the join gate (bootstrap or rejoin pending)"
+            ),
+            bootstraps_completed_total: counter!(
+                registry,
+                "marekvs_bootstraps_completed_total",
+                "Partition bootstrap streams completed (BootstrapDone received)"
+            ),
+            join_gate_timeouts_total: counter!(
+                registry,
+                "marekvs_join_gate_timeouts_total",
+                "Times the join gate was overridden by MAREKVS_JOIN_TIMEOUT_SECS"
+            ),
             cluster_members: gauge!(
                 registry,
                 "marekvs_cluster_members",

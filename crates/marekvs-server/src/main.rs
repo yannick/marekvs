@@ -266,10 +266,33 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Join sequence (design/06, simplified v1): give gossip a moment to find
-    // peers; bootstrap requests fire from the view watcher; then go Active.
+    // Join sequence (design/06): give gossip a moment to find peers, then
+    // hold phase Joining — invisible to HRW, /ready 503 — until every
+    // future-owned partition is bootstrapped (or the cluster is confirmed
+    // cold/empty). The old fixed 2 s sleep let a scale-up node go Active
+    // with an empty store: HRW immediately routed ~1/n of partitions to it
+    // and its reads AND other nodes' read-throughs served nils until AE.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    cluster.set_phase(NodePhase::Active).await;
+    if standalone_cfg {
+        cluster.set_phase(NodePhase::Active).await;
+    } else {
+        // 0 = wait forever (default): a node that cannot finish bootstrap
+        // must stay unready rather than serve empty reads. The env is an
+        // operator escape hatch, not a normal path.
+        let timeout_secs: u64 = env_or("MAREKVS_JOIN_TIMEOUT_SECS", "0").parse()?;
+        let timeout = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
+        if !repl.wait_join_ready(timeout).await {
+            tracing::error!(
+                timeout_secs,
+                "JOIN GATE TIMEOUT: going Active with incomplete bootstrap — \
+                 reads may be empty/stale until anti-entropy converges"
+            );
+            engine.metrics.join_gate_timeouts_total.inc();
+        }
+        cluster.set_phase(NodePhase::Active).await;
+        // Repair the bootstrap→Active delta window in one reactive AE round.
+        repl.kick_ae_bootstrapped().await;
+    }
 
     // Graceful drain on SIGTERM: enter Leaving (gossiped; peers stop
     // targeting us), then hold until the replication ring is fully shipped —

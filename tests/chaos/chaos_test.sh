@@ -17,7 +17,7 @@ source tests/chaos/lib.sh
 
 SCENARIOS=("$@")
 [ ${#SCENARIOS[@]} -gt 0 ] || {
-  SCENARIOS=(crash_restart freeze_thaw rolling_churn wipe_replace membership_churn bank)
+  SCENARIOS=(crash_restart freeze_thaw rolling_churn wipe_replace membership_churn join_empty_reads bank)
   [ "$BACKEND" = docker ] && SCENARIOS+=(partition_divergence partition_no_resurrect)
 }
 
@@ -218,6 +218,64 @@ membership_churn() {
   check_set chaos:set
   check_converged "counter" 40 get chaos:cnt
   check_replication_healed 90
+}
+
+# ── scenario: join_empty_reads ───────────────────────────────────────────
+# Scale-up must not serve empty reads: pre-join-gate, a new node flipped
+# Active after a fixed 2 s sleep, HRW immediately routed ~1/n of partitions
+# to it, and both its own home reads AND other nodes' read-throughs hit its
+# empty store until anti-entropy filled it. The gate holds the node in
+# Joining (RESP not listening, /ready 503) until every future-owned
+# partition is bootstrapped — so the moment PING answers, reads must be
+# complete everywhere.
+join_empty_reads() {
+  fresh_cluster
+  echo "  seeding 100k keys"
+  local seed_cmds
+  seed_cmds=$(awk 'BEGIN{for(i=0;i<100000;i++) printf "set seed:%d v%d\r\n", i, i}')
+  if [ "$BACKEND" = docker ]; then
+    echo "$seed_cmds" | redis-cli -p "$(resp_port 0)" --pipe >/dev/null
+  else
+    echo "$seed_cmds" | redis-cli -h "$(apple_ip chaos-0)" -p 6379 --pipe >/dev/null
+  fi
+  check_replication_healed 90
+  echo "  nemesis: node 3 joins the cluster"
+  if [ "$BACKEND" = docker ]; then
+    docker run -d --name chaos-3 \
+      --network "$EDGE_NET" --ip "$(edge_ip 3)" \
+      -p "$(resp_port 3):6379" -p "$(metrics_port 3):9121" \
+      -e MAREKVS_NODE_ID=3 -e MAREKVS_REPLICAS_N=2 \
+      -e MAREKVS_DATA_DIR=/data -e MAREKVS_ADVERTISE_IP="$(mesh_ip 3)" \
+      -e MAREKVS_SEEDS="$(seeds)" -e RUST_LOG=info,chitchat=warn \
+      "$IMAGE" >/dev/null
+    docker network connect --ip "$(mesh_ip 3)" "$MESH_NET" chaos-3
+  else
+    container run -d --name chaos-3 \
+      -e MAREKVS_NODE_ID=3 -e MAREKVS_REPLICAS_N=2 \
+      -e MAREKVS_DATA_DIR=/data -e MAREKVS_ADVERTISE_IP=auto \
+      -e MAREKVS_SEEDS="$(apple_ip chaos-0):7946" -e RUST_LOG=info,chitchat=warn \
+      "$IMAGE" >/dev/null
+  fi
+  N=4 wait_ready 3 300
+  # RESP answering == the node went Active. From this instant, reads must be
+  # complete on ALL nodes — sample immediately, no settle sleep.
+  local db3 miss=0 round j k v n
+  db3=$(rcli 3 dbsize 2>/dev/null || echo 0)
+  for round in 1 2 3; do
+    for j in $(seq 1 66); do
+      k=$(( (RANDOM * 3 + j) % 100000 ))
+      for n in 0 1 2 3; do
+        v=$(rcli "$n" get "seed:$k" 2>/dev/null)
+        [ -n "$v" ] || miss=$((miss + 1))
+      done
+    done
+  done
+  chk $((miss > 0)) "no empty reads immediately after join" \
+    "$miss empty replies out of 792 sampled (node3 dbsize=$db3 at ready)"
+  chk $((db3 < 1000)) "joiner bootstrapped before Active" \
+    "node3 dbsize=$db3 at first PONG — went Active with an empty store?"
+  crt rm -f chaos-3 >/dev/null 2>&1 || true
+  N=3 check_replication_healed 90
 }
 
 # ── scenario: bank ───────────────────────────────────────────────────────
