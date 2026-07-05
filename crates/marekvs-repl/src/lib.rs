@@ -39,6 +39,105 @@ const RING_SEQ_RESTART_JUMP: u64 = 1_000_000;
 
 type InterestMap = HashMap<Pid, HashMap<Vec<u8>, HashMap<NodeId, Instant>>>;
 
+/// Hard cap on interest-map entries. Design/04 defaults table: 1 M.
+fn interest_max_entries() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MAREKVS_INTEREST_MAX_ENTRIES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1_000_000)
+    })
+}
+
+/// The interest map behind a strict mutation API so the live (pid, key,
+/// node) leaf count can never drift — the count enforces the hard cap that
+/// keeps a redis-cli scanning unique keys through non-home nodes from
+/// inflating this table without limit (an OOM you can cause from a client).
+///
+/// Policy at cap: REJECT new registrations, always allow refreshing an
+/// existing leaf. Rejection is correct in the AP model: the subscriber's
+/// 60 s lease already bounds staleness and interest pushes only shrink it —
+/// a rejected registration degrades that key to worst-case-lease staleness
+/// with zero memory growth. (Evict-oldest would need an order structure
+/// that is itself unbounded under the scan-storm being defended against.)
+struct Interest {
+    map: InterestMap,
+    total: usize,
+    max: usize,
+}
+
+impl Interest {
+    fn new(max: usize) -> Interest {
+        Interest {
+            map: HashMap::new(),
+            total: 0,
+            max,
+        }
+    }
+
+    /// Register or refresh a lease; false = at cap, registration rejected.
+    fn register(&mut self, pid: Pid, userkey: &[u8], node: NodeId, exp: Instant) -> bool {
+        if let Some(slot) = self
+            .map
+            .get_mut(&pid)
+            .and_then(|keys| keys.get_mut(userkey))
+            .and_then(|subs| subs.get_mut(&node))
+        {
+            *slot = exp; // refresh never grows the map
+            return true;
+        }
+        if self.total >= self.max {
+            return false;
+        }
+        self.map
+            .entry(pid)
+            .or_default()
+            .entry(userkey.to_vec())
+            .or_default()
+            .insert(node, exp);
+        self.total += 1;
+        true
+    }
+
+    fn subs(&self, pid: Pid, userkey: &[u8]) -> Option<&HashMap<NodeId, Instant>> {
+        self.map.get(&pid).and_then(|keys| keys.get(userkey))
+    }
+
+    /// Drop every lease held by `node` (its connection died).
+    fn remove_peer(&mut self, node: NodeId) {
+        let total = &mut self.total;
+        self.map.retain(|_, keys| {
+            keys.retain(|_, subs| {
+                if subs.remove(&node).is_some() {
+                    *total -= 1;
+                }
+                !subs.is_empty()
+            });
+            !keys.is_empty()
+        });
+    }
+
+    /// Drop expired leases (called once per AE round).
+    fn gc(&mut self, now: Instant) {
+        let total = &mut self.total;
+        self.map.retain(|_, keys| {
+            keys.retain(|_, subs| {
+                subs.retain(|_, exp| {
+                    let live = *exp > now;
+                    if !live {
+                        *total -= 1;
+                    }
+                    live
+                });
+                !subs.is_empty()
+            });
+            !keys.is_empty()
+        });
+    }
+}
+
 /// Warn (once per stall) after a peer's window has been full this long.
 const STALL_WARN: Duration = Duration::from_secs(5);
 
@@ -190,7 +289,7 @@ pub struct ReplEngine {
     pub mesh: Arc<Mesh>,
     pub ring: Arc<Ring>,
     /// Home side: who is interested in which key (design/04 §Interest).
-    interest: Mutex<InterestMap>,
+    interest: Mutex<Interest>,
     /// Subscriber side: freshness leases per user key.
     leases: Mutex<HashMap<Vec<u8>, Instant>>,
     /// In-flight fetch/check requests.
@@ -270,7 +369,7 @@ impl ReplEngine {
             cluster: cluster.clone(),
             mesh: mesh.clone(),
             ring: ring.clone(),
-            interest: Mutex::new(HashMap::new()),
+            interest: Mutex::new(Interest::new(interest_max_entries())),
             leases: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             next_req: AtomicU64::new(1),
@@ -380,6 +479,7 @@ impl ReplEngine {
                     let g = self.gate.lock();
                     (g.bootstrap_pending.len() + g.rejoin_pending.len()) as i64
                 });
+                m.interest_entries.set(self.interest.lock().total as i64);
                 let stats = self.cluster.cluster_stats();
                 m.cluster_members.set(stats.members as i64);
                 m.cluster_underreplicated_partitions
@@ -624,11 +724,7 @@ impl ReplEngine {
                     );
                 } else {
                     // Their leases die with the connection (design/04).
-                    self.interest.lock().values_mut().for_each(|keys| {
-                        keys.values_mut().for_each(|subs| {
-                            subs.remove(&peer);
-                        });
-                    });
+                    self.interest.lock().remove_peer(peer);
                     // Nothing queued on the dead connection can be acked; a
                     // vanished peer must not hold its window full forever.
                     if let Some(flow) = self.flows.lock().get_mut(&peer) {
@@ -764,7 +860,7 @@ impl ReplEngine {
                     && peer != self.store.node_id;
                 // interest fan-out: only H1 forwards, never back to origin
                 if !send && is_h1 && e.origin != peer && !owners.contains(&peer) {
-                    if let Some(subs) = interest.get(&p.pid).and_then(|keys| keys.get(p.userkey)) {
+                    if let Some(subs) = interest.subs(p.pid, p.userkey) {
                         if subs.get(&peer).is_some_and(|exp| *exp > Instant::now()) {
                             send = true;
                         }
@@ -906,15 +1002,7 @@ impl ReplEngine {
     }
 
     fn gc_interest(&self) {
-        let now = Instant::now();
-        let mut interest = self.interest.lock();
-        interest.retain(|_, keys| {
-            keys.retain(|_, subs| {
-                subs.retain(|_, exp| *exp > now);
-                !subs.is_empty()
-            });
-            !keys.is_empty()
-        });
+        self.interest.lock().gc(Instant::now());
     }
 
     // ------------------------------------------------------------------
@@ -1235,13 +1323,16 @@ impl ReplEngine {
 
     fn register_interest(&self, peer: NodeId, userkey: &[u8]) {
         let pid = marekvs_core::pid_of(userkey);
-        self.interest
+        let ok = self
+            .interest
             .lock()
-            .entry(pid)
-            .or_default()
-            .entry(userkey.to_vec())
-            .or_default()
-            .insert(peer, Instant::now() + INTEREST_LEASE);
+            .register(pid, userkey, peer, Instant::now() + INTEREST_LEASE);
+        if !ok {
+            // At cap: the subscriber still gets its full lease and simply
+            // re-fetches on expiry — worst-case-lease staleness instead of
+            // unbounded memory. Counted so operators can size the cap.
+            self.engine.metrics.interest_rejected_total.inc();
+        }
     }
 
     fn register_interest_ops(&self, peer: NodeId, ops: &[ReplOp]) {
@@ -1467,6 +1558,56 @@ mod flow_tests {
         f.on_ack(10);
         assert_eq!(f.acked, 10);
         assert_eq!(f.inflight_bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod interest_tests {
+    use super::Interest;
+    use std::time::{Duration, Instant};
+
+    fn exp() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    #[test]
+    fn register_counts_and_caps() {
+        let mut i = Interest::new(2);
+        assert!(i.register(1, b"a", 10, exp()));
+        assert!(i.register(1, b"b", 10, exp()));
+        assert_eq!(i.total, 2);
+        assert!(!i.register(2, b"c", 10, exp()), "cap must reject");
+        assert_eq!(i.total, 2);
+    }
+
+    #[test]
+    fn refresh_is_always_allowed_at_cap() {
+        let mut i = Interest::new(1);
+        assert!(i.register(1, b"a", 10, exp()));
+        assert!(
+            i.register(1, b"a", 10, exp()),
+            "refresh must not count as growth"
+        );
+        assert_eq!(i.total, 1);
+        assert!(
+            !i.register(1, b"a", 11, exp()),
+            "same key, NEW node is growth"
+        );
+    }
+
+    #[test]
+    fn gc_and_remove_peer_release_capacity() {
+        let mut i = Interest::new(2);
+        let past = Instant::now() - Duration::from_secs(1);
+        assert!(i.register(1, b"a", 10, past));
+        assert!(i.register(1, b"b", 11, exp()));
+        i.gc(Instant::now());
+        assert_eq!(i.total, 1);
+        assert!(i.register(1, b"c", 10, exp()), "gc must free capacity");
+        i.remove_peer(11);
+        assert_eq!(i.total, 1);
+        assert!(i.subs(1, b"b").is_none());
+        assert!(i.subs(1, b"c").is_some());
     }
 }
 

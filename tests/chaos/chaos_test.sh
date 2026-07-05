@@ -17,7 +17,7 @@ source tests/chaos/lib.sh
 
 SCENARIOS=("$@")
 [ ${#SCENARIOS[@]} -gt 0 ] || {
-  SCENARIOS=(crash_restart freeze_thaw rolling_churn wipe_replace membership_churn join_empty_reads bank)
+  SCENARIOS=(crash_restart freeze_thaw rolling_churn wipe_replace membership_churn join_empty_reads interest_flood bank)
   [ "$BACKEND" = docker ] && SCENARIOS+=(partition_divergence partition_no_resurrect)
 }
 
@@ -96,7 +96,12 @@ partition_no_resurrect() {
   rcli 1 sadd res:s partition-born >/dev/null    # concurrent add on island
   sleep 3
   heal 1
-  check_set_converged "post-heal set" res:s 40 "keeper partition-born"
+  # 75 s > the 60 s interest lease: a NON-owner that cached the set before
+  # the partition serves its (refreshed-in-place, but never grown) copy
+  # until lease expiry re-fetches — new members born on the island reach it
+  # only then. Bounded staleness is the documented AP contract; asserting
+  # convergence inside the lease window was racing it.
+  check_set_converged "post-heal set" res:s 75 "keeper partition-born"
   # the removed element must be gone on every node; the island add survives
   local i
   for i in $(seq 0 $((N - 1))); do
@@ -276,6 +281,43 @@ join_empty_reads() {
     "node3 dbsize=$db3 at first PONG — went Active with an empty store?"
   crt rm -f chaos-3 >/dev/null 2>&1 || true
   N=3 check_replication_healed 90
+}
+
+# ── scenario: interest_flood ─────────────────────────────────────────────
+# A client scanning many unique keys through non-home nodes registers one
+# interest lease per (key, node) on the homes — previously unbounded: an
+# OOM you can cause from a redis-cli. With the cap, marekvs_interest_entries
+# must stay ≤ MAREKVS_INTEREST_MAX_ENTRIES (shrunk to 5000 here), rejections
+# must be counted, and interest-path reads must keep working.
+interest_flood() {
+  CHAOS_EXTRA_ARGS="-e MAREKVS_INTEREST_MAX_ENTRIES=5000"
+  fresh_cluster
+  CHAOS_EXTRA_ARGS=""
+  echo "  flooding: 30k unique-key GETs per node (read-through registers interest)"
+  local n cmds
+  for n in 0 1 2; do
+    cmds=$(awk -v n="$n" 'BEGIN{for(i=0;i<30000;i++) printf "get flood:%d:%d\r\n", n, i}')
+    if [ "$BACKEND" = docker ]; then
+      echo "$cmds" | redis-cli -p "$(resp_port "$n")" --pipe >/dev/null 2>&1 || true
+    else
+      echo "$cmds" | redis-cli -h "$(apple_ip "chaos-$n")" -p 6379 --pipe >/dev/null 2>&1 || true
+    fi
+  done
+  sleep 4 # let the 2 s stats tick publish the gauge
+  local maxi=0 rej=0 v i
+  for i in 0 1 2; do
+    v=$(metric_value "$i" marekvs_interest_entries); [ "${v:-0}" -gt "$maxi" ] && maxi=$v
+    v=$(metric_value "$i" marekvs_interest_rejected_total); rej=$((rej + ${v:-0}))
+  done
+  chk $((maxi > 5000)) "interest map capped" \
+    "max marekvs_interest_entries=$maxi (cap 5000) — unbounded growth?"
+  chk $((rej == 0)) "rejections counted at cap" "interest_rejected_total sum=$rej"
+  # Interest-path reads must still function at cap.
+  set_workload chaos:set 15 & local W=$!
+  wait $W
+  sleep 3
+  check_set chaos:set
+  check_converged "set still converges at cap" 45 scard chaos:set
 }
 
 # ── scenario: bank ───────────────────────────────────────────────────────

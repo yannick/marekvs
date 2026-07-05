@@ -54,6 +54,8 @@ pub struct Metrics {
     pub ring_ops: IntGauge,
     pub ring_bytes: IntGauge,
     pub join_gate_pending_pids: IntGauge,
+    pub interest_entries: IntGauge,
+    pub interest_rejected_total: IntCounter,
     pub bootstraps_completed_total: IntCounter,
     pub join_gate_timeouts_total: IntCounter,
 
@@ -247,6 +249,16 @@ impl Metrics {
                 "Replication ring occupancy (bytes)"
             ),
 
+            interest_entries: gauge!(
+                registry,
+                "marekvs_interest_entries",
+                "Live (partition, key, subscriber) interest leases held for peers"
+            ),
+            interest_rejected_total: counter!(
+                registry,
+                "marekvs_interest_rejected_total",
+                "Interest registrations rejected at MAREKVS_INTEREST_MAX_ENTRIES"
+            ),
             join_gate_pending_pids: gauge!(
                 registry,
                 "marekvs_join_gate_pending_pids",
