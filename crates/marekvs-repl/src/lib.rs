@@ -1717,13 +1717,18 @@ impl ReplEngine {
                 g.chunks_applied += 1;
             }
             PeerMsg::BootstrapDone { pid, .. } => {
-                tracing::info!(pid, peer, "partition bootstrap complete");
+                tracing::debug!(pid, peer, "partition bootstrap complete");
                 {
                     let mut g = self.gate.lock();
                     g.bootstrap_pending.remove(&pid);
                     g.last_chunk_at.remove(&pid);
                     g.resume_pids.remove(&pid);
                     g.bootstrap_done.insert(pid);
+                    // Dones count as pipeline progress too: a cold-start
+                    // cohort's streams are ALL EMPTY (no chunks), and
+                    // without this the retry gate saw a "dead" pipeline and
+                    // re-requested thousands of empty partitions each tier.
+                    g.chunks_applied += 1;
                 }
                 self.engine.metrics.bootstraps_completed_total.inc();
                 self.persist_join_pending().await;
