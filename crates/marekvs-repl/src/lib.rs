@@ -813,7 +813,23 @@ impl ReplEngine {
             g.last_sweep_applied = g.chunks_applied;
             advanced
         };
-        for pid in self.cluster.future_owned_pids() {
+        let future: HashSet<Pid> = self.cluster.future_owned_pids().into_iter().collect();
+        // Prune pending entries for pids that left future-ownership: early
+        // partial-view sweeps can request nearly EVERY pid (2 candidates →
+        // self is in the top-2 of all of them); the wrongly-picked donors
+        // refuse, the view completes, ownership shrinks — and without this
+        // the refused orphans stayed pending forever and the gate never
+        // opened (flaky cold-start/rejoin stalls).
+        {
+            let mut g = self.gate.lock();
+            let before = g.bootstrap_pending.len() + g.resume_pids.len();
+            g.bootstrap_pending.retain(|pid, _| future.contains(pid));
+            g.resume_pids.retain(|pid| future.contains(pid));
+            if g.bootstrap_pending.len() + g.resume_pids.len() != before {
+                changed = true;
+            }
+        }
+        for pid in future.iter().copied() {
             let (skip, resume, attempts) = {
                 let now = Instant::now();
                 let g = self.gate.lock();
