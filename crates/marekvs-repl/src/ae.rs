@@ -59,6 +59,17 @@ pub async fn bucket_digests(store: &Arc<Store>, pid: Pid) -> Vec<u64> {
 
 pub async fn partition_root(store: &Arc<Store>, pid: Pid) -> u64 {
     let digests = bucket_digests(store, pid).await;
+    // 0 is the documented "no visible records" sentinel (stranded-AE and
+    // the rejoin scope rely on it). xxh3 over 256 zero digests is a NONZERO
+    // constant, so without this check every empty partition looked
+    // data-bearing: stranded-AE probed every non-owned pid each round and
+    // a gc_grace rejoin scoped ~all owned pids instead of the few with
+    // data. (An XOR-cancelling non-empty bucket set would also hash to the
+    // sentinel — that needs colliding entry hash pairs; the consequence is
+    // a skipped offer, healed by owner-AE.)
+    if digests.iter().all(|d| *d == 0) {
+        return 0;
+    }
     let mut bytes = Vec::with_capacity(BUCKETS * 8);
     for d in digests {
         bytes.extend_from_slice(&d.to_be_bytes());

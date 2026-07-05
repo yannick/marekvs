@@ -1105,6 +1105,7 @@ impl ReplEngine {
                 return;
             }
             r.unsynced.remove(&pid);
+            tracing::debug!(pid, remaining = r.unsynced.len(), "rejoin pid synced");
             r.scoped && r.unsynced.is_empty()
         };
         self.gate.lock().rejoin_pending.remove(&pid);
