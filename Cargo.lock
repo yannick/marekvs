@@ -1333,6 +1333,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
+ "libc",
  "marekvs-core",
  "marekvs-resp",
  "mlua",

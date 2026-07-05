@@ -31,7 +31,6 @@ pub fn gc_grace() -> Duration {
         )
     })
 }
-/// Extra slack added to ondaDB's own TTL backstop on records with a deadline.
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
