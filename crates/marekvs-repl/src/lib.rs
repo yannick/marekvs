@@ -450,11 +450,15 @@ impl ReplEngine {
                 let mut flows = self.flows.lock();
                 let flow = flows.entry(peer).or_insert_with(|| PeerFlow::at(last));
                 if flow.window_full(window) {
+                    // Count every skipped pass: trickling acks reset the
+                    // stall clock below, so a duration-gated counter would
+                    // stay 0 under exactly the slow-peer condition it
+                    // exists to expose. The 5 s rule gates the LOG only.
+                    self.engine.metrics.repl_window_stalls_total.inc();
                     match flow.stalled_since {
                         None => flow.stalled_since = Some(Instant::now()),
                         Some(t) if !flow.stall_warned && t.elapsed() >= STALL_WARN => {
                             flow.stall_warned = true;
-                            self.engine.metrics.repl_window_stalls_total.inc();
                             tracing::warn!(
                                 peer,
                                 inflight_bytes = flow.inflight_bytes,
@@ -818,8 +822,19 @@ impl ReplEngine {
                 entries,
                 no_backfill,
             } => {
-                let (push, want) = ae::diff_bucket(&self.store, pid, bucket, &entries).await;
-                if !push.is_empty() && !no_backfill {
+                let (mut push, want) = ae::diff_bucket(&self.store, pid, bucket, &entries).await;
+                if no_backfill {
+                    // Stranded exchange: never GROW the non-owner's cache,
+                    // but DO refresh records it already holds (it offered
+                    // them). A stale non-owner cache otherwise serves
+                    // lease-valid stale reads for up to the 60 s lease —
+                    // e.g. a delete it missed while ownership flapped
+                    // through a partition (chaos: partition_no_resurrect).
+                    let offered: std::collections::HashSet<u64> =
+                        entries.iter().map(|(h, _, _)| *h).collect();
+                    push.retain(|op| offered.contains(&xxhash_rust::xxh3::xxh3_64(&op.ikey)));
+                }
+                if !push.is_empty() {
                     self.mesh
                         .send_ctl(peer, PeerMsg::RepairOps { pid, ops: push });
                 }

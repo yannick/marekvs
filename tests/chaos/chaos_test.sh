@@ -394,28 +394,25 @@ blackhole_conn() {
 }
 
 # ── scenario: backpressure_no_drop (debug, docker) ───────────────────────
-# Rate-shape one node's mesh egress so its acks crawl: senders' unacked
-# windows toward it must FILL and STALL (only that lane), and no write may
-# demote to the anti-entropy path — pre-flow-control, batches were dropped
-# after the cursor moved and only AE repaired them. Window shrunk via env
-# so the mechanism engages at harness write rates. slow_peer remains the
-# ring-overrun→gap→AE regression; this scenario asserts AE stays IDLE.
+# Delay one node's mesh nic (800 ms ± 200, well under the 3 s heartbeat
+# timeout — hard rate caps queue pings behind data and turn this into
+# connection churn) with a tiny 4 KB unacked window: in-flight bytes over
+# the inflated RTT exceed the window, so senders must SKIP that peer's lane
+# (marekvs_repl_window_stalls_total > 0) instead of overrunning it, and no
+# batch may be dropped after the cursor moved
+# (marekvs_repl_send_failures_total == 0 — the pre-fix silent-drop branch).
+# AE may legitimately assist while a lane is stalled; slow_peer remains the
+# ring-overrun→gap→AE regression.
 backpressure_no_drop() {
-  require_debug "netem rate shaping"
+  require_debug "netem delay shaping"
   [ "$BACKEND" = docker ] || { echo "  (skipped: needs the docker backend)"; return 0; }
-  CHAOS_EXTRA_ARGS="-e MAREKVS_REPL_WINDOW_BYTES=32768"
+  CHAOS_EXTRA_ARGS="-e MAREKVS_REPL_WINDOW_BYTES=4096"
   fresh_cluster
   CHAOS_EXTRA_ARGS=""
-  local ae0=0 ae1=0 i v
-  for i in 0 1 2; do
-    v=$(metric_value "$i" marekvs_ae_repair_ops_total); ae0=$((ae0 + ${v:-0}))
-  done
   counter_workload chaos:cnt 45 & local W1=$!
   set_workload chaos:set 45 & local W2=$!
   sleep 5
-  net_netem 1 rate 64kbit delay 40ms 10ms
-  # The 32 KB window toward node 1 must fill and (after the 5 s warn
-  # threshold) count a stall on at least one sender.
+  net_delay 1 800 200
   local deadline=$((SECONDS + 25)) stalled=0 s0 s2
   while [ $SECONDS -lt "$deadline" ]; do
     s0=$(metric_value 0 marekvs_repl_window_stalls_total)
@@ -423,8 +420,8 @@ backpressure_no_drop() {
     if [ "${s0:-0}" -gt 0 ] || [ "${s2:-0}" -gt 0 ]; then stalled=1; break; fi
     sleep 1
   done
-  chk $((1 - stalled)) "flow-control window engaged (stall counted on a sender)" \
-    "stalls node0=${s0:-?} node2=${s2:-?} after 25s of shaping"
+  chk $((1 - stalled)) "flow-control window engaged (stalled pump passes counted)" \
+    "stalls node0=${s0:-?} node2=${s2:-?} after 25s of 800ms delay"
   net_clear 1
   wait $W1 $W2
   sleep 5
@@ -432,11 +429,12 @@ backpressure_no_drop() {
   check_set chaos:set 90
   check_converged "counter" 90 get chaos:cnt
   check_replication_healed 120
+  local drops=0 i v
   for i in 0 1 2; do
-    v=$(metric_value "$i" marekvs_ae_repair_ops_total); ae1=$((ae1 + ${v:-0}))
+    v=$(metric_value "$i" marekvs_repl_send_failures_total); drops=$((drops + ${v:-0}))
   done
-  chk $((ae1 > ae0)) "no write demoted to anti-entropy under backpressure" \
-    "ae_repair_ops delta=$((ae1 - ae0)) (batches were dropped after cursor advance?)"
+  chk $((drops > 0)) "no batch dropped after cursor advance" \
+    "repl_send_failures_total sum=$drops — writer queues overran the window?"
 }
 
 # ── scenario: clock_bump_skew (debug, apple) ─────────────────────────────

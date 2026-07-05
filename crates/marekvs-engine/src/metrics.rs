@@ -196,7 +196,7 @@ impl Metrics {
             repl_window_stalls_total: counter!(
                 registry,
                 "marekvs_repl_window_stalls_total",
-                "Times a peer's unacked replication window stayed full past the warn threshold"
+                "Pump passes that skipped a peer because its unacked replication window was full"
             ),
             repl_inflight_bytes: gauge!(
                 registry,
