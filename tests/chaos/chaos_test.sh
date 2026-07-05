@@ -393,6 +393,52 @@ blackhole_conn() {
   check_replication_healed 120
 }
 
+# ── scenario: backpressure_no_drop (debug, docker) ───────────────────────
+# Rate-shape one node's mesh egress so its acks crawl: senders' unacked
+# windows toward it must FILL and STALL (only that lane), and no write may
+# demote to the anti-entropy path — pre-flow-control, batches were dropped
+# after the cursor moved and only AE repaired them. Window shrunk via env
+# so the mechanism engages at harness write rates. slow_peer remains the
+# ring-overrun→gap→AE regression; this scenario asserts AE stays IDLE.
+backpressure_no_drop() {
+  require_debug "netem rate shaping"
+  [ "$BACKEND" = docker ] || { echo "  (skipped: needs the docker backend)"; return 0; }
+  CHAOS_EXTRA_ARGS="-e MAREKVS_REPL_WINDOW_BYTES=32768"
+  fresh_cluster
+  CHAOS_EXTRA_ARGS=""
+  local ae0=0 ae1=0 i v
+  for i in 0 1 2; do
+    v=$(metric_value "$i" marekvs_ae_repair_ops_total); ae0=$((ae0 + ${v:-0}))
+  done
+  counter_workload chaos:cnt 45 & local W1=$!
+  set_workload chaos:set 45 & local W2=$!
+  sleep 5
+  net_netem 1 rate 64kbit delay 40ms 10ms
+  # The 32 KB window toward node 1 must fill and (after the 5 s warn
+  # threshold) count a stall on at least one sender.
+  local deadline=$((SECONDS + 25)) stalled=0 s0 s2
+  while [ $SECONDS -lt "$deadline" ]; do
+    s0=$(metric_value 0 marekvs_repl_window_stalls_total)
+    s2=$(metric_value 2 marekvs_repl_window_stalls_total)
+    if [ "${s0:-0}" -gt 0 ] || [ "${s2:-0}" -gt 0 ]; then stalled=1; break; fi
+    sleep 1
+  done
+  chk $((1 - stalled)) "flow-control window engaged (stall counted on a sender)" \
+    "stalls node0=${s0:-?} node2=${s2:-?} after 25s of shaping"
+  net_clear 1
+  wait $W1 $W2
+  sleep 5
+  check_counter chaos:cnt 90
+  check_set chaos:set 90
+  check_converged "counter" 90 get chaos:cnt
+  check_replication_healed 120
+  for i in 0 1 2; do
+    v=$(metric_value "$i" marekvs_ae_repair_ops_total); ae1=$((ae1 + ${v:-0}))
+  done
+  chk $((ae1 > ae0)) "no write demoted to anti-entropy under backpressure" \
+    "ae_repair_ops delta=$((ae1 - ae0)) (batches were dropped after cursor advance?)"
+}
+
 # ── scenario: clock_bump_skew (debug, apple) ─────────────────────────────
 # Per-VM clocks (apple) let us skew ONE node's wall clock while it takes
 # writes. The HLC receive rule must absorb it: a node bumped +N seconds must

@@ -98,12 +98,20 @@ seeds() {
   echo "${out%,}"
 }
 
+# Extra `docker/container run` args for every node, e.g. scenario-scoped env
+# tunables: CHAOS_EXTRA_ARGS="-e MAREKVS_GC_GRACE_SECS=20". Scenarios that
+# set it must reset it (fresh_cluster keeps whatever is exported).
+CHAOS_EXTRA_ARGS=${CHAOS_EXTRA_ARGS:-}
+
 node_run() { # <i> — create + start node i
   local i=$1
+  local extra=()
+  # shellcheck disable=SC2206 -- intentional word split of user-provided args
+  [ -n "$CHAOS_EXTRA_ARGS" ] && extra=($CHAOS_EXTRA_ARGS)
   if [ "$BACKEND" = docker ]; then
     local caps=()
     [ "$CHAOS_DEBUG" = 1 ] && caps=(--cap-add NET_ADMIN --cap-add SYS_TIME)
-    docker run -d --name "chaos-$i" "${caps[@]}" \
+    docker run -d --name "chaos-$i" "${caps[@]}" "${extra[@]}" \
       --network "$EDGE_NET" --ip "$(edge_ip "$i")" \
       -p "$(resp_port "$i"):6379" -p "$(metrics_port "$i"):9121" \
       -e MAREKVS_NODE_ID="$i" -e MAREKVS_REPLICAS_N=2 \
@@ -115,7 +123,7 @@ node_run() { # <i> — create + start node i
     local aseeds="" caps=()
     if [ "$i" != 0 ]; then aseeds="$(apple_ip chaos-0):7946"; fi
     [ "$CHAOS_DEBUG" = 1 ] && caps=(--cap-add CAP_SYS_TIME --cap-add CAP_NET_ADMIN)
-    container run -d --name "chaos-$i" "${caps[@]}" \
+    container run -d --name "chaos-$i" "${caps[@]}" "${extra[@]}" \
       -e MAREKVS_NODE_ID="$i" -e MAREKVS_REPLICAS_N=2 \
       -e MAREKVS_DATA_DIR=/data -e MAREKVS_ADVERTISE_IP=auto \
       -e MAREKVS_SEEDS="$aseeds" -e RUST_LOG=${CHAOS_LOG:-info},chitchat=warn \
