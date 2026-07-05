@@ -1648,7 +1648,19 @@ impl ReplEngine {
                 }
             }
             PeerMsg::BootstrapReq { pid } => {
-                self.stream_partition(peer, pid).await;
+                // Refuse pids we do not own: a joiner acting on a partial
+                // early gossip view can pick the wrong donor, and streaming
+                // our empty/stray copy + Done would mark the pid
+                // bootstrapped FOREVER (chaos join_empty_reads: ~1/3 of a
+                // joiner's partitions were "done" from a non-owner and then
+                // served empty home reads). No reply = the joiner's pending
+                // entry holds its join gate and its backoff re-requests
+                // from the right owner once views converge.
+                if self.cluster.owned_pids().contains(&pid) {
+                    self.stream_partition(peer, pid).await;
+                } else {
+                    tracing::info!(pid, peer, "refusing bootstrap request: not an owner");
+                }
             }
             PeerMsg::BootstrapChunk { pid, ops } => {
                 for op in ops {
