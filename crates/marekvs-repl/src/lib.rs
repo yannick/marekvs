@@ -1738,12 +1738,15 @@ impl ReplEngine {
                         let now = Instant::now();
                         let mut served = self.streams_served.lock();
                         served.retain(|_, t| now.duration_since(*t) < 4 * BOOTSTRAP_RETRY);
-                        if served.contains_key(&(peer, pid)) {
-                            true // do NOT re-stamp: a lost stream must
-                                 // become re-servable when the window ends
-                        } else {
-                            served.insert((peer, pid), now);
-                            false
+                        match served.entry((peer, pid)) {
+                            // Do NOT re-stamp an occupied entry: a lost
+                            // stream must become re-servable when the
+                            // window ends.
+                            std::collections::hash_map::Entry::Occupied(_) => true,
+                            std::collections::hash_map::Entry::Vacant(slot) => {
+                                slot.insert(now);
+                                false
+                            }
                         }
                     };
                     if dup {
