@@ -665,6 +665,13 @@ impl ReplEngine {
                                 &now.to_be_bytes(),
                                 Duration::ZERO,
                             );
+                            // MUST be durable: with interval fsync, a crash
+                            // shortly after going Active destroys the only
+                            // heartbeat — the restart then measures no
+                            // downtime and SKIPS the gc_grace rejoin,
+                            // re-opening the delete-resurrection window the
+                            // rejoin exists to close. Every ≤30 s, cheap.
+                            let _ = ctx.db.sync_wal();
                         })
                         .await;
                 }
