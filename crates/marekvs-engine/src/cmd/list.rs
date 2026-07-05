@@ -468,6 +468,102 @@ pub async fn pop(engine: &Arc<Engine>, args: &[Vec<u8>], left: bool) -> Reply {
         .await
 }
 
+async fn try_pop_many(
+    engine: &Arc<Engine>,
+    key: &[u8],
+    left: bool,
+    count: usize,
+) -> Result<Vec<Vec<u8>>, ()> {
+    let k = key.to_vec();
+    engine
+        .store
+        .run_key(key, move |ctx| {
+            let del = match check_type(ctx, &k, head::CTYPE_LIST) {
+                Err(()) => return Err(()),
+                Ok(d) => d,
+            };
+            if list_range(ctx, &k, del).is_none() {
+                return Ok(Vec::new());
+            }
+            let mut popped = Vec::with_capacity(count);
+            for _ in 0..count {
+                match do_pop(ctx, &k, left, del) {
+                    Some(v) => popped.push(v),
+                    None => break,
+                }
+            }
+            Ok(popped)
+        })
+        .await
+}
+
+async fn lmpop_inner(engine: &Arc<Engine>, keys: &[Vec<u8>], left: bool, count: usize) -> Reply {
+    for key in keys {
+        engine.ensure_local(key).await;
+        match try_pop_many(engine, key, left, count).await {
+            Err(()) => return Reply::wrongtype(),
+            Ok(values) if !values.is_empty() => {
+                return Reply::Array(vec![
+                    Reply::Bulk(key.clone()),
+                    Reply::Array(values.into_iter().map(Reply::Bulk).collect()),
+                ]);
+            }
+            Ok(_) => {}
+        }
+    }
+    Reply::NullArray
+}
+
+fn parse_lmpop_tail(args: &[Vec<u8>], start: usize) -> Result<(Vec<Vec<u8>>, bool, usize), Reply> {
+    let Some(numkeys) = args.get(start).and_then(|b| parse_i64(b)) else {
+        return Err(Reply::not_int());
+    };
+    if numkeys <= 0 {
+        return Err(Reply::syntax());
+    }
+    let numkeys = numkeys as usize;
+    let keys_start = start + 1;
+    let dir_idx = keys_start + numkeys;
+    if args.len() <= dir_idx {
+        return Err(Reply::syntax());
+    }
+    let left = if eq_ignore_case(&args[dir_idx], "LEFT") {
+        true
+    } else if eq_ignore_case(&args[dir_idx], "RIGHT") {
+        false
+    } else {
+        return Err(Reply::syntax());
+    };
+    let mut count = 1usize;
+    let mut i = dir_idx + 1;
+    while i < args.len() {
+        if eq_ignore_case(&args[i], "COUNT") {
+            let Some(n) = args.get(i + 1).and_then(|b| parse_i64(b)) else {
+                return Err(Reply::not_int());
+            };
+            if n <= 0 {
+                return Err(Reply::err("ERR count should be greater than 0"));
+            }
+            count = n as usize;
+            i += 2;
+        } else {
+            return Err(Reply::syntax());
+        }
+    }
+    Ok((args[keys_start..dir_idx].to_vec(), left, count))
+}
+
+pub async fn lmpop(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 4 {
+        return Reply::wrong_args("lmpop");
+    }
+    let (keys, left, count) = match parse_lmpop_tail(args, 1) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    lmpop_inner(engine, &keys, left, count).await
+}
+
 pub async fn llen(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     if args.len() != 2 {
         return Reply::wrong_args("llen");
@@ -987,6 +1083,32 @@ pub async fn brpoplpush(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         b"LEFT".to_vec(),
     ];
     poll_move(engine, inner, timeout).await
+}
+
+pub async fn blmpop(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 5 {
+        return Reply::wrong_args("blmpop");
+    }
+    let Some(timeout) = parse_timeout(&args[1]) else {
+        return Reply::err("ERR timeout is negative or not a float");
+    };
+    let (keys, left, count) = match parse_lmpop_tail(args, 2) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let deadline = timeout.map(|d| std::time::Instant::now() + d);
+    loop {
+        match lmpop_inner(engine, &keys, left, count).await {
+            Reply::NullArray => {}
+            other => return other,
+        }
+        if let Some(d) = deadline {
+            if std::time::Instant::now() >= d {
+                return Reply::NullArray;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
+    }
 }
 
 async fn poll_move(

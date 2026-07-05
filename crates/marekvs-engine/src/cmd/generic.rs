@@ -1,4 +1,4 @@
-//! Generic/keyspace family: DEL, EXISTS, TYPE, expiry, SCAN, KEYS, RENAME.
+//! Generic/keyspace family: DEL, EXISTS, TYPE, expiry, SCAN, KEYS, RENAME, COPY, OBJECT.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -521,7 +521,9 @@ pub async fn rename(engine: &Arc<Engine>, args: &[Vec<u8>], nx: bool) -> Reply {
             del_key(ctx, &d); // clobber whatever was there
             for (tag, suffix, value) in records {
                 let ik = rebuild_ikey(tag, &d, &suffix);
-                write_merged(ctx, &ik, &value);
+                if let Some(value) = restamp_record(ctx, &value) {
+                    write_merged(ctx, &ik, &value);
+                }
             }
         })
         .await;
@@ -535,6 +537,118 @@ pub async fn rename(engine: &Arc<Engine>, args: &[Vec<u8>], nx: bool) -> Reply {
     } else {
         Reply::ok()
     }
+}
+
+pub async fn copy(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 3 {
+        return Reply::wrong_args("copy");
+    }
+    let (src, dst) = (args[1].clone(), args[2].clone());
+    let mut replace = false;
+    let mut i = 3;
+    while i < args.len() {
+        if eq_ignore_case(&args[i], "REPLACE") {
+            replace = true;
+            i += 1;
+        } else if eq_ignore_case(&args[i], "DB") {
+            let Some(db) = args.get(i + 1).and_then(|b| parse_u64(b)) else {
+                return Reply::not_int();
+            };
+            if db != 0 {
+                return Reply::err("ERR DB index is out of range");
+            }
+            i += 2;
+        } else {
+            return Reply::syntax();
+        }
+    }
+
+    if !replace {
+        let d = dst.clone();
+        let exists = engine
+            .store
+            .run_key(&dst, move |ctx| key_type(ctx, &d).is_some())
+            .await;
+        if exists {
+            return Reply::Int(0);
+        }
+    }
+
+    let s = src.clone();
+    let records: Option<Vec<KeyRecord>> = engine
+        .store
+        .run_key(&src, move |ctx| collect_key_records(ctx, &s))
+        .await;
+    let Some(records) = records else {
+        return Reply::Int(0);
+    };
+
+    let d = dst.clone();
+    engine
+        .store
+        .run_key(&dst, move |ctx| {
+            if replace {
+                del_key(ctx, &d);
+            }
+            for (tag, suffix, value) in records {
+                let ik = rebuild_ikey(tag, &d, &suffix);
+                if let Some(value) = restamp_record(ctx, &value) {
+                    write_merged(ctx, &ik, &value);
+                }
+            }
+        })
+        .await;
+    Reply::Int(1)
+}
+
+pub async fn object(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 2 {
+        return Reply::wrong_args("object");
+    }
+    let sub = String::from_utf8_lossy(&args[1]).to_ascii_uppercase();
+    if sub == "HELP" {
+        return Reply::Array(vec![
+            Reply::bulk_str("OBJECT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"),
+            Reply::bulk_str("ENCODING <key>"),
+            Reply::bulk_str("REFCOUNT <key>"),
+            Reply::bulk_str("IDLETIME <key>"),
+            Reply::bulk_str("FREQ <key>"),
+            Reply::bulk_str("HELP"),
+        ]);
+    }
+    if args.len() != 3 {
+        return Reply::wrong_args("object");
+    }
+    if sub == "FREQ" {
+        return Reply::err(
+            "ERR An LFU maxmemory policy is not selected, access frequency not tracked.",
+        );
+    }
+    let key = args[2].clone();
+    engine.ensure_local(&key).await;
+    engine
+        .store
+        .run_key(&args[2], move |ctx| {
+            let Some(t) = key_type(ctx, &key) else {
+                return Reply::err("ERR no such key");
+            };
+            match sub.as_str() {
+                "REFCOUNT" => Reply::Int(1),
+                "IDLETIME" => Reply::Int(0),
+                "ENCODING" => Reply::bulk_str(match t {
+                    b's' => "raw",
+                    head::CTYPE_HASH => "hashtable",
+                    head::CTYPE_SET => "hashtable",
+                    head::CTYPE_ZSET => "skiplist",
+                    head::CTYPE_LIST => "quicklist",
+                    head::CTYPE_STREAM => "stream",
+                    head::CTYPE_HLL => "raw",
+                    _ => "raw",
+                }),
+                _ => Reply::err("ERR unknown subcommand"),
+            }
+        })
+        .await
 }
 
 /// One portable record: (tag, element suffix, full stored value).
@@ -572,8 +686,10 @@ fn collect_key_records(ctx: &ShardCtx, key: &[u8]) -> Option<Vec<KeyRecord>> {
             // non-OR-element branch below and copy with their position suffix
             // intact, so list order survives a RENAME.
             let (head_env, _, del) = get_head(ctx, key)?;
+            let head_raw = get_raw(ctx, &ikey::head_key(key))?;
+            let (_, head_payload) = Envelope::decode(&head_raw)?;
             let env = Envelope::head(ctx.hlc.now(), ctx.node_id).with_ttl(head_env.ttl_deadline_ms);
-            out.push((b'M', Vec::new(), env.encode_with(&head::encode(ctype, 0))));
+            out.push((b'M', Vec::new(), env.encode_with(head_payload)));
             let tag = match ctype {
                 head::CTYPE_HASH => ikey::Tag::HashField,
                 head::CTYPE_SET => ikey::Tag::SetMember,
@@ -588,11 +704,12 @@ fn collect_key_records(ctx: &ShardCtx, key: &[u8]) -> Option<Vec<KeyRecord>> {
                     if store::visible(&env, pay, del, now).is_some() {
                         if env.rtype().is_or_element() {
                             if let Some(val) = marekvs_core::merge::element_value(pay) {
-                                let rec = marekvs_core::merge::element_add(
+                                let rec = marekvs_core::merge::element_add_ttl(
                                     env.rtype(),
                                     ctx.hlc.now(),
                                     ctx.node_id,
                                     &val,
+                                    env.ttl_deadline_ms,
                                 );
                                 out.push((tag as u8, p.suffix.to_vec(), rec));
                             }
@@ -625,6 +742,33 @@ fn rebuild_ikey(tag: u8, userkey: &[u8], suffix: &[u8]) -> Vec<u8> {
         b'H' => ikey::prefixed(ikey::Tag::HllRegister, userkey, suffix),
         _ => unreachable!("unknown tag"),
     }
+}
+
+fn restamp_record(ctx: &ShardCtx, value: &[u8]) -> Option<Vec<u8>> {
+    let (env, payload) = Envelope::decode(value)?;
+    if env.is_head() {
+        return Some(
+            Envelope::head(ctx.hlc.now(), ctx.node_id)
+                .with_ttl(env.ttl_deadline_ms)
+                .encode_with(payload),
+        );
+    }
+    if env.rtype().is_or_element() {
+        let val = marekvs_core::merge::element_value(payload)?;
+        return Some(marekvs_core::merge::element_add_ttl(
+            env.rtype(),
+            ctx.hlc.now(),
+            ctx.node_id,
+            &val,
+            env.ttl_deadline_ms,
+        ));
+    }
+    Some(store::new_lww(
+        ctx,
+        env.rtype(),
+        payload,
+        env.ttl_deadline_ms,
+    ))
 }
 
 fn hex_encode(b: &[u8]) -> String {

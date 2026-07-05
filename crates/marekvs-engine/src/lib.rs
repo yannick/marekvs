@@ -251,10 +251,19 @@ impl Engine {
                 | "PERSIST"
                 | "RENAME"
                 | "RENAMENX"
+                | "COPY"
                 | "HSET"
                 | "HSETNX"
                 | "HMSET"
                 | "HDEL"
+                | "HGETDEL"
+                | "HEXPIRE"
+                | "HPEXPIRE"
+                | "HEXPIREAT"
+                | "HPEXPIREAT"
+                | "HPERSIST"
+                | "HGETEX"
+                | "HSETEX"
                 | "HINCRBY"
                 | "HINCRBYFLOAT"
                 | "SADD"
@@ -269,7 +278,17 @@ impl Engine {
                 | "ZREM"
                 | "ZPOPMIN"
                 | "ZPOPMAX"
+                | "BZPOPMIN"
+                | "BZPOPMAX"
+                | "ZMPOP"
+                | "BZMPOP"
+                | "ZRANGESTORE"
                 | "ZREMRANGEBYSCORE"
+                | "ZREMRANGEBYRANK"
+                | "ZREMRANGEBYLEX"
+                | "ZUNIONSTORE"
+                | "ZINTERSTORE"
+                | "ZDIFFSTORE"
                 | "LPUSH"
                 | "RPUSH"
                 | "LPUSHX"
@@ -282,13 +301,16 @@ impl Engine {
                 | "LINSERT"
                 | "LMOVE"
                 | "RPOPLPUSH"
+                | "LMPOP"
                 | "BLPOP"
                 | "BRPOP"
                 | "BLMOVE"
                 | "BRPOPLPUSH"
+                | "BLMPOP"
                 | "XADD"
                 | "XDEL"
                 | "XTRIM"
+                | "XSETID"
                 | "PFADD"
                 | "PFMERGE"
                 | "EVAL"
@@ -344,6 +366,7 @@ impl Engine {
                 | "PFCOUNT"
                 | "PFMERGE"
                 | "PERSIST"
+                | "COPY"
                 | "TOUCH"
                 | "SADD"
                 | "SREM"
@@ -369,6 +392,18 @@ impl Engine {
                 | "HMGET"
                 | "HGETALL"
                 | "HDEL"
+                | "HGETDEL"
+                | "HEXPIRE"
+                | "HPEXPIRE"
+                | "HEXPIREAT"
+                | "HPEXPIREAT"
+                | "HTTL"
+                | "HPTTL"
+                | "HEXPIRETIME"
+                | "HPEXPIRETIME"
+                | "HPERSIST"
+                | "HGETEX"
+                | "HSETEX"
                 | "HEXISTS"
                 | "HLEN"
                 | "HKEYS"
@@ -391,9 +426,24 @@ impl Engine {
                 | "ZRANK"
                 | "ZREVRANK"
                 | "ZCOUNT"
+                | "ZLEXCOUNT"
                 | "ZPOPMIN"
                 | "ZPOPMAX"
+                | "ZMPOP"
+                | "ZRANDMEMBER"
+                | "ZRANGESTORE"
+                | "ZRANGEBYLEX"
+                | "ZREVRANGEBYLEX"
                 | "ZREMRANGEBYSCORE"
+                | "ZREMRANGEBYRANK"
+                | "ZREMRANGEBYLEX"
+                | "ZUNION"
+                | "ZINTER"
+                | "ZDIFF"
+                | "ZUNIONSTORE"
+                | "ZINTERSTORE"
+                | "ZDIFFSTORE"
+                | "ZINTERCARD"
                 | "ZSCAN"
                 | "LPUSH"
                 | "RPUSH"
@@ -411,6 +461,7 @@ impl Engine {
                 | "LPOS"
                 | "LMOVE"
                 | "RPOPLPUSH"
+                | "LMPOP"
                 | "XADD"
                 | "XLEN"
                 | "XRANGE"
@@ -418,6 +469,8 @@ impl Engine {
                 | "XREAD"
                 | "XDEL"
                 | "XTRIM"
+                | "XSETID"
+                | "XINFO"
                 | "PING"
                 | "ECHO"
         )
@@ -554,7 +607,21 @@ mod write_command_tests {
             "GETDEL",
             "GETEX",
             "RENAME",
+            "COPY",
             "MSETNX",
+            "HGETDEL",
+            "HEXPIRE",
+            "HPERSIST",
+            "HGETEX",
+            "HSETEX",
+            "ZRANGESTORE",
+            "ZREMRANGEBYRANK",
+            "ZUNIONSTORE",
+            "ZMPOP",
+            "BZPOPMIN",
+            "LMPOP",
+            "BLMPOP",
+            "XSETID",
         ] {
             assert!(Engine::is_write_command(c), "{c} must be write-gated");
         }
@@ -572,8 +639,12 @@ mod write_command_tests {
             "SMEMBERS",
             "HGETALL",
             "ZRANGE",
+            "ZRANDMEMBER",
+            "ZINTERCARD",
             "LRANGE",
             "XRANGE",
+            "XINFO",
+            "OBJECT",
             "PFCOUNT",
             "INFO",
             "CONFIG",

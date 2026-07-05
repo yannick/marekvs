@@ -8,6 +8,7 @@
 //! range reads still re-verify each member record, so a dangling index entry
 //! (possible after a crash) is tolerated, not trusted.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -249,6 +250,34 @@ fn parse_score_bound(b: &[u8]) -> Option<(f64, bool)> {
 fn in_range(score: f64, min: (f64, bool), max: (f64, bool)) -> bool {
     let lo = if min.1 { score > min.0 } else { score >= min.0 };
     let hi = if max.1 { score < max.0 } else { score <= max.0 };
+    lo && hi
+}
+
+fn parse_lex_bound(b: &[u8], is_min: bool) -> Option<Option<(Vec<u8>, bool)>> {
+    if b == b"-" && is_min {
+        return Some(None);
+    }
+    if b == b"+" && !is_min {
+        return Some(None);
+    }
+    match b.first()? {
+        b'(' => Some(Some((b[1..].to_vec(), true))),
+        b'[' => Some(Some((b[1..].to_vec(), false))),
+        _ => None,
+    }
+}
+
+fn in_lex(member: &[u8], min: Option<(Vec<u8>, bool)>, max: Option<(Vec<u8>, bool)>) -> bool {
+    let lo = match min {
+        None => true,
+        Some((ref b, excl)) if excl => member > b.as_slice(),
+        Some((ref b, _)) => member >= b.as_slice(),
+    };
+    let hi = match max {
+        None => true,
+        Some((ref b, excl)) if excl => member < b.as_slice(),
+        Some((ref b, _)) => member <= b.as_slice(),
+    };
     lo && hi
 }
 
@@ -537,13 +566,39 @@ pub async fn zrange(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             return Reply::syntax();
         }
     }
-    if bylex {
-        return Reply::err("ERR BYLEX is not supported");
-    }
     if limit.is_some() && !byscore {
-        return Reply::err(
-            "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX",
-        );
+        if !bylex {
+            return Reply::err(
+                "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX",
+            );
+        }
+    }
+
+    if bylex {
+        let (min_arg, max_arg) = if rev { (a3, a2) } else { (a2, a3) };
+        let (Some(min), Some(max)) = (
+            parse_lex_bound(&min_arg, true),
+            parse_lex_bound(&max_arg, false),
+        ) else {
+            return Reply::syntax();
+        };
+        return engine
+            .store
+            .run_key(&args[1], move |ctx| {
+                let Ok(del) = zset_del_hlc(ctx, &key) else {
+                    return Reply::wrongtype();
+                };
+                let mut items: Vec<(f64, Vec<u8>)> = scored_members(ctx, &key, del)
+                    .into_iter()
+                    .filter(|(_, m)| in_lex(m, min.clone(), max.clone()))
+                    .collect();
+                items.sort_by(|a, b| a.1.cmp(&b.1));
+                if rev {
+                    items.reverse();
+                }
+                emit(apply_limit(items, limit), withscores)
+            })
+            .await;
     }
 
     if byscore {
@@ -833,6 +888,683 @@ pub async fn zremrangebyscore(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
                 }
             }
             Reply::Int(n)
+        })
+        .await
+}
+
+pub async fn zrandmember(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 2 || args.len() > 4 {
+        return Reply::wrong_args("zrandmember");
+    }
+    let key = args[1].clone();
+    let count = args.get(2).and_then(|b| parse_i64(b));
+    let withscores = match args.get(3) {
+        None => false,
+        Some(a) if eq_ignore_case(a, "WITHSCORES") => true,
+        Some(_) => return Reply::syntax(),
+    };
+    engine.ensure_local(&key).await;
+    engine
+        .store
+        .run_key(&args[1], move |ctx| {
+            let Ok(del) = zset_del_hlc(ctx, &key) else {
+                return Reply::wrongtype();
+            };
+            let want = match count {
+                None => 1,
+                Some(n) => n.unsigned_abs() as usize,
+            };
+            let items = scored_members_limited(ctx, &key, del, want.max(1));
+            if items.is_empty() {
+                return if count.is_none() {
+                    Reply::Null
+                } else {
+                    Reply::Array(vec![])
+                };
+            }
+            match count {
+                None => {
+                    if withscores {
+                        emit(vec![items[0].clone()], true)
+                    } else {
+                        Reply::Bulk(items[0].1.clone())
+                    }
+                }
+                Some(n) => {
+                    let take = if n < 0 { want } else { want.min(items.len()) };
+                    let mut out = Vec::with_capacity(take * if withscores { 2 } else { 1 });
+                    for i in 0..take {
+                        let (s, m) = &items[i % items.len()];
+                        out.push(Reply::Bulk(m.clone()));
+                        if withscores {
+                            out.push(Reply::Double(*s));
+                        }
+                    }
+                    Reply::Array(out)
+                }
+            }
+        })
+        .await
+}
+
+pub async fn zremrangebyrank(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() != 4 {
+        return Reply::wrong_args("zremrangebyrank");
+    }
+    let key = args[1].clone();
+    let (Some(start), Some(stop)) = (parse_i64(&args[2]), parse_i64(&args[3])) else {
+        return Reply::not_int();
+    };
+    engine
+        .store
+        .run_key(&args[1], move |ctx| {
+            let Ok(del) = zset_del_hlc(ctx, &key) else {
+                return Reply::wrongtype();
+            };
+            let victims: Vec<Vec<u8>> = slice_by_index(scored_members(ctx, &key, del), start, stop)
+                .into_iter()
+                .map(|(_, m)| m)
+                .collect();
+            let mut n = 0;
+            for m in victims {
+                if remove_member(ctx, &key, &m, del) {
+                    n += 1;
+                }
+            }
+            Reply::Int(n)
+        })
+        .await
+}
+
+pub async fn zlexcount(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() != 4 {
+        return Reply::wrong_args("zlexcount");
+    }
+    let key = args[1].clone();
+    let (Some(min), Some(max)) = (
+        parse_lex_bound(&args[2], true),
+        parse_lex_bound(&args[3], false),
+    ) else {
+        return Reply::syntax();
+    };
+    engine.ensure_local(&key).await;
+    engine
+        .store
+        .run_key(&args[1], move |ctx| {
+            let Ok(del) = zset_del_hlc(ctx, &key) else {
+                return Reply::wrongtype();
+            };
+            let n = scored_members(ctx, &key, del)
+                .into_iter()
+                .filter(|(_, m)| in_lex(m, min.clone(), max.clone()))
+                .count();
+            Reply::Int(n as i64)
+        })
+        .await
+}
+
+pub async fn zrangebylex(engine: &Arc<Engine>, args: &[Vec<u8>], rev: bool) -> Reply {
+    if args.len() < 4 {
+        return Reply::wrong_args("zrangebylex");
+    }
+    let mut zargs = vec![
+        b"ZRANGE".to_vec(),
+        args[1].clone(),
+        args[2].clone(),
+        args[3].clone(),
+        b"BYLEX".to_vec(),
+    ];
+    if rev {
+        zargs.push(b"REV".to_vec());
+    }
+    zargs.extend_from_slice(&args[4..]);
+    zrange(engine, &zargs).await
+}
+
+pub async fn zremrangebylex(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() != 4 {
+        return Reply::wrong_args("zremrangebylex");
+    }
+    let key = args[1].clone();
+    let (Some(min), Some(max)) = (
+        parse_lex_bound(&args[2], true),
+        parse_lex_bound(&args[3], false),
+    ) else {
+        return Reply::syntax();
+    };
+    engine
+        .store
+        .run_key(&args[1], move |ctx| {
+            let Ok(del) = zset_del_hlc(ctx, &key) else {
+                return Reply::wrongtype();
+            };
+            let victims: Vec<Vec<u8>> = scored_members(ctx, &key, del)
+                .into_iter()
+                .filter(|(_, m)| in_lex(m, min.clone(), max.clone()))
+                .map(|(_, m)| m)
+                .collect();
+            let mut n = 0;
+            for m in victims {
+                if remove_member(ctx, &key, &m, del) {
+                    n += 1;
+                }
+            }
+            Reply::Int(n)
+        })
+        .await
+}
+
+pub async fn zrangestore(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 5 {
+        return Reply::wrong_args("zrangestore");
+    }
+    let dst = args[1].clone();
+    let src = args[2].clone();
+    let zargs: Vec<Vec<u8>> = std::iter::once(b"ZRANGE".to_vec())
+        .chain(args[2..].iter().cloned())
+        .collect();
+    let selected = match zrange_items(engine, &zargs).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let out = selected.clone();
+    let dst_arg = dst.clone();
+    engine
+        .store
+        .run_key(&dst_arg, move |ctx| {
+            crate::cmd::generic::del_key(ctx, &dst);
+            if !out.is_empty() {
+                ensure_head(ctx, &dst, head::CTYPE_ZSET);
+            }
+            for (s, m) in out {
+                write_member(ctx, &dst, &m, s);
+            }
+        })
+        .await;
+    let _ = src;
+    Reply::Int(selected.len() as i64)
+}
+
+fn try_zpop(
+    ctx: &ShardCtx,
+    key: &[u8],
+    max: bool,
+    count: usize,
+) -> Result<Vec<(f64, Vec<u8>)>, ()> {
+    let del = zset_del_hlc(ctx, key)?;
+    let victims: Vec<(f64, Vec<u8>)> = if max {
+        let mut window = std::collections::VecDeque::with_capacity(count + 1);
+        for pair in scored_members(ctx, key, del) {
+            window.push_back(pair);
+            if window.len() > count {
+                window.pop_front();
+            }
+        }
+        window.into_iter().rev().collect()
+    } else {
+        pop_scored_candidates(ctx, key, del, count)
+    };
+    let mut popped = Vec::with_capacity(victims.len());
+    for (score, member) in victims {
+        if remove_member(ctx, key, &member, del) {
+            popped.push((score, member));
+        }
+    }
+    Ok(popped)
+}
+
+async fn zmpop_inner(
+    engine: &Arc<Engine>,
+    keys: &[Vec<u8>],
+    max: bool,
+    count: usize,
+) -> Result<Option<(Vec<u8>, Vec<(f64, Vec<u8>)>)>, Reply> {
+    for key in keys {
+        engine.ensure_local(key).await;
+        let k = key.clone();
+        let popped = engine
+            .store
+            .run_key(key, move |ctx| try_zpop(ctx, &k, max, count))
+            .await;
+        match popped {
+            Err(()) => return Err(Reply::wrongtype()),
+            Ok(items) if !items.is_empty() => return Ok(Some((key.clone(), items))),
+            Ok(_) => {}
+        }
+    }
+    Ok(None)
+}
+
+fn zmpop_reply(hit: Option<(Vec<u8>, Vec<(f64, Vec<u8>)>)>) -> Reply {
+    match hit {
+        None => Reply::NullArray,
+        Some((key, items)) => Reply::Array(vec![Reply::Bulk(key), emit(items, true)]),
+    }
+}
+
+fn parse_zmpop_tail(args: &[Vec<u8>], start: usize) -> Result<(Vec<Vec<u8>>, bool, usize), Reply> {
+    let Some(numkeys) = args.get(start).and_then(|b| crate::cmd::parse_u64(b)) else {
+        return Err(Reply::not_int());
+    };
+    if numkeys == 0 {
+        return Err(Reply::syntax());
+    }
+    let numkeys = numkeys as usize;
+    let keys_start = start + 1;
+    let where_idx = keys_start + numkeys;
+    if args.len() <= where_idx {
+        return Err(Reply::syntax());
+    }
+    let max = if eq_ignore_case(&args[where_idx], "MAX") {
+        true
+    } else if eq_ignore_case(&args[where_idx], "MIN") {
+        false
+    } else {
+        return Err(Reply::syntax());
+    };
+    let mut count = 1usize;
+    let mut i = where_idx + 1;
+    while i < args.len() {
+        if eq_ignore_case(&args[i], "COUNT") {
+            let Some(n) = args.get(i + 1).and_then(|b| parse_i64(b)) else {
+                return Err(Reply::not_int());
+            };
+            if n <= 0 {
+                return Err(Reply::err("ERR count should be greater than 0"));
+            }
+            count = n as usize;
+            i += 2;
+        } else {
+            return Err(Reply::syntax());
+        }
+    }
+    Ok((args[keys_start..where_idx].to_vec(), max, count))
+}
+
+pub async fn zmpop(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 4 {
+        return Reply::wrong_args("zmpop");
+    }
+    let (keys, max, count) = match parse_zmpop_tail(args, 1) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    match zmpop_inner(engine, &keys, max, count).await {
+        Ok(hit) => zmpop_reply(hit),
+        Err(r) => r,
+    }
+}
+
+fn parse_timeout(b: &[u8]) -> Option<Option<std::time::Duration>> {
+    let secs = parse_f64(b)?;
+    if secs < 0.0 {
+        return None;
+    }
+    Some(if secs == 0.0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs_f64(secs))
+    })
+}
+
+pub async fn bzpop(engine: &Arc<Engine>, args: &[Vec<u8>], max: bool) -> Reply {
+    if args.len() < 3 {
+        return Reply::wrong_args("bzpop");
+    }
+    let Some(timeout) = parse_timeout(args.last().unwrap()) else {
+        return Reply::err("ERR timeout is negative or not a float");
+    };
+    let keys: Vec<Vec<u8>> = args[1..args.len() - 1].to_vec();
+    let deadline = timeout.map(|d| std::time::Instant::now() + d);
+    loop {
+        match zmpop_inner(engine, &keys, max, 1).await {
+            Err(r) => return r,
+            Ok(Some((key, mut items))) => {
+                let (score, member) = items.remove(0);
+                return Reply::Array(vec![
+                    Reply::Bulk(key),
+                    Reply::Bulk(member),
+                    Reply::Double(score),
+                ]);
+            }
+            Ok(None) => {}
+        }
+        if let Some(d) = deadline {
+            if std::time::Instant::now() >= d {
+                return Reply::NullArray;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+pub async fn bzmpop(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 5 {
+        return Reply::wrong_args("bzmpop");
+    }
+    let Some(timeout) = parse_timeout(&args[1]) else {
+        return Reply::err("ERR timeout is negative or not a float");
+    };
+    let (keys, max, count) = match parse_zmpop_tail(args, 2) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let deadline = timeout.map(|d| std::time::Instant::now() + d);
+    loop {
+        match zmpop_inner(engine, &keys, max, count).await {
+            Err(r) => return r,
+            Ok(Some(hit)) => return zmpop_reply(Some(hit)),
+            Ok(None) => {}
+        }
+        if let Some(d) = deadline {
+            if std::time::Instant::now() >= d {
+                return Reply::NullArray;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum ZSetOp {
+    Union,
+    Inter,
+    Diff,
+}
+
+#[derive(Clone, Copy)]
+enum Aggregate {
+    Sum,
+    Min,
+    Max,
+}
+
+async fn zitems_of(engine: &Arc<Engine>, key: &[u8]) -> Result<Vec<(Vec<u8>, f64)>, ()> {
+    let k = key.to_vec();
+    engine.ensure_local(key).await;
+    engine
+        .store
+        .run_key(key, move |ctx| {
+            let del = zset_del_hlc(ctx, &k)?;
+            Ok(scored_members(ctx, &k, del)
+                .into_iter()
+                .map(|(s, m)| (m, s))
+                .collect())
+        })
+        .await
+}
+
+fn aggregate(cur: f64, next: f64, agg: Aggregate) -> f64 {
+    match agg {
+        Aggregate::Sum => cur + next,
+        Aggregate::Min => cur.min(next),
+        Aggregate::Max => cur.max(next),
+    }
+}
+
+pub async fn zsetop(engine: &Arc<Engine>, args: &[Vec<u8>], op: ZSetOp, store_dst: bool) -> Reply {
+    let min = if store_dst { 4 } else { 3 };
+    if args.len() < min {
+        return Reply::wrong_args("zsetop");
+    }
+    let mut idx = if store_dst { 2 } else { 1 };
+    let Some(numkeys) = args.get(idx).and_then(|b| crate::cmd::parse_u64(b)) else {
+        return Reply::not_int();
+    };
+    if numkeys == 0 {
+        return Reply::syntax();
+    }
+    let numkeys = numkeys as usize;
+    idx += 1;
+    if args.len() < idx + numkeys {
+        return Reply::syntax();
+    }
+    let keys = args[idx..idx + numkeys].to_vec();
+    idx += numkeys;
+    let mut weights = vec![1.0; numkeys];
+    let mut agg = Aggregate::Sum;
+    let mut withscores = false;
+    while idx < args.len() {
+        if eq_ignore_case(&args[idx], "WEIGHTS") {
+            if args.len() < idx + 1 + numkeys {
+                return Reply::syntax();
+            }
+            for j in 0..numkeys {
+                let Some(w) = parse_f64(&args[idx + 1 + j]) else {
+                    return Reply::not_float();
+                };
+                weights[j] = w;
+            }
+            idx += 1 + numkeys;
+        } else if eq_ignore_case(&args[idx], "AGGREGATE") {
+            let Some(a) = args.get(idx + 1) else {
+                return Reply::syntax();
+            };
+            agg = if eq_ignore_case(a, "SUM") {
+                Aggregate::Sum
+            } else if eq_ignore_case(a, "MIN") {
+                Aggregate::Min
+            } else if eq_ignore_case(a, "MAX") {
+                Aggregate::Max
+            } else {
+                return Reply::syntax();
+            };
+            idx += 2;
+        } else if eq_ignore_case(&args[idx], "WITHSCORES") && !store_dst {
+            withscores = true;
+            idx += 1;
+        } else {
+            return Reply::syntax();
+        }
+    }
+
+    let mut maps = Vec::with_capacity(numkeys);
+    for (k, w) in keys.iter().zip(weights.iter()) {
+        let items = match zitems_of(engine, k).await {
+            Ok(v) => v,
+            Err(()) => return Reply::wrongtype(),
+        };
+        maps.push(
+            items
+                .into_iter()
+                .map(|(m, s)| (m, s * *w))
+                .collect::<HashMap<Vec<u8>, f64>>(),
+        );
+    }
+
+    let mut result: HashMap<Vec<u8>, f64> = HashMap::new();
+    match op {
+        ZSetOp::Union => {
+            for m in maps {
+                for (member, score) in m {
+                    result
+                        .entry(member)
+                        .and_modify(|s| *s = aggregate(*s, score, agg))
+                        .or_insert(score);
+                }
+            }
+        }
+        ZSetOp::Inter => {
+            if let Some(first) = maps.first() {
+                let mut candidates: HashSet<Vec<u8>> = first.keys().cloned().collect();
+                for m in maps.iter().skip(1) {
+                    candidates.retain(|member| m.contains_key(member));
+                }
+                for member in candidates {
+                    let mut score = maps[0][&member];
+                    for m in maps.iter().skip(1) {
+                        score = aggregate(score, m[&member], agg);
+                    }
+                    result.insert(member, score);
+                }
+            }
+        }
+        ZSetOp::Diff => {
+            if let Some(first) = maps.first() {
+                for (member, score) in first {
+                    if maps.iter().skip(1).all(|m| !m.contains_key(member)) {
+                        result.insert(member.clone(), *score);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<(f64, Vec<u8>)> = result.into_iter().map(|(m, s)| (s, m)).collect();
+    out.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+    });
+
+    if store_dst {
+        let dst = args[1].clone();
+        let rows = out.clone();
+        let dst_arg = dst.clone();
+        engine
+            .store
+            .run_key(&dst_arg, move |ctx| {
+                crate::cmd::generic::del_key(ctx, &dst);
+                if !rows.is_empty() {
+                    ensure_head(ctx, &dst, head::CTYPE_ZSET);
+                }
+                for (s, m) in rows {
+                    write_member(ctx, &dst, &m, s);
+                }
+            })
+            .await;
+        Reply::Int(out.len() as i64)
+    } else {
+        emit(out, withscores)
+    }
+}
+
+pub async fn zintercard(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 3 {
+        return Reply::wrong_args("zintercard");
+    }
+    let Some(numkeys) = args.get(1).and_then(|b| crate::cmd::parse_u64(b)) else {
+        return Reply::not_int();
+    };
+    if numkeys == 0 {
+        return Reply::syntax();
+    }
+    let numkeys = numkeys as usize;
+    if args.len() < 2 + numkeys {
+        return Reply::syntax();
+    }
+    let mut limit = usize::MAX;
+    let mut idx = 2 + numkeys;
+    while idx < args.len() {
+        if eq_ignore_case(&args[idx], "LIMIT") {
+            let Some(n) = args.get(idx + 1).and_then(|b| crate::cmd::parse_u64(b)) else {
+                return Reply::not_int();
+            };
+            if n != 0 {
+                limit = n as usize;
+            }
+            idx += 2;
+        } else {
+            return Reply::syntax();
+        }
+    }
+    let mut acc: Option<HashSet<Vec<u8>>> = None;
+    for k in &args[2..2 + numkeys] {
+        let items = match zitems_of(engine, k).await {
+            Ok(v) => v,
+            Err(()) => return Reply::wrongtype(),
+        };
+        let set: HashSet<Vec<u8>> = items.into_iter().map(|(m, _)| m).collect();
+        acc = Some(match acc {
+            None => set,
+            Some(cur) => cur.intersection(&set).cloned().collect(),
+        });
+        if acc.as_ref().is_some_and(|s| s.len() >= limit) {
+            break;
+        }
+    }
+    Reply::Int(acc.map_or(0, |s| s.len().min(limit)) as i64)
+}
+
+async fn zrange_items(
+    engine: &Arc<Engine>,
+    args: &[Vec<u8>],
+) -> Result<Vec<(f64, Vec<u8>)>, Reply> {
+    if args.len() < 4 {
+        return Err(Reply::wrong_args("zrange"));
+    }
+    let key = args[1].clone();
+    let a2 = args[2].clone();
+    let a3 = args[3].clone();
+    let mut byscore = false;
+    let mut bylex = false;
+    let mut rev = false;
+    let mut limit: Option<(i64, i64)> = None;
+    let mut i = 4;
+    while i < args.len() {
+        if eq_ignore_case(&args[i], "BYSCORE") {
+            byscore = true;
+            i += 1;
+        } else if eq_ignore_case(&args[i], "BYLEX") {
+            bylex = true;
+            i += 1;
+        } else if eq_ignore_case(&args[i], "REV") {
+            rev = true;
+            i += 1;
+        } else if eq_ignore_case(&args[i], "WITHSCORES") {
+            i += 1;
+        } else if eq_ignore_case(&args[i], "LIMIT") {
+            let (Some(off), Some(cnt)) = (
+                args.get(i + 1).and_then(|b| parse_i64(b)),
+                args.get(i + 2).and_then(|b| parse_i64(b)),
+            ) else {
+                return Err(Reply::not_int());
+            };
+            limit = Some((off, cnt));
+            i += 3;
+        } else {
+            return Err(Reply::syntax());
+        }
+    }
+    engine.ensure_local(&key).await;
+    engine
+        .store
+        .run_key(&args[1], move |ctx| {
+            let Ok(del) = zset_del_hlc(ctx, &key) else {
+                return Err(Reply::wrongtype());
+            };
+            let mut items = scored_members(ctx, &key, del);
+            if byscore {
+                let (min_arg, max_arg) = if rev { (a3, a2) } else { (a2, a3) };
+                let (Some(min), Some(max)) =
+                    (parse_score_bound(&min_arg), parse_score_bound(&max_arg))
+                else {
+                    return Err(Reply::err("ERR min or max is not a float"));
+                };
+                items.retain(|(s, _)| in_range(*s, min, max));
+            } else if bylex {
+                let (min_arg, max_arg) = if rev { (a3, a2) } else { (a2, a3) };
+                let (Some(min), Some(max)) = (
+                    parse_lex_bound(&min_arg, true),
+                    parse_lex_bound(&max_arg, false),
+                ) else {
+                    return Err(Reply::syntax());
+                };
+                items.retain(|(_, m)| in_lex(m, min.clone(), max.clone()));
+                items.sort_by(|a, b| a.1.cmp(&b.1));
+            } else {
+                let (Some(start), Some(stop)) = (parse_i64(&a2), parse_i64(&a3)) else {
+                    return Err(Reply::not_int());
+                };
+                if rev {
+                    items.reverse();
+                }
+                return Ok(slice_by_index(items, start, stop));
+            }
+            if rev {
+                items.reverse();
+            }
+            Ok(apply_limit(items, limit))
         })
         .await
 }
