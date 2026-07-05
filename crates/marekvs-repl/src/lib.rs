@@ -789,6 +789,19 @@ impl ReplEngine {
         let self_id = self.store.node_id;
         let mut changed = false;
         let mut re_requests = 0usize;
+        // Global progress signal: while ANY bootstrap chunk arrived within
+        // the retry window, the donor pipeline is alive and merely working
+        // through its SEQUENTIAL queue — re-requesting queued pids only
+        // duplicates streams (measured 6-7x amplification). Re-requests fire
+        // only once the pipe has gone quiet.
+        let pipe_active = {
+            let g = self.gate.lock();
+            let now = Instant::now();
+            !g.bootstrap_pending.is_empty()
+                && g.last_chunk_at
+                    .values()
+                    .any(|t| now.duration_since(*t) < BOOTSTRAP_RETRY)
+        };
         for pid in self.cluster.future_owned_pids() {
             let (skip, resume, attempts) = {
                 let now = Instant::now();
@@ -798,13 +811,19 @@ impl ReplEngine {
                 // occur; revisit when cold_purge lands.
                 let entry = g.bootstrap_pending.get(&pid);
                 let attempts = entry.map(|(_, a)| *a).unwrap_or(0);
-                let backoff = BOOTSTRAP_RETRY * 2u32.saturating_pow(attempts.min(6));
+                // Capped backoff (5/10/20 s): early attempts often hit
+                // refusing donors while gossip is still delivering members;
+                // punitive exponential tiers stalled joins for minutes.
+                let backoff = BOOTSTRAP_RETRY * 2u32.saturating_pow(attempts.min(2));
                 let awaiting_req = entry.is_some_and(|(t, _)| now.duration_since(*t) < backoff);
                 let progressing = g
                     .last_chunk_at
                     .get(&pid)
                     .is_some_and(|t| now.duration_since(*t) < BOOTSTRAP_RETRY);
-                let skip = g.bootstrap_done.contains(&pid) || awaiting_req || progressing;
+                let skip = g.bootstrap_done.contains(&pid)
+                    || awaiting_req
+                    || progressing
+                    || (pipe_active && entry.is_some());
                 let next_attempts = if entry.is_some() { attempts + 1 } else { 0 };
                 (skip, g.resume_pids.contains(&pid), next_attempts)
             };
