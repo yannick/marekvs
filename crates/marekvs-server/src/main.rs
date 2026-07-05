@@ -321,6 +321,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_secs(2)).await;
     if standalone_cfg {
         cluster.set_phase(NodePhase::Active).await;
+        repl.mark_join_complete().await;
     } else {
         // 0 = wait forever (default): a node that cannot finish bootstrap
         // must stay unready rather than serve empty reads. The env is an
@@ -336,6 +337,9 @@ async fn main() -> anyhow::Result<()> {
             engine.metrics.join_gate_timeouts_total.inc();
         }
         cluster.set_phase(NodePhase::Active).await;
+        // Join complete: clear the crash-resume marker so a later healthy
+        // restart recovers via ring resume + AE, not a re-bootstrap.
+        repl.mark_join_complete().await;
         // Writes that landed on donors during the join are healed by the
         // regular AE rounds (≤ ~15 s, bounded AP staleness) — see the note
         // in marekvs-repl on why an eager per-pid AE kick was reverted.

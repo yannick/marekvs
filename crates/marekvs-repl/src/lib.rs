@@ -984,6 +984,27 @@ impl ReplEngine {
         }
     }
 
+    /// Called once the node reaches Active: the join is complete, so clear
+    /// the crash-resume marker. `join:pending` (and its in-memory resume
+    /// set) exist ONLY to finish a join interrupted mid-bootstrap; a node
+    /// that reached Active owns its data and any LATER restart is a healthy
+    /// returning member that recovers via ring resume + anti-entropy, not a
+    /// re-bootstrap. Leaving stale entries made a graceful restart
+    /// force-re-request partitions it already held — which the donor-side
+    /// stream dedup then refused, hanging the join (chaos bank scenario).
+    pub async fn mark_join_complete(&self) {
+        {
+            let mut g = self.gate.lock();
+            g.resume_pids.clear();
+            g.bootstrap_pending.clear();
+        }
+        self.store
+            .run(0, |ctx| {
+                let _ = ctx.db.delete(&ctx.meta, JOIN_PENDING_KEY);
+            })
+            .await;
+    }
+
     // NOTE: writes committed on donors between a pid's bootstrap scan and
     // this node turning Active are consumed past the donors' cursors (we
     // were not an owner yet) and are healed by the REGULAR AE rounds within
