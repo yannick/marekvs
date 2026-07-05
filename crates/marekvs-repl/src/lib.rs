@@ -665,15 +665,17 @@ impl ReplEngine {
                                 &now.to_be_bytes(),
                                 Duration::ZERO,
                             );
-                            // MUST be durable: with interval fsync, a crash
-                            // shortly after going Active destroys the only
-                            // heartbeat — the restart then measures no
-                            // downtime and SKIPS the gc_grace rejoin,
-                            // re-opening the delete-resurrection window the
-                            // rejoin exists to close. Every ≤30 s, cheap.
-                            let _ = ctx.db.sync_wal();
                         })
                         .await;
+                    // MUST be durable: with interval fsync, a crash shortly
+                    // after going Active destroys the only heartbeat — the
+                    // restart then measures no downtime and SKIPS the
+                    // gc_grace rejoin, re-opening the delete-resurrection
+                    // window. Synced OFF the shard thread: sync_wal inside
+                    // a shard closure wedged the shard (observed: total
+                    // process silence right after the first heartbeat).
+                    let db = self.store.db.clone();
+                    let _ = tokio::task::spawn_blocking(move || db.sync_wal()).await;
                 }
                 let (ops, bytes) = self.ring.occupancy();
                 m.ring_ops.set(ops as i64);
