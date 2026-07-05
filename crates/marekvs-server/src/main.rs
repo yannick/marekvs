@@ -290,8 +290,9 @@ async fn main() -> anyhow::Result<()> {
             engine.metrics.join_gate_timeouts_total.inc();
         }
         cluster.set_phase(NodePhase::Active).await;
-        // Repair the bootstrap→Active delta window in one reactive AE round.
-        repl.kick_ae_bootstrapped().await;
+        // Writes that landed on donors during the join are healed by the
+        // regular AE rounds (≤ ~15 s, bounded AP staleness) — see the note
+        // in marekvs-repl on why an eager per-pid AE kick was reverted.
     }
 
     // Graceful drain on SIGTERM: enter Leaving (gossiped; peers stop

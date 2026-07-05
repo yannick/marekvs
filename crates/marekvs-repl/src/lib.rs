@@ -907,28 +907,16 @@ impl ReplEngine {
         }
     }
 
-    /// Close the BootstrapDone→Active delta hole: entries committed on
-    /// donors while we were Joining were consumed past their cursors (we
-    /// were not an owner). One reactive AE round per bootstrapped pid
-    /// repairs the delta immediately instead of waiting for spawn_ae.
-    pub async fn kick_ae_bootstrapped(&self) {
-        let pids: Vec<Pid> = self.gate.lock().bootstrap_done.iter().copied().collect();
-        let view = self.cluster.view();
-        let n = self.cluster.replicas_n;
-        for pid in pids {
-            let others: Vec<NodeId> = view
-                .owners(pid, n)
-                .into_iter()
-                .filter(|o| *o != self.store.node_id)
-                .collect();
-            if others.is_empty() {
-                continue;
-            }
-            let peer = others[(self.pseudo_rand() % others.len() as u64) as usize];
-            let root = self.partition_root_cached(pid).await;
-            self.mesh.send_ctl(peer, PeerMsg::MerkleRoot { pid, root });
-        }
-    }
+    // NOTE: writes committed on donors between a pid's bootstrap scan and
+    // this node turning Active are consumed past the donors' cursors (we
+    // were not an owner yet) and are healed by the REGULAR AE rounds within
+    // ~15 s — bounded staleness on writes-during-join, within the AP
+    // contract. An eager "probe every bootstrapped pid at Active" kick was
+    // tried and reverted: thousands of simultaneous MerkleRoot probes force
+    // cold digest scans on the donors, whose sequential incoming pumps then
+    // starve read-through fetches into their 300 ms timeout — turning the
+    // join moment into exactly the empty-reads window the gate exists to
+    // close (chaos: join_empty_reads, 254/792 nil with the kick in place).
 
     /// gc_grace rejoin driver: resolve the sync scope once a view with
     /// Active others exists, then probe each unsynced home partition with an
