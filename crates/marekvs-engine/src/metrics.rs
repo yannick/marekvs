@@ -42,6 +42,7 @@ pub struct Metrics {
     // --- replication (repl) ---
     pub repl_batches_sent_total: IntCounter,
     pub repl_ops_sent_total: IntCounter,
+    pub repl_send_failures_total: IntCounter,
     pub repl_batches_received_total: IntCounter,
     pub repl_ops_applied_total: IntCounter,
     pub fetches_served_total: IntCounter,
@@ -184,6 +185,11 @@ impl Metrics {
                 registry,
                 "marekvs_repl_ops_sent_total",
                 "Replication ops pushed to peers"
+            ),
+            repl_send_failures_total: counter!(
+                registry,
+                "marekvs_repl_send_failures_total",
+                "Replication batches dropped because the peer's writer queue was full or the peer was absent"
             ),
             repl_batches_received_total: counter!(
                 registry,

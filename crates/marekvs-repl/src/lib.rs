@@ -411,7 +411,7 @@ impl ReplEngine {
                 .metrics
                 .repl_ops_sent_total
                 .inc_by(ops.len() as u64);
-            self.mesh.send_ctl(
+            if !self.mesh.send_ctl(
                 peer,
                 PeerMsg::Repl(ReplBatch {
                     origin: self.store.node_id,
@@ -419,7 +419,12 @@ impl ReplEngine {
                     ops,
                     implicit_sub: false,
                 }),
-            );
+            ) {
+                // Cursor already advanced: this batch is silently demoted to
+                // anti-entropy latency. Counted here as fails-before evidence
+                // for the flow-control fix that removes this branch.
+                self.engine.metrics.repl_send_failures_total.inc();
+            }
         }
     }
 
