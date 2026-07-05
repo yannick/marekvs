@@ -51,6 +51,7 @@ pub struct Metrics {
     pub fetches_issued_total: IntCounter,
     pub ae_rounds_total: IntCounter,
     pub ae_repair_ops_total: IntCounter,
+    pub ae_digest_scans_total: IntCounter,
     pub ring_ops: IntGauge,
     pub ring_bytes: IntGauge,
     pub join_gate_pending_pids: IntGauge,
@@ -246,6 +247,11 @@ impl Metrics {
                 registry,
                 "marekvs_ae_repair_ops_total",
                 "Records pushed or pulled by anti-entropy repair"
+            ),
+            ae_digest_scans_total: counter!(
+                registry,
+                "marekvs_ae_digest_scans_total",
+                "Full partition scans performed to (re)compute a Merkle root (cache misses)"
             ),
             ring_ops: gauge!(
                 registry,

@@ -264,6 +264,23 @@ fn disk_min_avail_bytes() -> u64 {
     })
 }
 
+/// Refresh even clean cached AE roots this often: ondadb's TTL backstop
+/// purges expired records/tombstones WITHOUT a commit hook, so a purely
+/// dirty-driven cache could hold a stale root forever on a quiescent pid.
+const AE_ROOT_CACHE_TTL: Duration = Duration::from_secs(600);
+
+/// Cap on owned pids probed per AE round (0 = all): bounds per-round CPU/IO
+/// on huge ownership sets; a rotating cursor still covers everything.
+fn ae_partitions_per_round() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MAREKVS_AE_PARTITIONS_PER_ROUND")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// Bootstrap stream pacing in bytes/s (design/06 defaults table: 64 MiB/s);
 /// MAREKVS_BOOTSTRAP_RATE_MB, 0 = unlimited.
 fn bootstrap_rate_bytes_per_sec() -> u64 {
@@ -378,6 +395,14 @@ pub struct ReplEngine {
     gate: Mutex<JoinGate>,
     /// gc_grace pull-only rejoin state (Tier-1 #3).
     rejoin: Mutex<RejoinState>,
+    /// AE root cache: pid → (root, computed_at). Entries are invalidated by
+    /// the commit hook's dirty set; quiescent partitions cost NO scan per
+    /// round (previously the whole keyspace was re-hashed every ~5 s —
+    /// linear I/O in data size, Tier-2 #7).
+    ae_roots: Mutex<HashMap<Pid, (u64, Instant)>>,
+    /// Pids written since their root was last computed (set by the commit
+    /// hook on every committed op, including AE repairs and rejoin drops).
+    ae_dirty: Arc<Mutex<HashSet<Pid>>>,
     started: Instant,
 }
 
@@ -418,6 +443,8 @@ impl ReplEngine {
         let ring = Ring::new_starting_at(ring_hw + RING_SEQ_RESTART_JUMP);
         ring.standalone_cfg
             .store(standalone_cfg, std::sync::atomic::Ordering::Relaxed);
+
+        let ae_dirty: Arc<Mutex<HashSet<Pid>>> = Arc::new(Mutex::new(HashSet::new()));
 
         // Bootstraps left unfinished by a previous incarnation: re-request
         // them even though their partitions are locally non-empty.
@@ -487,6 +514,8 @@ impl ReplEngine {
                 unsynced: HashSet::new(),
                 cutoff_wall_ms: alive_last,
             }),
+            ae_roots: Mutex::new(HashMap::new()),
+            ae_dirty: ae_dirty.clone(),
             started: Instant::now(),
         });
 
@@ -495,7 +524,20 @@ impl ReplEngine {
         {
             let ring = ring.clone();
             let self_node = store.node_id;
+            let ae_dirty = ae_dirty.clone();
             store.set_commit_hook(Some(Arc::new(move |seq: u64, ops: &[ondadb::CommitOp]| {
+                // AE root-cache invalidation FIRST — every committed op
+                // (client write, repair, bootstrap chunk, rejoin drop, sweep
+                // tombstone) makes its pid's cached root stale, including
+                // ops the early-returns below skip.
+                {
+                    let mut dirty = ae_dirty.lock();
+                    for op in ops {
+                        if let Some(p) = ikey::parse(&op.key) {
+                            dirty.insert(p.pid);
+                        }
+                    }
+                }
                 // Node-local maintenance writes (rejoin extras deletion)
                 // must not enter the ring.
                 if store::commit_hook_suppressed() {
@@ -883,7 +925,7 @@ impl ReplEngine {
                 continue;
             }
             let peer = others[(self.pseudo_rand() % others.len() as u64) as usize];
-            let root = ae::partition_root(&self.store, pid).await;
+            let root = self.partition_root_cached(pid).await;
             self.mesh.send_ctl(peer, PeerMsg::MerkleRoot { pid, root });
         }
     }
@@ -925,7 +967,7 @@ impl ReplEngine {
                     // sync; empty ones take the normal bootstrap gate.
                     let mut unsynced: HashSet<Pid> = HashSet::new();
                     for pid in self.cluster.future_owned_pids() {
-                        if ae::partition_root(&self.store, pid).await != 0 {
+                        if self.partition_root_cached(pid).await != 0 {
                             unsynced.insert(pid);
                         }
                     }
@@ -963,7 +1005,7 @@ impl ReplEngine {
                         continue;
                     }
                     let peer = owners[(self.pseudo_rand() % owners.len() as u64) as usize];
-                    let root = ae::partition_root(&self.store, pid).await;
+                    let root = self.partition_root_cached(pid).await;
                     if root == 0 {
                         // Drained empty (all extras dropped, nothing pulled
                         // yet counts as synced-empty for placement purposes).
@@ -1271,8 +1313,22 @@ impl ReplEngine {
                 let owned = self.cluster.owned_pids();
                 let view = self.cluster.view();
                 let n = self.cluster.replicas_n;
-                for pid in &owned {
-                    let pid = *pid;
+                // Optional per-round cap on huge ownership sets: a rotating
+                // window still covers every pid across successive rounds.
+                let cap = ae_partitions_per_round();
+                let probe: Vec<Pid> = if cap > 0 && owned.len() > cap {
+                    let start = (round as usize).wrapping_mul(cap) % owned.len();
+                    owned
+                        .iter()
+                        .cycle()
+                        .skip(start)
+                        .take(cap)
+                        .copied()
+                        .collect()
+                } else {
+                    owned.clone()
+                };
+                for pid in probe {
                     let owners = view.owners(pid, n);
                     let others: Vec<NodeId> = owners
                         .into_iter()
@@ -1282,7 +1338,7 @@ impl ReplEngine {
                         continue;
                     }
                     let peer = others[(self.pseudo_rand() % others.len() as u64) as usize];
-                    let root = ae::partition_root(&self.store, pid).await;
+                    let root = self.partition_root_cached(pid).await;
                     self.mesh.send_ctl(peer, PeerMsg::MerkleRoot { pid, root });
                 }
                 // Stranded-record AE (chaos findings): every few rounds, also
@@ -1302,7 +1358,7 @@ impl ReplEngine {
                         if owners.is_empty() {
                             continue;
                         }
-                        let root = ae::partition_root(&self.store, pid).await;
+                        let root = self.partition_root_cached(pid).await;
                         if root == 0 {
                             continue; // no local data for this pid
                         }
@@ -1316,6 +1372,28 @@ impl ReplEngine {
 
     fn gc_interest(&self) {
         self.interest.lock().gc(Instant::now());
+    }
+
+    /// Cached partition Merkle root: recompute (one partition scan) only
+    /// when the pid was written since the last compute, or the entry aged
+    /// past AE_ROOT_CACHE_TTL (ondadb's TTL purge bypasses the commit
+    /// hook). Quiescent partitions cost no I/O per AE round — previously
+    /// the full keyspace was re-hashed every ~5 s.
+    async fn partition_root_cached(&self, pid: Pid) -> u64 {
+        if !self.ae_dirty.lock().contains(&pid) {
+            if let Some((root, at)) = self.ae_roots.lock().get(&pid) {
+                if at.elapsed() < AE_ROOT_CACHE_TTL {
+                    return *root;
+                }
+            }
+        }
+        // Clear BEFORE scanning: writes landing mid-scan re-mark the pid,
+        // so an invalidation can never be lost (worst case: one extra scan).
+        self.ae_dirty.lock().remove(&pid);
+        let root = ae::partition_root(&self.store, pid).await;
+        self.ae_roots.lock().insert(pid, (root, Instant::now()));
+        self.engine.metrics.ae_digest_scans_total.inc();
+        root
     }
 
     // ------------------------------------------------------------------
@@ -1430,7 +1508,7 @@ impl ReplEngine {
                 }
             }
             PeerMsg::MerkleRoot { pid, root } => {
-                let ours = ae::partition_root(&self.store, pid).await;
+                let ours = self.partition_root_cached(pid).await;
                 if ours != root {
                     let digests = ae::bucket_digests(&self.store, pid).await;
                     self.mesh
