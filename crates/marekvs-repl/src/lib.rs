@@ -416,6 +416,7 @@ impl ReplEngine {
                 PeerMsg::Repl(ReplBatch {
                     origin: self.store.node_id,
                     first_seq,
+                    last_seq: new_cursor,
                     ops,
                     implicit_sub: false,
                 }),
@@ -531,20 +532,22 @@ impl ReplEngine {
                     .metrics
                     .repl_ops_applied_total
                     .inc_by(batch.ops.len() as u64);
-                let count = batch.ops.len() as u64;
                 for op in &batch.ops {
                     self.apply_op_from(op.clone(), Some(batch.origin)).await;
                 }
                 if batch.implicit_sub {
                     self.register_interest_ops(peer, &batch.ops);
                 }
-                self.store_applied_seq(peer, batch.first_seq + count.saturating_sub(1))
-                    .await;
+                // Ack/persist the seq the batch COVERS (incl. entries the
+                // sender filtered out for us), not first_seq + count: the
+                // sender's window drains against its cursor, and ResumeFrom
+                // must not rewind over filtered-only stretches.
+                self.store_applied_seq(peer, batch.last_seq).await;
                 self.mesh.send_ctl(
                     peer,
                     PeerMsg::AckSeq {
                         origin: self.store.node_id,
-                        seq: batch.first_seq + count - 1,
+                        seq: batch.last_seq,
                     },
                 );
             }
@@ -618,7 +621,13 @@ impl ReplEngine {
                     let digests = ae::bucket_digests(&self.store, pid).await;
                     self.mesh
                         .send_ctl(peer, PeerMsg::MerkleBuckets { pid, digests });
+                } else {
+                    self.mesh.send_ctl(peer, PeerMsg::MerkleRootMatch { pid });
                 }
+            }
+            PeerMsg::MerkleRootMatch { .. } => {
+                // Consumed by the gc_grace rejoin driver (per-pid sync
+                // confirmation); no-op otherwise.
             }
             PeerMsg::MerkleBuckets { pid, digests } => {
                 let ours = ae::bucket_digests(&self.store, pid).await;
@@ -690,7 +699,6 @@ impl ReplEngine {
             PeerMsg::BootstrapDone { pid, .. } => {
                 tracing::info!(pid, peer, "partition bootstrap complete");
             }
-            PeerMsg::HandoffAck { .. } => {}
             PeerMsg::Publish { channel, payload } => {
                 self.engine.pubsub.publish_local(&channel, &payload);
             }
