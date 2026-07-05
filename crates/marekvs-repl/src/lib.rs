@@ -30,6 +30,9 @@ pub const INTEREST_LEASE: Duration = Duration::from_secs(60);
 pub const FETCH_TIMEOUT: Duration = Duration::from_millis(300);
 pub const AE_ROUND: Duration = Duration::from_secs(5);
 const BATCH_MAX_OPS: usize = 256;
+/// Payload-byte cap per ReplBatch, comfortably under proto MAX_FRAME (8 MiB):
+/// oversized frames fail encode in the writer task and are dropped silently.
+const BATCH_MAX_BYTES: usize = 1024 * 1024;
 /// Seq-space jump applied on restart: must exceed ops accepted between two
 /// high-water persists (1s apart) with generous margin.
 const RING_SEQ_RESTART_JUMP: u64 = 1_000_000;
@@ -487,6 +490,7 @@ impl ReplEngine {
             // before this entry, retry on the next pump with a fresher view.
             let mut ops: Vec<ReplOp> = Vec::new();
             let mut new_cursor = cursor;
+            let mut batch_bytes: usize = 0;
             for e in entries {
                 let Some(p) = ikey::parse(&e.op.ikey) else {
                     new_cursor = e.seq;
@@ -519,7 +523,16 @@ impl ReplEngine {
                     }
                 }
                 if send {
+                    batch_bytes += e.op.ikey.len() + e.op.value.len();
                     ops.push(e.op);
+                    // Byte cap: a 256-op batch of large values can exceed
+                    // MAX_FRAME (8 MiB); encode then fails in the writer task
+                    // and the frame is dropped SILENTLY — a hole even the ack
+                    // window cannot see (later cumulative acks cover it).
+                    // Stop the batch here; the next pump continues after it.
+                    if batch_bytes >= BATCH_MAX_BYTES {
+                        break;
+                    }
                 }
             }
             drop(interest);
@@ -538,7 +551,6 @@ impl ReplEngine {
             }
             tracing::debug!(peer, n = ops.len(), "pump: sending ReplBatch");
             let op_count = ops.len() as u64;
-            let batch_bytes: usize = ops.iter().map(|o| o.ikey.len() + o.value.len()).sum();
             let sent_ok = self.mesh.send_ctl(
                 peer,
                 PeerMsg::Repl(ReplBatch {
