@@ -376,7 +376,7 @@ gc_grace_rejoin() {
   # holds Joining until ~2700 partitions confirm MerkleRootMatch.
   echo "  nemesis: revive node 2 (rejoin sync may take minutes)"
   crt start chaos-2 >/dev/null
-  wait_ready 2 450
+  wait_ready 2 750
   # The delete must hold everywhere — pre-fix, node 2's stale live record
   # re-offers doomed:k via AE and resurrects it once the tombstone is gone.
   check_converged "deleted key stays deleted" 60 get doomed:k

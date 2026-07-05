@@ -850,7 +850,11 @@ impl ReplEngine {
                 let skip = g.bootstrap_done.contains(&pid)
                     || awaiting_req
                     || progressing
-                    || (pipe_active && entry.is_some());
+                    || (pipe_active && entry.is_some())
+                    // Rejoin-scoped pids are being Merkle-synced by the
+                    // rejoin driver; bootstrap-streaming them too would
+                    // re-copy data the node already has.
+                    || g.rejoin_pending.contains(&pid);
                 let next_attempts = if entry.is_some() { attempts + 1 } else { 0 };
                 (skip, g.resume_pids.contains(&pid), next_attempts)
             };
@@ -861,7 +865,7 @@ impl ReplEngine {
             // sequential — flooding it with duplicates only slows the join.
             if attempts > 0 {
                 re_requests += 1;
-                if re_requests > 64 {
+                if re_requests > 256 {
                     continue;
                 }
             }
