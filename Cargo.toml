@@ -30,7 +30,7 @@ crossbeam-channel = "0.5"
 parking_lot = "0.12"
 smallvec = { version = "1", features = ["serde"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }
 chitchat = "0.9"
 anyhow = "1"
 thiserror = "2"

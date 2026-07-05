@@ -147,9 +147,14 @@ constant (rebuild to change), `manifest` = the k8s pod spec, `design` = a
 design target **not yet implemented** (the Notes column says what the code
 does instead). **Runtime** = adjustable on a live node without a restart.
 
-`CONFIG SET` is *accepted and ignored* (Redis-client compat; config is
-env-driven). The only knob changeable at runtime is the upstream master via
-the `REPLICAOF`/`SLAVEOF` command.
+`CONFIG SET` applies **three live keys** — `requirepass`, `lua-time-limit`
+(alias `busy-reply-threshold`), and `loglevel` (a Redis level *or* a raw
+tracing filter spec like `info,chitchat=debug`) — and accepts-but-ignores
+everything else (Redis-client compat; config is env-driven). The upstream
+master is changeable via the `REPLICAOF`/`SLAVEOF` command. All runtime
+changes are **ephemeral**: the env is the source of truth again after a
+restart (`CONFIG REWRITE` is a no-op — the k8s manifest is the durable
+config).
 
 | Parameter | Default | Where set | Runtime | Notes |
 |---|---|---|---|---|
@@ -190,10 +195,10 @@ the `REPLICAOF`/`SLAVEOF` command.
 | seeds | empty | env `MAREKVS_SEEDS` | no | chitchat re-resolves DNS names continuously |
 | advertise IP | 127.0.0.1 | env `MAREKVS_ADVERTISE_IP` | no | `auto` = self-detect the pod IP |
 | cluster name | `marekvs` | env `MAREKVS_CLUSTER` | no | gossip cluster isolation |
-| requirepass | off | env `MAREKVS_REQUIREPASS` | no | `CONFIG SET requirepass` is ignored like all CONFIG SET |
+| requirepass | off | env `MAREKVS_REQUIREPASS` | **yes** — `CONFIG SET requirepass` | new connections need the new password; authenticated sessions stay (Redis semantics) |
 | upstream Redis master | none | env `MAREKVS_REPLICAOF` | **yes** — `REPLICAOF`/`SLAVEOF` cmd | live-migration ingest (design/03); node stays writable |
-| script time limit | 20 ms | env `MAREKVS_SCRIPT_TIME_LIMIT_MS` | no | read per EVAL, but the process env is fixed at exec |
+| script time limit | 20 ms | env `MAREKVS_SCRIPT_TIME_LIMIT_MS` | **yes** — `CONFIG SET lua-time-limit` | alias `busy-reply-threshold`; applies from the next EVAL |
 | Lua allocator limit | 16 MiB | const (marekvs-engine) | no | per script VM |
 | blocking-list poll | 50 ms | const (marekvs-engine `POLL_MS`) | no | BLPOP/BRPOP wakeup granularity |
 | ondaDB sync_mode | Interval, 128 ms | ondadb default | no | durability window per node |
-| log level | `info` | env `RUST_LOG` | no | |
+| log level | `info,chitchat=warn` | env `RUST_LOG` | **yes** — `CONFIG SET loglevel` | Redis levels map to tracing (`debug`→trace, `verbose`→debug, `notice`→info, `warning`→warn, `nothing`→off); any other value is a raw tracing filter spec |

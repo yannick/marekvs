@@ -77,12 +77,20 @@ async fn resolve(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,chitchat=warn".into()),
-        )
-        .init();
+    // Reloadable log filter: seeded from RUST_LOG, live-adjustable via
+    // CONFIG SET loglevel (the hook is installed on the engine below).
+    let log_spec = std::env::var("RUST_LOG").unwrap_or_else(|_| "info,chitchat=warn".into());
+    let log_filter = tracing_subscriber::EnvFilter::try_new(&log_spec)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,chitchat=warn"));
+    let (log_filter, log_reload) = tracing_subscriber::reload::Layer::new(log_filter);
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        tracing_subscriber::registry()
+            .with(log_filter)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    }
 
     let node_id = node_id_from_env();
     let data_dir = env_or("MAREKVS_DATA_DIR", ".data/n0");
@@ -154,6 +162,13 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let engine = Engine::new(store.clone());
+    engine.set_log_reload(
+        log_spec,
+        Arc::new(move |spec: &str| {
+            let f = tracing_subscriber::EnvFilter::try_new(spec).map_err(|e| e.to_string())?;
+            log_reload.reload(f).map_err(|e| e.to_string())
+        }),
+    );
 
     // Cluster membership.
     let cluster = Cluster::spawn(ClusterConfig {
@@ -350,7 +365,7 @@ async fn serve_client(engine: Arc<Engine>, mut socket: TcpStream, id: u64) -> an
     socket.set_nodelay(true)?;
     let (push_tx, mut push_rx) = mpsc::unbounded_channel();
     let mut sess = Session::new(id, push_tx);
-    sess.authenticated = engine.requirepass.is_empty();
+    sess.authenticated = engine.requirepass.read().is_empty();
     let mut parser = RespParser::new();
     let mut out = ReplyBuf::new(false);
     let mut buf = vec![0u8; 64 * 1024];

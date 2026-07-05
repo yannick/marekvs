@@ -37,6 +37,10 @@ pub trait ReplicaOfCtl: Send + Sync {
     fn info(&self) -> ReplicaOfInfo;
 }
 
+/// Log-filter reload hook: applies a tracing filter spec to the live
+/// subscriber (`CONFIG SET loglevel`).
+pub type LogReloadFn = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
 /// Snapshot of upstream-replication status for `INFO replication`.
 #[derive(Default)]
 pub struct ReplicaOfInfo {
@@ -85,8 +89,20 @@ pub struct Engine {
     pub store: Arc<Store>,
     pub pubsub: Arc<PubSub>,
     pub read_through: parking_lot::RwLock<Option<Arc<dyn ReadThrough>>>,
-    /// Password for AUTH; empty = auth disabled.
-    pub requirepass: String,
+    /// Password for AUTH; empty = auth disabled. Seeded from
+    /// `MAREKVS_REQUIREPASS`, live-settable via `CONFIG SET requirepass`
+    /// (Redis semantics: already-authenticated sessions stay authenticated;
+    /// the env value is re-applied on restart).
+    pub requirepass: parking_lot::RwLock<String>,
+    /// EVAL/EVALSHA wall-clock budget in ms. Seeded from
+    /// `MAREKVS_SCRIPT_TIME_LIMIT_MS`, live-settable via
+    /// `CONFIG SET lua-time-limit` (alias `busy-reply-threshold`).
+    pub script_time_limit_ms: std::sync::atomic::AtomicU64,
+    /// Live log-filter reload hook installed by the server
+    /// (`CONFIG SET loglevel`); absent in embedded/test use.
+    pub log_reload: parking_lot::RwLock<Option<LogReloadFn>>,
+    /// Currently applied log-filter directives (`CONFIG GET loglevel`).
+    pub log_filter: parking_lot::RwLock<String>,
     pub started_at_ms: u64,
     /// INFO-visible cluster stats provider installed by the server.
     pub cluster_info: parking_lot::RwLock<Option<Arc<dyn Fn() -> String + Send + Sync>>>,
@@ -122,7 +138,17 @@ impl Engine {
             store,
             pubsub: PubSub::new(),
             read_through: parking_lot::RwLock::new(None),
-            requirepass: std::env::var("MAREKVS_REQUIREPASS").unwrap_or_default(),
+            requirepass: parking_lot::RwLock::new(
+                std::env::var("MAREKVS_REQUIREPASS").unwrap_or_default(),
+            ),
+            script_time_limit_ms: std::sync::atomic::AtomicU64::new(
+                std::env::var("MAREKVS_SCRIPT_TIME_LIMIT_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(20),
+            ),
+            log_reload: parking_lot::RwLock::new(None),
+            log_filter: parking_lot::RwLock::new(String::new()),
             started_at_ms: store::now_ms(),
             cluster_info: parking_lot::RwLock::new(None),
             replicaof: parking_lot::RwLock::new(None),
@@ -144,6 +170,13 @@ impl Engine {
 
     pub fn set_replicaof(&self, ctl: Arc<dyn ReplicaOfCtl>) {
         *self.replicaof.write() = Some(ctl);
+    }
+
+    /// Install the live log-filter reload hook (server wires this to the
+    /// tracing reload handle) and record the initially applied directives.
+    pub fn set_log_reload(&self, initial: String, f: LogReloadFn) {
+        *self.log_filter.write() = initial;
+        *self.log_reload.write() = Some(f);
     }
 
     /// Status of upstream-Redis replication for `INFO` (default when unset).

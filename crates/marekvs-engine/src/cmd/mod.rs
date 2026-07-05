@@ -40,7 +40,7 @@ pub async fn dispatch(
         "SELECT" => server::select(&args),
         "CLIENT" => server::client(sess, &args),
         "COMMAND" => server::command_cmd(&args),
-        "CONFIG" => server::config(&args),
+        "CONFIG" => server::config(engine, &args),
         "INFO" => server::info(engine, &args).await,
         "DBSIZE" => server::dbsize(engine).await,
         "FLUSHALL" | "FLUSHDB" => server::flushall(engine).await,

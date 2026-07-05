@@ -43,9 +43,11 @@ pub fn hello(
             let (Some(_user), Some(pass)) = (args.get(i + 1), args.get(i + 2)) else {
                 return Reply::syntax();
             };
-            if !engine.requirepass.is_empty() && pass != engine.requirepass.as_bytes() {
+            let rp = engine.requirepass.read();
+            if !rp.is_empty() && pass != rp.as_bytes() {
                 return Reply::err("WRONGPASS invalid username-password pair or user is disabled.");
             }
+            drop(rp);
             sess.authenticated = true;
             i += 3;
         } else if eq_ignore_case(&args[i], "SETNAME") {
@@ -57,7 +59,7 @@ pub fn hello(
             return Reply::syntax();
         }
     }
-    if !engine.requirepass.is_empty() && !sess.authenticated {
+    if !engine.requirepass.read().is_empty() && !sess.authenticated {
         return Reply::err("NOAUTH HELLO must be called with the client already authenticated");
     }
     out.resp3 = sess.resp3;
@@ -84,10 +86,11 @@ pub fn auth(engine: &Arc<Engine>, sess: &mut Session, args: &[Vec<u8>]) -> Reply
         3 => &args[2], // AUTH user pass
         _ => return Reply::wrong_args("auth"),
     };
-    if engine.requirepass.is_empty() {
+    let rp = engine.requirepass.read();
+    if rp.is_empty() {
         return Reply::err("ERR Client sent AUTH, but no password is set.");
     }
-    if pass == engine.requirepass.as_bytes() {
+    if pass == rp.as_bytes() {
         sess.authenticated = true;
         Reply::ok()
     } else {
@@ -100,7 +103,7 @@ pub fn reset(engine: &Arc<Engine>, sess: &mut Session) -> Reply {
     sess.subs.clear();
     sess.psubs.clear();
     sess.resp3 = false;
-    sess.authenticated = engine.requirepass.is_empty();
+    sess.authenticated = engine.requirepass.read().is_empty();
     Reply::Simple("RESET")
 }
 
@@ -226,33 +229,97 @@ pub fn command_cmd(args: &[Vec<u8>]) -> Reply {
     }
 }
 
-pub fn config(args: &[Vec<u8>]) -> Reply {
+/// Map a Redis loglevel to tracing directives; anything else is passed
+/// through verbatim as a tracing `EnvFilter` spec (so
+/// `CONFIG SET loglevel debug,chitchat=warn` works too).
+fn loglevel_to_filter(level: &str) -> String {
+    match level.to_ascii_lowercase().as_str() {
+        "nothing" => "off".into(),
+        "warning" => "warn".into(),
+        "notice" => "info".into(),
+        "verbose" => "debug".into(),
+        "debug" => "trace".into(),
+        other => other.into(),
+    }
+}
+
+pub fn config(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     if args.len() < 2 {
         return Reply::wrong_args("config");
     }
     let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
     match sub.as_str() {
         "GET" => {
-            // Answer common probes with sane values; unknown → empty map.
+            // Live values for the runtime-settable knobs, sane statics for
+            // common client probes; unknown → empty map.
+            let limit = engine
+                .script_time_limit_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string();
+            let known: &[(&str, String)] = &[
+                ("maxmemory", "0".into()),
+                ("maxmemory-policy", "noeviction".into()),
+                ("appendonly", "no".into()),
+                ("save", String::new()),
+                ("databases", "1".into()),
+                ("requirepass", engine.requirepass.read().clone()),
+                ("lua-time-limit", limit.clone()),
+                ("busy-reply-threshold", limit),
+                ("loglevel", engine.log_filter.read().clone()),
+            ];
             let mut pairs = Vec::new();
             for pat in &args[2..] {
                 let p = String::from_utf8_lossy(pat).to_lowercase();
-                let known: &[(&str, &str)] = &[
-                    ("maxmemory", "0"),
-                    ("maxmemory-policy", "noeviction"),
-                    ("appendonly", "no"),
-                    ("save", ""),
-                    ("databases", "1"),
-                ];
                 for (k, v) in known {
                     if crate::pubsub::glob_match(p.as_bytes(), k.as_bytes()) {
-                        pairs.push((Reply::bulk_str(*k), Reply::bulk_str(*v)));
+                        pairs.push((Reply::bulk_str(*k), Reply::bulk_str(v.clone())));
                     }
                 }
             }
             Reply::Map(pairs)
         }
-        "SET" => Reply::ok(), // accepted, ignored (env-driven config)
+        "SET" => {
+            // CONFIG SET param value [param value ...] (Redis 7 form).
+            // Known keys apply live; unknown keys are accepted and ignored
+            // (config is env-driven — this keeps redis-benchmark & friends
+            // working). Runtime changes are ephemeral: the env is the source
+            // of truth again after a restart.
+            if args.len() < 4 || args.len() % 2 != 0 {
+                return Reply::wrong_args("config|set");
+            }
+            for kv in args[2..].chunks(2) {
+                let key = String::from_utf8_lossy(&kv[0]).to_lowercase();
+                let val = String::from_utf8_lossy(&kv[1]).into_owned();
+                match key.as_str() {
+                    "requirepass" => *engine.requirepass.write() = val,
+                    "lua-time-limit" | "busy-reply-threshold" => match val.parse::<u64>() {
+                        Ok(ms) => engine
+                            .script_time_limit_ms
+                            .store(ms, std::sync::atomic::Ordering::Relaxed),
+                        Err(_) => {
+                            return Reply::err(format!(
+                                "ERR CONFIG SET failed - argument couldn't be parsed into an integer for '{key}'"
+                            ))
+                        }
+                    },
+                    "loglevel" => {
+                        let spec = loglevel_to_filter(&val);
+                        let hook = engine.log_reload.read().clone();
+                        let Some(hook) = hook else {
+                            return Reply::err(
+                                "ERR loglevel is not reloadable in this build (no tracing hook installed)",
+                            );
+                        };
+                        if let Err(e) = hook(&spec) {
+                            return Reply::err(format!("ERR CONFIG SET loglevel failed - {e}"));
+                        }
+                        *engine.log_filter.write() = spec;
+                    }
+                    _ => {} // accepted, ignored (env-driven config)
+                }
+            }
+            Reply::ok()
+        }
         "RESETSTAT" | "REWRITE" => Reply::ok(),
         _ => Reply::err(format!("ERR CONFIG subcommand '{sub}' not supported")),
     }

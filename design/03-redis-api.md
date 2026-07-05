@@ -139,14 +139,24 @@ through the pub/sub mesh. One event per logical write cluster-wide.
 |---|---|
 | PING, ECHO, HELLO, AUTH, SELECT*, TIME, DBSIZE, FLUSHDB, FLUSHALL | v1 |
 | INFO (server, clients, memory, persistence, stats, replication†, keyspace) | v1 |
-| CLIENT (ID/GETNAME/SETNAME/LIST/KILL/INFO), COMMAND (DOCS/COUNT/INFO), CONFIG GET/SET (subset), SHUTDOWN, DEBUG SLEEP/OBJECT | v1 |
+| CLIENT (ID/GETNAME/SETNAME/LIST/KILL/INFO), COMMAND (DOCS/COUNT/INFO), CONFIG GET/SET‡, SHUTDOWN, DEBUG SLEEP/OBJECT | v1 |
 | SLOWLOG, LATENCY, MEMORY USAGE/STATS | v1.1 |
 | MULTI/EXEC/DISCARD | v1.1 ✓ — per-connection queue, sequential execution; **no atomicity across keys** (queued commands are ordinary commands). WATCH → error (no CAS in AP) |
-| WAIT, FAILOVER, REPLICAOF, CLUSTER *, SCRIPT/EVAL, FUNCTION, ACL beyond AUTH | ✗ |
+| EVAL/EVALSHA, SCRIPT (LOAD/EXISTS/FLUSH) | v1.1 ✓ — sandboxed Lua, effects replication ([design/11](11-lua-scripting.md)) |
+| REPLICAOF/SLAVEOF | v1.1 ✓ — live-migration ingest from an upstream Redis master; node stays writable (AP) |
+| WAIT, FAILOVER, CLUSTER *, FUNCTION, ACL beyond AUTH | ✗ |
 
 *SELECT 0 only (single logical database; SELECT n>0 → error, like many
 Redis-compatible stores). †`INFO replication` reports marekvs cluster health:
 `cluster_degraded`, `underreplicated_partitions`, effective RF, staleness gauge.
+‡`CONFIG SET` applies three keys live — `requirepass`, `lua-time-limit`
+(alias `busy-reply-threshold`), and `loglevel` (Redis level or a raw tracing
+filter spec, e.g. `info,chitchat=debug`) — and accepts-but-ignores every
+other key (config is env-driven; see the
+[defaults table](05-consistency-anti-entropy.md#defaults-table)). Runtime
+changes are ephemeral: the env re-applies on restart, and `CONFIG REWRITE`
+is a no-op. `CONFIG GET` answers the three live keys plus common client
+probes (`maxmemory`, `appendonly`, `save`, `databases`, …).
 
 ### Not planned (module territory / conflicts with AP-on-disk)
 

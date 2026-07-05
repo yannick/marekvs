@@ -26,8 +26,9 @@
 //!
 //! ## Budgets
 //! Instruction-count debug hook enforcing a wall deadline (default 20 ms,
-//! `MAREKVS_SCRIPT_TIME_LIMIT_MS`) and a 16 MiB Lua allocator limit.
-//! Writes made before an abort stick (Redis semantics).
+//! `MAREKVS_SCRIPT_TIME_LIMIT_MS`; live-settable via `CONFIG SET
+//! lua-time-limit`) and a 16 MiB Lua allocator limit. Writes made before an
+//! abort stick (Redis semantics).
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -45,12 +46,12 @@ use mlua::{Lua, LuaOptions, LuaSerdeExt, MultiValue, StdLib, Value as LuaValue, 
 /// collide with printable user keys and is filtered from SCAN/KEYS/DBSIZE.
 pub const SCRIPT_SYS_PREFIX: &[u8] = b"\x00script:";
 
-fn time_limit() -> Duration {
-    std::env::var("MAREKVS_SCRIPT_TIME_LIMIT_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_millis(20))
+fn time_limit(engine: &Engine) -> Duration {
+    Duration::from_millis(
+        engine
+            .script_time_limit_ms
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 pub fn sha1_hex(data: &[u8]) -> String {
@@ -363,7 +364,7 @@ fn execute(engine: &Arc<Engine>, lua: &Lua, run: ScriptRun) -> Reply {
     }
 
     // Instruction-budget hook: abort when the wall deadline passes.
-    let deadline = Instant::now() + time_limit();
+    let deadline = Instant::now() + time_limit(engine);
     lua.set_hook(
         mlua::HookTriggers::new().every_nth_instruction(10_000),
         move |_lua, _debug| {
