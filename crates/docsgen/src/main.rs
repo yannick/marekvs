@@ -40,6 +40,10 @@ struct SiteMeta {
     github: String,
     #[serde(default)]
     base: String,
+    /// Custom domain for GitHub Pages. When set, an apex `CNAME` file is
+    /// emitted so Pages serves the site at this domain (at the root).
+    #[serde(default)]
+    domain: String,
 }
 
 #[derive(Deserialize)]
@@ -178,6 +182,11 @@ fn main() {
     fs::copy(theme_dir.join("site.css"), assets.join("site.css")).unwrap();
     fs::copy(theme_dir.join("site.js"), assets.join("site.js")).unwrap();
     fs::write(out.join(".nojekyll"), "").unwrap();
+    // Custom domain: emit a CNAME so GitHub Pages keeps serving at the domain
+    // across deploys (a deploy without it would clear the custom-domain setting).
+    if !nav.site.domain.is_empty() {
+        fs::write(out.join("CNAME"), format!("{}\n", nav.site.domain)).unwrap();
+    }
     fs::write(
         out.join("404.html"),
         fill(
