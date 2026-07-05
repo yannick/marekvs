@@ -372,7 +372,11 @@ gc_grace_rejoin() {
   # grace, and compaction physically purges it on the survivors.
   register_workload churn:reg 60 & local W=$!
   wait $W
-  revive 2
+  # revive's default 40 s readiness window is too tight here: the rejoiner
+  # holds Joining until ~2700 partitions confirm MerkleRootMatch.
+  echo "  nemesis: revive node 2 (rejoin sync may take minutes)"
+  crt start chaos-2 >/dev/null
+  wait_ready 2 450
   # The delete must hold everywhere — pre-fix, node 2's stale live record
   # re-offers doomed:k via AE and resurrects it once the tombstone is gone.
   check_converged "deleted key stays deleted" 60 get doomed:k
