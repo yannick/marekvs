@@ -363,6 +363,9 @@ fn apply_session() -> Session {
     drop(rx);
     let mut sess = Session::new(0, tx);
     sess.authenticated = true;
+    // Exempt from client guards (disk write-stop): refusing upstream applies
+    // would silently diverge this follower from its master.
+    sess.internal = true;
     sess
 }
 

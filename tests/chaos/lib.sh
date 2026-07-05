@@ -98,12 +98,28 @@ seeds() {
   echo "${out%,}"
 }
 
+# Extra `docker/container run` args for every node, e.g. scenario-scoped env
+# tunables: CHAOS_EXTRA_ARGS="-e MAREKVS_GC_GRACE_SECS=20". Scenarios that
+# set it must reset it (fresh_cluster keeps whatever is exported).
+CHAOS_EXTRA_ARGS=${CHAOS_EXTRA_ARGS:-}
+# "<i> <bytes>": mount a tmpfs of that size as node i's /data (docker only) —
+# the disk-full fault for the write-stop guard scenario.
+CHAOS_TMPFS=${CHAOS_TMPFS:-}
+
 node_run() { # <i> — create + start node i
   local i=$1
+  local extra=()
+  # shellcheck disable=SC2206 -- intentional word split of user-provided args
+  [ -n "$CHAOS_EXTRA_ARGS" ] && extra=($CHAOS_EXTRA_ARGS)
   if [ "$BACKEND" = docker ]; then
     local caps=()
     [ "$CHAOS_DEBUG" = 1 ] && caps=(--cap-add NET_ADMIN --cap-add SYS_TIME)
-    docker run -d --name "chaos-$i" "${caps[@]}" \
+    if [ -n "$CHAOS_TMPFS" ]; then
+      local ti tsz
+      read -r ti tsz <<<"$CHAOS_TMPFS"
+      [ "$ti" = "$i" ] && extra+=(--mount "type=tmpfs,destination=/data,tmpfs-size=$tsz")
+    fi
+    docker run -d --name "chaos-$i" "${caps[@]}" "${extra[@]}" \
       --network "$EDGE_NET" --ip "$(edge_ip "$i")" \
       -p "$(resp_port "$i"):6379" -p "$(metrics_port "$i"):9121" \
       -e MAREKVS_NODE_ID="$i" -e MAREKVS_REPLICAS_N=2 \
@@ -115,7 +131,7 @@ node_run() { # <i> — create + start node i
     local aseeds="" caps=()
     if [ "$i" != 0 ]; then aseeds="$(apple_ip chaos-0):7946"; fi
     [ "$CHAOS_DEBUG" = 1 ] && caps=(--cap-add CAP_SYS_TIME --cap-add CAP_NET_ADMIN)
-    container run -d --name "chaos-$i" "${caps[@]}" \
+    container run -d --name "chaos-$i" "${caps[@]}" "${extra[@]}" \
       -e MAREKVS_NODE_ID="$i" -e MAREKVS_REPLICAS_N=2 \
       -e MAREKVS_DATA_DIR=/data -e MAREKVS_ADVERTISE_IP=auto \
       -e MAREKVS_SEEDS="$aseeds" -e RUST_LOG=${CHAOS_LOG:-info},chitchat=warn \
@@ -274,6 +290,30 @@ grudge_heal() { # flush all grudge rules on every node
   for i in $(seq 0 $((N - 1))); do
     nexec "$i" iptables -F 2>/dev/null || true
   done
+}
+
+# ── conntrack blackhole (debug image, iptables) ──────────────────────────
+# Wedge the ESTABLISHED mesh TCP connections between two nodes without
+# closing them: drop mesh-port TCP in both directions on both nodes, but
+# leave gossip UDP (7946) untouched. Membership keeps both nodes Active
+# while their replication link is silently dead — the exact failure the
+# mesh heartbeat exists to detect (phi-accrual can't see it).
+
+blackhole() { # <a> <b>
+  require_debug "conntrack blackhole"
+  echo "  nemesis: blackhole mesh TCP between node $1 and node $2"
+  local a b
+  for pair in "$1 $2" "$2 $1"; do
+    read -r a b <<<"$pair"
+    nexec "$a" iptables -A INPUT  -p tcp -s "$(mesh_ip "$b")" --dport 7373 -j DROP 2>/dev/null || true
+    nexec "$a" iptables -A INPUT  -p tcp -s "$(mesh_ip "$b")" --sport 7373 -j DROP 2>/dev/null || true
+    nexec "$a" iptables -A OUTPUT -p tcp -d "$(mesh_ip "$b")" --dport 7373 -j DROP 2>/dev/null || true
+    nexec "$a" iptables -A OUTPUT -p tcp -d "$(mesh_ip "$b")" --sport 7373 -j DROP 2>/dev/null || true
+  done
+}
+
+blackhole_heal() { # flush on every node (same rules table as grudge)
+  grudge_heal
 }
 
 # ── tc-netem packet faults (debug image) ─────────────────────────────────
@@ -580,6 +620,11 @@ capture_logs() { # <label>
     crt logs "chaos-$i" > "$CHAOS_DIR/logs.$1.node$i" 2>&1 || true
   done
   echo "  (node logs captured to $CHAOS_DIR/logs.$1.*)"
+}
+
+# One unlabeled prometheus metric from node i ("" when absent/unreachable).
+metric_value() { # <i> <metric_name>
+  metrics "$1" | awk -v m="$2" '$1 == m {print $2; exit}'
 }
 
 # Every node's underreplicated gauge must return to 0 after faults — this

@@ -26,6 +26,21 @@ pub async fn dispatch(
     args: Vec<Vec<u8>>,
     out: &mut ReplyBuf,
 ) -> Reply {
+    // Disk high-water guard: refuse client writes cleanly instead of letting
+    // ondadb hit ENOSPC mid-compaction (which wedges the node). Sits here so
+    // it also covers the EXEC loop; internal sessions (REPLICAOF apply) are
+    // exempt — refusing merges would silently diverge a follower.
+    if !sess.internal
+        && engine
+            .write_stopped
+            .load(std::sync::atomic::Ordering::Relaxed)
+        && Engine::is_write_command(name)
+    {
+        return Reply::err(
+            "MISCONF disk usage above high-water mark; write commands are rejected \
+             until space is freed (see marekvs_disk_* metrics)",
+        );
+    }
     match name {
         // --- connection / server ---
         "PING" => server::ping(&args),

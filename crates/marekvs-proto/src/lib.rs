@@ -34,6 +34,12 @@ pub struct ReplBatch {
     pub origin: NodeId,
     /// Origin's ondaDB commit sequence of the first op (cursor resume).
     pub first_seq: u64,
+    /// Highest ring seq this batch COVERS on the sender — including entries
+    /// filtered out for this peer. The receiver acks and persists THIS value:
+    /// acking `first_seq + ops.len() - 1` would never equal the sender's
+    /// cursor under interest-filtered traffic, so flow-control windows would
+    /// never drain and ResumeFrom would rewind too far.
+    pub last_seq: u64,
     pub ops: Vec<ReplOp>,
     /// Sender wants to be registered as an interest subscriber for these
     /// keys' partitions (write-implies-subscribe).
@@ -102,6 +108,12 @@ pub enum PeerMsg {
         pid: Pid,
         root: u64,
     },
+    /// Reply to a MerkleRoot whose root EQUALS ours: the sender's copy of
+    /// `pid` is confirmed in sync. Consumed by the gc_grace rejoin driver
+    /// as its per-partition completion signal; harmless elsewhere.
+    MerkleRootMatch {
+        pid: Pid,
+    },
     MerkleBuckets {
         pid: Pid,
         digests: Vec<u64>,
@@ -127,7 +139,7 @@ pub enum PeerMsg {
         ikey_hashes: Vec<u64>,
     },
 
-    // --- bootstrap / handoff (bulk) ---
+    // --- bootstrap (bulk) ---
     BootstrapReq {
         pid: Pid,
     },
@@ -138,9 +150,6 @@ pub enum PeerMsg {
     BootstrapDone {
         pid: Pid,
         as_of_seq: u64,
-    },
-    HandoffAck {
-        pid: Pid,
     },
 
     // --- pub/sub (ctl) ---
@@ -201,6 +210,7 @@ mod tests {
         let msg = PeerMsg::Repl(ReplBatch {
             origin: 3,
             first_seq: 42,
+            last_seq: 45,
             ops: vec![ReplOp {
                 ikey: vec![1, 2, 3],
                 value: vec![9; 32],

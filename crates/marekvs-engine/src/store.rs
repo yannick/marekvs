@@ -16,9 +16,21 @@ use marekvs_core::{Hlc, NodeId};
 use ondadb::{ColumnFamily, ColumnFamilyConfig, Compression, Options, SyncMode, DB};
 
 /// Tombstone retention (design/05 `gc_grace`).
-pub const GC_GRACE: Duration = Duration::from_secs(3600);
-/// Extra slack added to ondaDB's own TTL backstop on records with a deadline.
-const ONDA_TTL_SLACK: Duration = GC_GRACE;
+/// Tombstone retention (design/05 defaults table). Env-tunable via
+/// MAREKVS_GC_GRACE_SECS — required by the gc_grace rejoin chaos scenario,
+/// which cannot wait an hour. Must be uniform across the cluster.
+pub fn gc_grace() -> Duration {
+    static V: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        Duration::from_secs(
+            std::env::var("MAREKVS_GC_GRACE_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or(3600),
+        )
+    })
+}
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -144,8 +156,34 @@ pub struct Store {
     pub meta: Arc<ColumnFamily>,
     pub hlc: Arc<Hlc>,
     pub node_id: NodeId,
+    /// Data directory, kept for filesystem usage stats (disk-full guard).
+    pub data_dir: std::path::PathBuf,
     shards: Vec<Sender<Job>>,
     shard_handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+/// (total_bytes, available_bytes) of the filesystem holding `path`, via
+/// statvfs. `None` on failure or non-unix. Available = f_bavail (space left
+/// for unprivileged writers — the number that matters before ENOSPC).
+#[cfg(unix)]
+pub fn fs_usage(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    let frsize = if st.f_frsize > 0 {
+        st.f_frsize as u64
+    } else {
+        st.f_bsize as u64
+    };
+    Some((st.f_blocks as u64 * frsize, st.f_bavail as u64 * frsize))
+}
+
+#[cfg(not(unix))]
+pub fn fs_usage(_path: &std::path::Path) -> Option<(u64, u64)> {
+    None
 }
 
 impl Drop for Store {
@@ -208,6 +246,7 @@ impl Store {
             meta,
             hlc,
             node_id: cfg.node_id,
+            data_dir: std::path::PathBuf::from(&cfg.data_dir),
             shards,
             shard_handles,
         }))
@@ -403,6 +442,32 @@ impl Drop for ApplyOriginGuard {
     }
 }
 
+thread_local! {
+    /// True while this shard thread performs node-local maintenance writes
+    /// that must NOT enter the replication ring (gc_grace rejoin extras
+    /// deletion — feeding those del_raws into the ring would replicate a
+    /// local cleanup as if it were data).
+    static SUPPRESS_COMMIT_HOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Suppress the commit hook for writes on this shard thread until the guard
+/// drops (mirror of `set_apply_origin`).
+pub fn suppress_commit_hook() -> SuppressHookGuard {
+    SUPPRESS_COMMIT_HOOK.with(|c| c.set(true));
+    SuppressHookGuard
+}
+
+pub fn commit_hook_suppressed() -> bool {
+    SUPPRESS_COMMIT_HOOK.with(|c| c.get())
+}
+
+pub struct SuppressHookGuard;
+impl Drop for SuppressHookGuard {
+    fn drop(&mut self) {
+        SUPPRESS_COMMIT_HOOK.with(|c| c.set(false));
+    }
+}
+
 /// Raw point read; NotFound → None.
 pub fn get_raw(ctx: &ShardCtx, ikey: &[u8]) -> Option<Vec<u8>> {
     match ctx.db.get(&ctx.data, ikey) {
@@ -435,11 +500,11 @@ pub fn del_raw(ctx: &ShardCtx, ikey: &[u8]) {
 
 fn onda_ttl_for(value: &[u8]) -> Duration {
     match Envelope::decode(value) {
-        Some((env, _)) if env.is_tombstone() => GC_GRACE,
+        Some((env, _)) if env.is_tombstone() => gc_grace(),
         Some((env, _)) if env.ttl_deadline_ms != 0 => {
             let now = now_ms();
             let remain = env.ttl_deadline_ms.saturating_sub(now);
-            Duration::from_millis(remain) + ONDA_TTL_SLACK
+            Duration::from_millis(remain) + gc_grace()
         }
         _ => Duration::ZERO,
     }

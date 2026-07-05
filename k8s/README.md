@@ -159,9 +159,12 @@ kubectl scale statefulset marekvs --replicas=5
 ```
 
 New ordinals boot in the Joining phase, discover the cluster via gossip,
-and flip to Active. HRW placement shifts a proportional slice of the
-partitions (~`4096/n` each) onto the newcomers, sourced evenly from the
-existing nodes; anti-entropy fills them in the background. Nothing needs to
+bootstrap every partition they will own (the join gate — `/ready` stays 503
+and the pod is invisible to placement until the pull completes; progress is
+visible as `marekvs_join_gate_pending_pids` on `/metrics`), and only then
+flip to Active. HRW placement shifts a proportional slice of the partitions
+(~`4096/n` each) onto the newcomers, sourced evenly from the existing
+nodes; anti-entropy heals any writes that raced the join. Nothing needs to
 be quiesced — writes continue throughout, and the readiness probe keeps a
 joining pod out of the client service until it can serve.
 

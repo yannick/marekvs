@@ -136,9 +136,11 @@ Test pointers refer to [10-testing.md](10-testing.md).
    a newer add. Believed acceptable for Redis set semantics. → merge-law
    property tests (§10.1).
 4. **Connection-scoped leases as the interest staleness bound** assume
-   application heartbeats detect peer death within 3 s. A wedged-but-open
-   connection (conntrack blackhole) can serve stale up to the 60 s lease timer.
-   Documented as the pathological worst case. → chaos test (§10.4).
+   application heartbeats detect peer death within 3 s. The mesh heartbeat is
+   now implemented (ping every 1 s, close after 3 s without inbound bytes),
+   so even a wedged-but-open connection (conntrack blackhole) is detected in
+   ~3 s; the 60 s lease timer remains the absolute backstop. → chaos test
+   `blackhole_conn` (§10.3) + k8s chaos (§10.4).
 5. **HRW balances load only for uniform key traffic.** A single mega-hot key
    still lands on one H1 for interest fan-out; escalation helps readers, not
    the writer. Acceptable v1; per-key H1 offload is future work.

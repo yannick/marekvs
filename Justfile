@@ -239,7 +239,7 @@ chaos-debug: debug-build
     #!/usr/bin/env bash
     set -euo pipefail
     trap 'CHAOS_DEBUG=1 BACKEND=docker bash -c "source tests/chaos/lib.sh; cluster_down"' EXIT
-    CHAOS_DEBUG=1 BACKEND=docker ./tests/chaos/chaos_test.sh bridge_partition majority_ring slow_peer lossy_writes
+    CHAOS_DEBUG=1 BACKEND=docker ./tests/chaos/chaos_test.sh bridge_partition majority_ring slow_peer lossy_writes blackhole_conn backpressure_no_drop
     printf '{{bold}}{{green}}✓ debug fault suite passed{{reset}}\n'
 
 # clock-fault suite on apple containers (per-VM clocks): bump + strobe

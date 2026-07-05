@@ -139,8 +139,11 @@ read/delete (reclaim). No secrets, no exec, no node access.
 ## Future work
 
 - Leader election → HA operator deployment.
-- Disk-fill as a second autoscale signal (needs a data-size gauge in the
-  server metrics first).
+- Disk-fill as a second autoscale signal — the server side now exists
+  (`marekvs_db_total_bytes`, `marekvs_disk_total_bytes`/`_avail_bytes`,
+  `marekvs_disk_write_stopped`, plus the MISCONF write-stop at the
+  `MAREKVS_DISK_HIGH_WATER_PCT` watermark); remaining work is the
+  controller consuming it.
 - Version rollouts gated on cluster health (today: plain StatefulSet
   rolling update when `spec.image` changes — already drain-safe via
   preStop, but not health-gated between pods).

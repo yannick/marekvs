@@ -266,11 +266,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Join sequence (design/06, simplified v1): give gossip a moment to find
-    // peers; bootstrap requests fire from the view watcher; then go Active.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    cluster.set_phase(NodePhase::Active).await;
-
     // Graceful drain on SIGTERM: enter Leaving (gossiped; peers stop
     // targeting us), then hold until the replication ring is fully shipped —
     // exiting with unshipped entries strands acked writes on this node only
@@ -301,8 +296,10 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Probes + Prometheus metrics (design/07): started BEFORE the RESP
-    // listener so kubelet can watch readiness during long bootstraps.
+    // Probes + Prometheus metrics (design/07): started BEFORE the join gate
+    // and the RESP listener — /ready and /metrics (join_gate_pending_pids)
+    // must be observable WHILE a long bootstrap holds the node Joining, or
+    // kubelet and operators watch a black box.
     {
         let http_listener = TcpListener::bind(metrics_addr).await?;
         tracing::info!(%metrics_addr, "probes + metrics listening");
@@ -313,6 +310,39 @@ async fn main() -> anyhow::Result<()> {
                 tracing::error!(?e, "http probe server exited");
             }
         });
+    }
+
+    // Join sequence (design/06): give gossip a moment to find peers, then
+    // hold phase Joining — invisible to HRW, /ready 503 — until every
+    // future-owned partition is bootstrapped (or the cluster is confirmed
+    // cold/empty). The old fixed 2 s sleep let a scale-up node go Active
+    // with an empty store: HRW immediately routed ~1/n of partitions to it
+    // and its reads AND other nodes' read-throughs served nils until AE.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    if standalone_cfg {
+        cluster.set_phase(NodePhase::Active).await;
+        repl.mark_join_complete().await;
+    } else {
+        // 0 = wait forever (default): a node that cannot finish bootstrap
+        // must stay unready rather than serve empty reads. The env is an
+        // operator escape hatch, not a normal path.
+        let timeout_secs: u64 = env_or("MAREKVS_JOIN_TIMEOUT_SECS", "0").parse()?;
+        let timeout = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
+        if !repl.wait_join_ready(timeout).await {
+            tracing::error!(
+                timeout_secs,
+                "JOIN GATE TIMEOUT: going Active with incomplete bootstrap — \
+                 reads may be empty/stale until anti-entropy converges"
+            );
+            engine.metrics.join_gate_timeouts_total.inc();
+        }
+        cluster.set_phase(NodePhase::Active).await;
+        // Join complete: clear the crash-resume marker so a later healthy
+        // restart recovers via ring resume + AE, not a re-bootstrap.
+        repl.mark_join_complete().await;
+        // Writes that landed on donors during the join are healed by the
+        // regular AE rounds (≤ ~15 s, bounded AP staleness) — see the note
+        // in marekvs-repl on why an eager per-pid AE kick was reverted.
     }
 
     // RESP frontend — only after Active (readiness = port open).

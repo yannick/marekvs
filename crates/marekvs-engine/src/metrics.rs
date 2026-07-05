@@ -37,24 +37,43 @@ pub struct Metrics {
     pub mesh_input_bytes_total: IntCounter,
     pub mesh_output_bytes_total: IntCounter,
     pub mesh_peers: IntGauge,
+    pub mesh_conn_timeouts_total: IntCounter,
 
     // --- replication (repl) ---
     pub repl_batches_sent_total: IntCounter,
     pub repl_ops_sent_total: IntCounter,
+    pub repl_send_failures_total: IntCounter,
+    pub repl_window_stalls_total: IntCounter,
+    pub repl_inflight_bytes: IntGauge,
     pub repl_batches_received_total: IntCounter,
     pub repl_ops_applied_total: IntCounter,
     pub fetches_served_total: IntCounter,
     pub fetches_issued_total: IntCounter,
     pub ae_rounds_total: IntCounter,
     pub ae_repair_ops_total: IntCounter,
+    pub ae_digest_scans_total: IntCounter,
     pub ring_ops: IntGauge,
     pub ring_bytes: IntGauge,
+    pub join_gate_pending_pids: IntGauge,
+    pub bootstrap_bytes_sent_total: IntCounter,
+    pub rejoin_active: IntGauge,
+    pub rejoin_dropped_records_total: IntCounter,
+    pub interest_entries: IntGauge,
+    pub interest_rejected_total: IntCounter,
+    pub bootstraps_completed_total: IntCounter,
+    pub join_gate_timeouts_total: IntCounter,
 
     // --- cluster (repl stats task) ---
     pub cluster_members: IntGauge,
     pub cluster_underreplicated_partitions: IntGauge,
     pub cluster_effective_rf_min: IntGauge,
     pub cluster_owned_partitions: IntGauge,
+
+    // --- disk (repl stats task; also the operator disk-autoscale signal) ---
+    pub disk_total_bytes: IntGauge,
+    pub disk_avail_bytes: IntGauge,
+    pub db_total_bytes: IntGauge,
+    pub disk_write_stopped: IntGauge,
 
     // --- process ---
     pub uptime_seconds: IntGauge,
@@ -168,6 +187,11 @@ impl Metrics {
                 "marekvs_mesh_peers",
                 "Peer nodes with at least one live mesh connection"
             ),
+            mesh_conn_timeouts_total: counter!(
+                registry,
+                "marekvs_mesh_conn_timeouts_total",
+                "Mesh connections closed by heartbeat idle timeout"
+            ),
 
             repl_batches_sent_total: counter!(
                 registry,
@@ -178,6 +202,21 @@ impl Metrics {
                 registry,
                 "marekvs_repl_ops_sent_total",
                 "Replication ops pushed to peers"
+            ),
+            repl_send_failures_total: counter!(
+                registry,
+                "marekvs_repl_send_failures_total",
+                "Replication batches dropped because the peer's writer queue was full or the peer was absent"
+            ),
+            repl_window_stalls_total: counter!(
+                registry,
+                "marekvs_repl_window_stalls_total",
+                "Pump passes that skipped a peer because its unacked replication window was full"
+            ),
+            repl_inflight_bytes: gauge!(
+                registry,
+                "marekvs_repl_inflight_bytes",
+                "Largest per-peer unacked replication window (bytes)"
             ),
             repl_batches_received_total: counter!(
                 registry,
@@ -209,6 +248,11 @@ impl Metrics {
                 "marekvs_ae_repair_ops_total",
                 "Records pushed or pulled by anti-entropy repair"
             ),
+            ae_digest_scans_total: counter!(
+                registry,
+                "marekvs_ae_digest_scans_total",
+                "Full partition scans performed to (re)compute a Merkle root (cache misses)"
+            ),
             ring_ops: gauge!(
                 registry,
                 "marekvs_ring_ops",
@@ -220,6 +264,46 @@ impl Metrics {
                 "Replication ring occupancy (bytes)"
             ),
 
+            bootstrap_bytes_sent_total: counter!(
+                registry,
+                "marekvs_bootstrap_bytes_sent_total",
+                "Payload bytes streamed to joining peers (rate-paced)"
+            ),
+            rejoin_active: gauge!(
+                registry,
+                "marekvs_rejoin_active",
+                "1 while the gc_grace pull-only rejoin is syncing home partitions"
+            ),
+            rejoin_dropped_records_total: counter!(
+                registry,
+                "marekvs_rejoin_dropped_records_total",
+                "Stale extra records shed during a gc_grace rejoin instead of being served"
+            ),
+            interest_entries: gauge!(
+                registry,
+                "marekvs_interest_entries",
+                "Live (partition, key, subscriber) interest leases held for peers"
+            ),
+            interest_rejected_total: counter!(
+                registry,
+                "marekvs_interest_rejected_total",
+                "Interest registrations rejected at MAREKVS_INTEREST_MAX_ENTRIES"
+            ),
+            join_gate_pending_pids: gauge!(
+                registry,
+                "marekvs_join_gate_pending_pids",
+                "Partitions still holding the join gate (bootstrap or rejoin pending)"
+            ),
+            bootstraps_completed_total: counter!(
+                registry,
+                "marekvs_bootstraps_completed_total",
+                "Partition bootstrap streams completed (BootstrapDone received)"
+            ),
+            join_gate_timeouts_total: counter!(
+                registry,
+                "marekvs_join_gate_timeouts_total",
+                "Times the join gate was overridden by MAREKVS_JOIN_TIMEOUT_SECS"
+            ),
             cluster_members: gauge!(
                 registry,
                 "marekvs_cluster_members",
@@ -239,6 +323,27 @@ impl Metrics {
                 registry,
                 "marekvs_cluster_owned_partitions",
                 "Partitions this node homes"
+            ),
+
+            disk_total_bytes: gauge!(
+                registry,
+                "marekvs_disk_total_bytes",
+                "Size of the filesystem holding the data directory"
+            ),
+            disk_avail_bytes: gauge!(
+                registry,
+                "marekvs_disk_avail_bytes",
+                "Available bytes on the filesystem holding the data directory"
+            ),
+            db_total_bytes: gauge!(
+                registry,
+                "marekvs_db_total_bytes",
+                "On-disk SSTable bytes reported by the storage engine"
+            ),
+            disk_write_stopped: gauge!(
+                registry,
+                "marekvs_disk_write_stopped",
+                "1 while client write commands are refused (disk above high-water)"
             ),
 
             uptime_seconds: gauge!(registry, "marekvs_uptime_seconds", "Process uptime"),

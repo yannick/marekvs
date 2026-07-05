@@ -89,9 +89,11 @@ their origin — each one closes a hole the chaos suite actually caught:
    (unshipped ring entries die with the process) and by ownership moves —
    which owners-only Merkle AE can never repair, because the owners AGREE
    with each other and the gauge reads 0.
-3. **Backlog-aware drain.** SIGTERM waits (bounded) for all peer cursors
-   to reach the ring head before exiting, instead of a fixed grace sleep —
-   the last-moment ack window otherwise leaves with the process.
+3. **Backlog-aware drain.** SIGTERM waits (bounded) for every peer's
+   **acked** seq — shipped *and* acknowledged, not merely queued on a
+   socket — to reach the ring head before exiting, instead of a fixed
+   grace sleep. The last-moment ack window otherwise leaves with the
+   process.
 4. **Commit-context attribution, not envelope origin.** Each ring entry's
    origin (used by the fan-out rule to suppress echo) is the origin of the
    *batch being applied on the shard thread* — a thread-local set around
@@ -120,7 +122,10 @@ Postcard-encoded after the frame header ([framing](#transport)):
 struct ReplBatch {
     origin: NodeId,        // u16
     first_seq: u64,        // origin's ondaDB seq of first op (cursor resume)
-    ops: Vec<ReplOp>,      // ≤256 ops / ≤256 KiB / 2 ms linger, whichever first
+    last_seq: u64,         // highest ring seq this batch COVERS on the sender,
+                           // including entries filtered out for this peer —
+                           // this is the value the receiver acks and persists
+    ops: Vec<ReplOp>,      // ≤256 ops / ≤1 MiB payload, whichever first
 }
 struct ReplOp {
     ikey: Bytes,           // full internal key (pid + tag + userkey [+ elem])
@@ -138,9 +143,17 @@ tombstone.
 - One bounded ring per process: **128 MiB or 262,144 ops**, whichever first.
   Shard threads write (one producer segment per shard, sequenced by ondaDB
   seq); per-peer sender tasks hold read cursors.
-- Receiver acks `ReplBatch` with `AckSeq{origin, seq}`; acks advance the
-  sender's persisted cursor floor — they never gate client acks.
-  Per-peer unacked window: **4 MiB** (sender pauses that peer past it).
+- Receiver acks `ReplBatch` with `AckSeq{origin, seq = last_seq}`.
+  `last_seq` is the highest ring seq the batch *covers* on the sender —
+  including entries filtered out for that peer; acking an op count would
+  never match the sender's cursor under interest-filtered traffic, so
+  windows would never drain and `ResumeFrom` would rewind too far. Acks
+  drain the per-peer unacked window — **4 MiB**
+  (`MAREKVS_REPL_WINDOW_BYTES`) — and never gate client acks. A full window
+  stalls **only that peer's lane** (skipped pump passes counted by
+  `marekvs_repl_window_stalls_total`, warn log after 5 s); the cursor
+  advances only on successful send, and the ring is the retransmit buffer —
+  no separate resend queue.
 - **Slow/dead peer:** when a peer's cursor falls off the ring tail, the
   sender (a) drops the cursor, (b) marks every partition shared with that peer
   **dirty-pair(peer, pid)**, (c) stops streaming to it. Recovery: the peer
@@ -171,9 +184,14 @@ uninterested nodes, and blooms can't expire entries. Metadata is bounded by:
 - **Escalation**: one subscriber holding > `interest_escalate = 4096`
   key-leases in a partition is converted to a partition-level subscription
   (it becomes a shadow replica fed every op for that pid); per-key entries drop.
-- **Global cap** `interest_max_entries = 1,000,000` (~120 MB), LRU-evicted.
-  Eviction is safe: the subscriber's own lease timer expires independently, so
-  it revalidates at most one lease period late.
+- **Global cap** `interest_max_entries = 1,000,000` (~120 MB,
+  `MAREKVS_INTEREST_MAX_ENTRIES`) — a hard cap, since a client scanning
+  unique keys through non-home nodes can otherwise inflate the map without
+  limit (an OOM you can cause from redis-cli). Policy at cap: **reject** new
+  registrations, always allow refreshing an existing leaf. Rejection is safe
+  in the AP model: the subscriber's own lease timer expires independently,
+  so a rejected registration degrades to worst-case-lease (60 s) staleness.
+  Gauges: `marekvs_interest_entries`, `marekvs_interest_rejected_total`.
 
 **Lifecycle:**
 
@@ -238,23 +256,44 @@ Cluster size (3–50) → **filtered full-mesh fan-out**, no broadcast tree
   - `bulk` — bootstrap chunks and Merkle exchanges (lz4-compressed frames).
     Separating bulk removes head-of-line blocking without multiplexing
     machinery.
-- **Framing**: `[len: u32 LE][msg_type: u8][flags: u8][body…]`, max frame
-  8 MiB.
+- **Heartbeat**: every connection (ctl *and* bulk) pings its peer each
+  `MAREKVS_MESH_PING_INTERVAL_MS` (1 s) and is closed after
+  `MAREKVS_MESH_IDLE_TIMEOUT_MS` (3 s) without inbound bytes; Ping/Pong is
+  answered in the mesh reader on the same connection. TCP alone cannot
+  detect a wedged-but-open connection (conntrack blackhole), and gossip
+  phi-accrual detects dead *nodes*, not dead *connections*. Idle closes are
+  counted (`marekvs_mesh_conn_timeouts_total`), and a disconnect removes the
+  peer's registry entry — `connected_peers` is truthful.
+- **Incoming lanes**: received frames are demuxed onto two channels — a
+  latency lane (Repl/Ack/Fetch/Check/Interest/Publish) and a heavy lane for
+  all AE + bootstrap messages, so digest scans and partition streams never
+  head-of-line-block read-through fetches.
+- **Framing**: `[len: u32 LE][postcard body]`, max frame 8 MiB. The body is
+  a single `PeerMsg` enum; postcard's varint discriminant replaces the
+  manual msg-type byte (one enum = one registry, still compact).
 - **Codec**: postcard (serde) for message bodies — compact varints, evolvable
   via `#[serde(default)]`. Exception: `ReplOp.env_and_payload` and fetch
   payloads are raw bytes copied verbatim from/to ondaDB values — zero
   re-encode on the hot path. (rkyv rejected: schema-evolution pain; bincode:
   larger wire size.)
 
-**Message registry (u8):**
+**Message registry (`PeerMsg` variants, in wire order):**
 
 ```
-01 ReplBatch   02 AckSeq        03 Fetch          04 FetchResp
-05 FetchCollection  06 Check    07 CheckResp      08 InterestRenew
-09 MerkleRoot  0A MerkleBuckets 0B BucketKeys     0C BootstrapReq
-0D BootstrapChunk   0E BootstrapDone  0F HandoffAck  10 Publish
-11 Ping/Pong   12 ResumeFrom
+Hello          ReplBatch        AckSeq            ResumeFrom
+Fetch          FetchResp        FetchCollection   FetchCollectionResp
+Check          CheckResp        InterestRenew     MerkleRoot
+MerkleRootMatch  MerkleBuckets  BucketKeys        RepairOps
+RequestKeys    BootstrapReq     BootstrapChunk    BootstrapDone
+Publish        Ping             Pong
 ```
+
+`HandoffAck` is **removed** — planned-leave completion is drain-based
+([06](06-cluster-membership.md)). `ReplBatch.last_seq` and
+`MerkleRootMatch{pid}` (the gc_grace-rejoin per-partition completion signal)
+were added in the same change. Postcard discriminants are positional, so any
+registry change is a **wire break: whole-cluster upgrade required, no
+mixed-version mesh.**
 
 All tunables referenced here are collected in the
 [defaults table](05-consistency-anti-entropy.md#defaults-table).

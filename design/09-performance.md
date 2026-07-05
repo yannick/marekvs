@@ -37,13 +37,18 @@ Verified per release by the benchmark plan below; regressions >10 % fail CI.
 ### Replication
 
 - Commit hook does **one ring append** (per-shard producer segment, no CAS
-  contention); sender tasks batch (256 ops / 256 KiB / 2 ms) and write
-  postcard frames with the envelope+payload bytes **verbatim** — zero
-  re-serialization.
+  contention); sender tasks batch (256 ops / 1 MiB, pumped on notify or a
+  50 ms tick) and write postcard frames with the envelope+payload bytes
+  **verbatim** — zero re-serialization.
 - Apply path groups a `ReplBatch` into one ondaDB `Txn` per shard —
   group-commit WAL amortizes fsync.
-- Merkle bucket scans run on shard threads at AE pace (≤ 512 partitions /
-  5 s), bounded by dirty-marking to buckets that actually changed.
+- Merkle roots are cached per partition and rescanned only when the commit
+  hook dirtied the pid (or on a 10-min TTL — ondaDB's TTL purge bypasses
+  the hook); quiescent partitions cost no scan per round, and
+  `MAREKVS_AE_PARTITIONS_PER_ROUND` caps probes per round if set. Scans run
+  on shard threads at AE pace, dirty-marked down to the buckets that
+  actually changed. AE/bootstrap frames ride a dedicated incoming lane so
+  digest scans never head-of-line-block read-through fetches.
 
 ### ondaDB tuning (per CF config)
 

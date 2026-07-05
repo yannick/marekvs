@@ -35,10 +35,21 @@ recomputed lazily by prefix scan at sync time on the shard thread. Scan cost is
 bounded (a bucket is ~1/256 of a partition ≈ 1/1M of the keyspace) and avoids
 needing old values inside the hook.
 
+Per-partition **roots are cached**: a root is rescanned only when the commit
+hook has dirtied the pid since the last scan, or after a 10-min TTL (ondaDB's
+TTL backstop purges expired records *without* a commit hook, so a purely
+dirty-driven cache could hold a stale root forever on a quiescent pid).
+Quiescent partitions therefore cost no scan per round;
+`marekvs_ae_digest_scans_total` counts real scans. An empty partition's root
+is the documented `0` sentinel (it was previously a nonzero xxh3-of-zeros
+constant, so the stranded-AE "no local data" skip never fired).
+
 ### Round protocol
 
 Every `ae_round = 5 s` (±20 % jitter), each node walks its owned partitions in
-rotation, ≤ `ae_partitions_per_round = 512` per round:
+rotation, ≤ `ae_partitions_per_round` per round
+(`MAREKVS_AE_PARTITIONS_PER_ROUND`, default 0 = all owned; a cap rotates a
+per-round probe cursor):
 
 ```
 for each owned pid this round:
@@ -71,9 +82,13 @@ worst case... but owned pids shrink with cluster size (≈ 4096×3/n). We size t
 published bound for the worst supported small cluster:
 
 - **n ≥ 24**: all owned pids fit in one round → bound ≈ `2 × ae_round + 1 s ≈ 11 s`.
-- **n = 3** (floor): 4096 owned pids → 8 rounds → 40 s. Unacceptable; therefore
-  `ae_partitions_per_round` **auto-scales**: `max(512, ceil(owned_pids / 2))`,
-  restoring ≤ 2 rounds for any cluster size.
+- **n = 3** (floor): 4096 owned pids → 8 rounds → 40 s at a 512 cap.
+  Unacceptable; as implemented the default (cap = 0) probes **all** owned pids
+  every round, so the ≤ 2-round bound holds trivially at any cluster size —
+  cached roots keep the per-round cost proportional to *dirty* partitions, not
+  owned partitions. Setting `MAREKVS_AE_PARTITIONS_PER_ROUND` trades rotation
+  delay for a hard per-round ceiling
+  (`rotation ≤ ae_round × ceil(owned_pids / cap)`).
 
 **Published bound: 15 s worst case** (2 rounds + exchange + margin);
 **typical: replication push latency, single-digit milliseconds.** The single
@@ -81,7 +96,10 @@ knob to tighten it is `ae_round`; cost scales linearly.
 
 Interest replicas: ≤ home bound + push latency while connected; after a
 disconnect, ≤ 3 s heartbeat detection + revalidation on next read. The
-pathological ceiling (wedged-open connection) is the 60 s lease timer
+formerly pathological wedged-open connection is now closed by the mesh
+heartbeat (ping every 1 s, close after 3 s without inbound bytes —
+`MAREKVS_MESH_PING_INTERVAL_MS` / `MAREKVS_MESH_IDLE_TIMEOUT_MS`), bounding
+detection at ~3 s; the 60 s lease timer remains the absolute backstop
 (risky assumption 4, [00-overview.md](00-overview.md)).
 
 ## Tombstone lifecycle & GC safe point
@@ -89,18 +107,29 @@ pathological ceiling (wedged-open connection) is the 60 s lease timer
 Deletes are never raw storage deletes at write time — a delete is an envelope
 with the tombstone flag (and, for element removes, observed dots). GC:
 
-- Every tombstone carries **ondaDB per-key TTL = `gc_grace` = 1 h** → the
+- Every tombstone carries **ondaDB per-key TTL = `gc_grace` = 1 h**
+  (`MAREKVS_GC_GRACE_SECS`, must be uniform cluster-wide) → the
   storage engine purges it automatically at the safe point; no sweep needed.
 - **Safety invariant**: a replica partitioned/down longer than `gc_grace` may
   hold data whose covering tombstone was already purged elsewhere; merging it
-  back would resurrect deletes. Enforcement on rejoin: if
-  `now − last_alive > gc_grace` (last_alive persisted in `meta` and observed
-  via gossip), the node's home partitions become **pull-only**: it
-  participates in AE receiving repairs but never pushes, until each partition
-  completes a full Merkle sync against a current home (its local data serves
-  as a warm base — the diff is pulled, not re-streamed). Only then does it
+  back would resurrect deletes. Enforcement on rejoin (implemented): an
+  `alive:last` heartbeat is written to `meta` every `min(gc_grace/4, 30 s)`
+  while Active/Leaving; a node whose downtime exceeds `gc_grace` stays
+  **Joining** (held by the join gate) and Merkle-syncs each data-bearing home
+  partition against its **pre-outage co-owner** — placement computed with
+  itself included — never a current-view owner, which after a long outage can
+  be an empty crash-era owner whose want-set would destroy valid data. Stale
+  extras (records only the rejoiner holds, HLC before its death) are
+  **dropped** when the co-owner's `RequestKeys` enumerates them
+  (commit-hook-suppressed delete, so the drops don't replicate) instead of
+  served; every other requester is refused without deletion while rejoining,
+  and outbound stranded-AE is suppressed. A sole survivor (no Active peers
+  anywhere) stands down and serves — there is no one to sync against.
+  `MerkleRootMatch{pid}` confirms each partition; its local data serves as a
+  warm base — the diff is pulled, not re-streamed. Only then does the node
   regain push eligibility. *Pull-only-until-synced is the precise rule that
-  prevents resurrection.*
+  prevents resurrection.* Metrics: `marekvs_rejoin_active`,
+  `marekvs_rejoin_dropped_records_total`.
 - Interest replicas cannot resurrect by construction: they never push AE, and
   lease-gated reads revalidate against homes.
 
@@ -165,28 +194,33 @@ config).
 | failure detection | ~5 s | chitchat defaults | no | phi-accrual |
 | gossip dead-node grace | 1 h | const (marekvs-cluster) | no | chitchat `marked_for_deletion_grace_period` |
 | ae_round | 5 s + 0–2 s jitter | const (marekvs-repl `AE_ROUND`) | no | jitter is uniform 0–2 s, not ±20 % |
-| ae_partitions_per_round | all owned pids | design | — | per-round cap (max(512, owned/2)) unimplemented; every round walks all owned pids, so the ≤ 2-round rotation bound holds trivially |
-| stranded-record AE | every 3rd round | const (marekvs-repl) | no | push-only roots for non-owned pids with local data (chaos finding, design/10) |
+| ae_partitions_per_round | 0 = all owned pids | env `MAREKVS_AE_PARTITIONS_PER_ROUND` | no | default walks all owned pids (≤ 2-round rotation bound holds trivially); a cap rotates a per-round probe cursor |
+| ae root cache TTL | 10 m | const (marekvs-repl `AE_ROOT_CACHE_TTL`) | no | roots rescanned only when the commit hook dirtied the pid or on TTL (ondaDB TTL purge bypasses the hook); `marekvs_ae_digest_scans_total` counts real scans |
+| stranded-record AE | every 3rd round | const (marekvs-repl) | no | push-only roots for non-owned pids with local data (chaos finding, design/10); suppressed during a gc_grace rejoin |
 | **published staleness bound** | **15 s worst / ms typical** | derived | — | derivation above |
 | merkle buckets / partition | 256 | const (marekvs-repl `BUCKETS`) | no | content-aware digests: (ikey, hlc, value_hash) |
 | interest_lease | 60 s | const (marekvs-repl `INTEREST_LEASE`) | no | connection-scoped |
 | interest renew interval | — | design (15 s) | — | `InterestRenew` msg exists and is handled but never sent; leases refresh by re-fetch on expiry |
 | read-through fetch timeout | 300 ms | const (marekvs-repl `FETCH_TIMEOUT`) | no | miss → serve local/empty, AE reconciles |
-| peer heartbeat / timeout | — | design (1 s / 3 s) | — | not implemented; peer liveness = TCP disconnect + gossip failure detection |
+| peer heartbeat / timeout | 1 s / 3 s | env `MAREKVS_MESH_PING_INTERVAL_MS` / `MAREKVS_MESH_IDLE_TIMEOUT_MS` | no | every ctl+bulk connection pings; closed after the idle timeout without inbound bytes (`marekvs_mesh_conn_timeouts_total`); disconnect deregisters the peer entry, so `connected_peers` is truthful |
 | interest_escalate | — | design (4096 keys/pid) | — | whole-partition escalation unimplemented |
-| interest_max_entries | — | design (1,000,000) | — | no cap/LRU on the interest map; expired entries GC'd each AE round |
-| replication ring | 128 MiB / 262,144 ops | const (marekvs-repl `RING_MAX_*`) | no | overrun → ring gap warning + AE backstop |
-| repl batch | 256 ops / pump on notify or 50 ms tick | const (marekvs-repl `BATCH_MAX_OPS`) | no | design byte cap (256 KiB) + 2 ms linger unimplemented |
-| per-peer unacked window | — | design (4 MiB) | — | `AckSeq` is received and ignored; no send-window flow control |
+| interest_max_entries | 1,000,000 | env `MAREKVS_INTEREST_MAX_ENTRIES` | no | reject-at-cap (refresh always allowed); a rejected registration degrades to worst-case-lease (60 s) staleness; `marekvs_interest_entries` / `marekvs_interest_rejected_total` |
+| replication ring | 128 MiB / 262,144 ops | const (marekvs-repl `RING_MAX_*`) | no | overrun → ring gap warning + AE backstop; the ring is also the flow-control retransmit buffer |
+| repl batch | 256 ops / 1 MiB payload / pump on notify or 50 ms tick | const (marekvs-repl `BATCH_MAX_OPS`, `BATCH_MAX_BYTES`) | no | byte cap keeps frames under proto MAX_FRAME (oversized frames previously failed encode silently); design 2 ms linger unimplemented |
+| per-peer unacked window | 4 MiB | env `MAREKVS_REPL_WINDOW_BYTES` | no | `AckSeq` (= `ReplBatch.last_seq`) drains it; a full window stalls only that peer's lane (`marekvs_repl_window_stalls_total`, warn after 5 s); cursor advances only on successful send |
 | ring high-water persist | 1 s | const (marekvs-repl) | no | restart resumes seq space +1,000,000 above persisted HW |
 | mesh writer queue | 4096 msgs | const (marekvs-repl) | no | per-peer, per-lane |
 | mesh reconnect backoff | 100 ms → 5 s | const (marekvs-repl) | no | exponential |
-| gc_grace | 1 h | const (marekvs-engine `GC_GRACE`) | no | tombstone TTL; the pull-only-until-synced rejoin rule is **not yet enforced** |
+| gc_grace | 1 h | env `MAREKVS_GC_GRACE_SECS` | no | tombstone TTL; must be uniform cluster-wide; pull-only-until-synced rejoin rule **enforced** (above); `alive:last` heartbeat every min(gc_grace/4, 30 s) |
 | ttl_skew_grace | — | design (5 s) | — | expiry is materialized by the sweep as an ordinary tombstone write; digest-exclusion grace unimplemented |
 | expiry sweep budget | 128 records | const (marekvs-engine) | no | incremental cursor walk between shard jobs |
 | max_clock_drift | 5 s | const (marekvs-core `MAX_CLOCK_DRIFT_MS`) | no | remote HLC clamp + loud log |
 | repair_delay | — | design (30 s + jitter) | — | unimplemented; AE repairs fire on the next round |
-| bootstrap chunking | 256 ops/chunk, sequential | const (marekvs-repl) | no | lz4 bulk lane; design 8 streams / 64 MiB/s rate cap unimplemented |
+| bootstrap chunking | 256 ops/chunk, sequential | const (marekvs-repl) | no | lz4 bulk lane; donors refuse non-owned pids and dedup duplicate (peer, pid) streams within a 20 s window; design 8 concurrent streams unimplemented |
+| bootstrap rate cap | 64 MiB/s | env `MAREKVS_BOOTSTRAP_RATE_MB` | no | donor-side stream pacing; 0 = unlimited; `marekvs_bootstrap_bytes_sent_total` |
+| join gate timeout | 0 = wait forever | env `MAREKVS_JOIN_TIMEOUT_SECS` | no | operator escape hatch: forces Active with incomplete bootstrap (loud log + `marekvs_join_gate_timeouts_total`); gate progress visible via `marekvs_join_gate_pending_pids` |
+| disk high/low water | 90 % / 85 % | env `MAREKVS_DISK_HIGH_WATER_PCT` / `MAREKVS_DISK_LOW_WATER_PCT` | no | client writes (incl. DEL/EXPIRE/FLUSHALL — LSM deletes grow disk) get MISCONF at high-water; peer replication/AE/bootstrap and the REPLICAOF apply session are exempt; `marekvs_disk_write_stopped` |
+| disk min-avail floor | 1024 MiB | env `MAREKVS_DISK_MIN_AVAIL_MB` | no | write stop engages only when used% ≥ high-water AND available < floor (shared-fs false positives); releases at low-water or 2× the floor; statvfs + ondaDB DbStats polled every 2 s (`marekvs_disk_total_bytes` / `_avail_bytes`, `marekvs_db_total_bytes`) |
 | cold_purge_delay | — | design (15 m) | — | unimplemented; data kept after losing ownership (feeds stranded-record AE) |
 | terminationGracePeriodSeconds | 60 | manifest (k8s/statefulset.yaml) | k8s edit | drain typically completes in ~3 s |
 | listen addresses | :6379 / :7373 / :7946 / :9121 | env `MAREKVS_{RESP,MESH,GOSSIP,METRICS}_ADDR` | no | RESP / mesh / gossip(UDP) / metrics+probes |

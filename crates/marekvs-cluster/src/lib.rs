@@ -177,6 +177,9 @@ pub struct Cluster {
     pub replicas_n: usize,
     view: Arc<RwLock<Arc<View>>>,
     view_tx: watch::Sender<u64>,
+    /// Local mirror of the gossiped self phase (chitchat has no cheap sync
+    /// read of own state; consumers like the alive-heartbeat need one).
+    self_phase: RwLock<NodePhase>,
 }
 
 impl Cluster {
@@ -216,6 +219,7 @@ impl Cluster {
             replicas_n: cfg.replicas_n,
             view: Arc::new(RwLock::new(Arc::new(View::default()))),
             view_tx,
+            self_phase: RwLock::new(NodePhase::Joining),
         });
 
         // Watch live-node changes and rebuild the placement view.
@@ -284,7 +288,13 @@ impl Cluster {
         let chitchat = self.handle.chitchat();
         let mut guard = chitchat.lock().await;
         guard.self_node_state().set("state", phase.as_str());
+        *self.self_phase.write() = phase;
         tracing::info!(phase = phase.as_str(), "node phase changed");
+    }
+
+    /// Our own current phase (local mirror of the gossiped state).
+    pub fn phase(&self) -> NodePhase {
+        *self.self_phase.read()
     }
 
     pub async fn set_kv(&self, key: &str, value: &str) {
@@ -324,6 +334,22 @@ impl Cluster {
         }
         (0..PARTITIONS)
             .filter(|pid| owners_for(&candidates, *pid, self.replicas_n).contains(&self.self_id))
+            .collect()
+    }
+
+    /// Owners of `pid` under the placement that INCLUDES this node as an
+    /// Active candidate (the post-join world), excluding self. For a
+    /// rejoiner these are its pre-outage co-owners — the peers that held
+    /// the partition's data alongside it.
+    pub fn future_co_owners(&self, pid: Pid) -> Vec<NodeId> {
+        let view = self.view();
+        let mut candidates = view.owner_candidates();
+        if !candidates.iter().any(|(id, _)| *id == self.self_id) {
+            candidates.push((self.self_id, true));
+        }
+        owners_for(&candidates, pid, self.replicas_n)
+            .into_iter()
+            .filter(|o| *o != self.self_id)
             .collect()
     }
 

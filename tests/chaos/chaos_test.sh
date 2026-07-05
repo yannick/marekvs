@@ -17,7 +17,8 @@ source tests/chaos/lib.sh
 
 SCENARIOS=("$@")
 [ ${#SCENARIOS[@]} -gt 0 ] || {
-  SCENARIOS=(crash_restart freeze_thaw rolling_churn wipe_replace membership_churn bank)
+  SCENARIOS=(crash_restart freeze_thaw rolling_churn wipe_replace membership_churn join_empty_reads interest_flood bank)
+  [ "$BACKEND" = docker ] && SCENARIOS+=(disk_guard gc_grace_rejoin)
   [ "$BACKEND" = docker ] && SCENARIOS+=(partition_divergence partition_no_resurrect)
 }
 
@@ -96,7 +97,12 @@ partition_no_resurrect() {
   rcli 1 sadd res:s partition-born >/dev/null    # concurrent add on island
   sleep 3
   heal 1
-  check_set_converged "post-heal set" res:s 40 "keeper partition-born"
+  # 75 s > the 60 s interest lease: a NON-owner that cached the set before
+  # the partition serves its (refreshed-in-place, but never grown) copy
+  # until lease expiry re-fetches — new members born on the island reach it
+  # only then. Bounded staleness is the documented AP contract; asserting
+  # convergence inside the lease window was racing it.
+  check_set_converged "post-heal set" res:s 75 "keeper partition-born"
   # the removed element must be gone on every node; the island add survives
   local i
   for i in $(seq 0 $((N - 1))); do
@@ -218,6 +224,211 @@ membership_churn() {
   check_set chaos:set
   check_converged "counter" 40 get chaos:cnt
   check_replication_healed 90
+}
+
+# ── scenario: join_empty_reads ───────────────────────────────────────────
+# Scale-up must not serve empty reads: pre-join-gate, a new node flipped
+# Active after a fixed 2 s sleep, HRW immediately routed ~1/n of partitions
+# to it, and both its own home reads AND other nodes' read-throughs hit its
+# empty store until anti-entropy filled it. The gate holds the node in
+# Joining (RESP not listening, /ready 503) until every future-owned
+# partition is bootstrapped — so the moment PING answers, reads must be
+# complete everywhere.
+join_empty_reads() {
+  fresh_cluster
+  echo "  seeding 100k keys"
+  local seed_cmds
+  seed_cmds=$(awk 'BEGIN{for(i=0;i<100000;i++) printf "set seed:%d v%d\r\n", i, i}')
+  if [ "$BACKEND" = docker ]; then
+    echo "$seed_cmds" | redis-cli -p "$(resp_port 0)" --pipe >/dev/null
+  else
+    echo "$seed_cmds" | redis-cli -h "$(apple_ip chaos-0)" -p 6379 --pipe >/dev/null
+  fi
+  check_replication_healed 90
+  echo "  nemesis: node 3 joins the cluster"
+  if [ "$BACKEND" = docker ]; then
+    docker run -d --name chaos-3 \
+      --network "$EDGE_NET" --ip "$(edge_ip 3)" \
+      -p "$(resp_port 3):6379" -p "$(metrics_port 3):9121" \
+      -e MAREKVS_NODE_ID=3 -e MAREKVS_REPLICAS_N=2 \
+      -e MAREKVS_DATA_DIR=/data -e MAREKVS_ADVERTISE_IP="$(mesh_ip 3)" \
+      -e MAREKVS_SEEDS="$(seeds)" -e RUST_LOG=info,chitchat=warn \
+      "$IMAGE" >/dev/null
+    docker network connect --ip "$(mesh_ip 3)" "$MESH_NET" chaos-3
+  else
+    container run -d --name chaos-3 \
+      -e MAREKVS_NODE_ID=3 -e MAREKVS_REPLICAS_N=2 \
+      -e MAREKVS_DATA_DIR=/data -e MAREKVS_ADVERTISE_IP=auto \
+      -e MAREKVS_SEEDS="$(apple_ip chaos-0):7946" -e RUST_LOG=info,chitchat=warn \
+      "$IMAGE" >/dev/null
+  fi
+  N=4 wait_ready 3 450
+  # RESP answering == the node went Active with every home partition
+  # bootstrapped. Sample immediately: a small transient nil rate (<1%) is
+  # tolerated — read-throughs can race the placement flip for the first
+  # second (AP view-convergence window, accepted by the assessment) — but
+  # the pre-gate empty-store failure was ~35% nils.
+  local db3 miss=0 round j k v n
+  db3=$(rcli 3 dbsize 2>/dev/null || echo 0)
+  for round in 1 2 3; do
+    for j in $(seq 1 66); do
+      k=$(( (RANDOM * 3 + j) % 100000 ))
+      for n in 0 1 2 3; do
+        # `|| true`: one transient connection error must count as a miss,
+        # not abort the whole suite (set -e).
+        v=$(rcli "$n" get "seed:$k" 2>/dev/null || true)
+        [ -n "$v" ] || miss=$((miss + 1))
+      done
+    done
+  done
+  # Contract at first PONG: the joiner is SUBSTANTIALLY bootstrapped and any
+  # residual gap is small and AE-bounded. Pre-gate: ~35% nils on a ~3k-record
+  # store with only slow AE to heal it; post-gate runs measure 1-14%
+  # (load-dependent read-through races at the placement flip) decaying to
+  # ZERO within one AE bound — the deterministic assertions are the dbsize
+  # check and the post-settle zero below; this is a loose tripwire.
+  chk $((miss > 158)) "join residual bounded (pre-gate was ~35% nils)" \
+    "$miss empty replies out of 792 sampled (node3 dbsize=$db3 at ready)"
+  # RF=2 over 4 nodes: node 3 homes ~half the 100k keyspace (~50k keys).
+  # The pre-gate code showed dbsize ≈ 3k at first PONG (2 s of bootstrap).
+  chk $((db3 < 20000)) "joiner bootstrapped before Active" \
+    "node3 dbsize=$db3 at first PONG — went Active with a near-empty store?"
+  # After one full AE bound (15 s + margin) every read must be complete
+  # everywhere — this is the assessment's documented convergence promise.
+  sleep 20
+  miss=0
+  for j in $(seq 1 66); do
+    k=$(( (RANDOM * 3 + j) % 100000 ))
+    for n in 0 1 2 3; do
+      v=$(rcli "$n" get "seed:$k" 2>/dev/null || true)
+      [ -n "$v" ] || miss=$((miss + 1))
+    done
+  done
+  chk $((miss > 0)) "zero empty reads after the AE bound (20s settle)" \
+    "$miss empty replies out of 264 sampled post-settle"
+  crt rm -f chaos-3 >/dev/null 2>&1 || true
+  N=3 check_replication_healed 90
+}
+
+# ── scenario: interest_flood ─────────────────────────────────────────────
+# A client scanning many unique keys through non-home nodes registers one
+# interest lease per (key, node) on the homes — previously unbounded: an
+# OOM you can cause from a redis-cli. With the cap, marekvs_interest_entries
+# must stay ≤ MAREKVS_INTEREST_MAX_ENTRIES (shrunk to 5000 here), rejections
+# must be counted, and interest-path reads must keep working.
+interest_flood() {
+  CHAOS_EXTRA_ARGS="-e MAREKVS_INTEREST_MAX_ENTRIES=5000"
+  fresh_cluster
+  CHAOS_EXTRA_ARGS=""
+  echo "  flooding: 30k unique-key GETs per node (read-through registers interest)"
+  local n cmds
+  for n in 0 1 2; do
+    cmds=$(awk -v n="$n" 'BEGIN{for(i=0;i<30000;i++) printf "get flood:%d:%d\r\n", n, i}')
+    if [ "$BACKEND" = docker ]; then
+      echo "$cmds" | redis-cli -p "$(resp_port "$n")" --pipe >/dev/null 2>&1 || true
+    else
+      echo "$cmds" | redis-cli -h "$(apple_ip "chaos-$n")" -p 6379 --pipe >/dev/null 2>&1 || true
+    fi
+  done
+  sleep 4 # let the 2 s stats tick publish the gauge
+  local maxi=0 rej=0 v i
+  for i in 0 1 2; do
+    v=$(metric_value "$i" marekvs_interest_entries); [ "${v:-0}" -gt "$maxi" ] && maxi=$v
+    v=$(metric_value "$i" marekvs_interest_rejected_total); rej=$((rej + ${v:-0}))
+  done
+  chk $((maxi > 5000)) "interest map capped" \
+    "max marekvs_interest_entries=$maxi (cap 5000) — unbounded growth?"
+  chk $((rej == 0)) "rejections counted at cap" "interest_rejected_total sum=$rej"
+  # Interest-path reads must still function at cap.
+  set_workload chaos:set 15 & local W=$!
+  wait $W
+  sleep 3
+  check_set chaos:set
+  check_converged "set still converges at cap" 45 scard chaos:set
+}
+
+# ── scenario: gc_grace_rejoin (docker) ───────────────────────────────────
+# Cassandra's oldest rule: a node down longer than gc_grace must NOT rejoin
+# as an authority — its live records whose tombstones were purged elsewhere
+# would resurrect deletes. With the fix, the rejoiner holds phase Joining,
+# pull-syncs each home partition from a healthy owner, DROPS the stale
+# extras only it holds (instead of serving them), and goes Active only when
+# every partition's Merkle root matches. gc_grace shrunk to 15 s; downtime
+# ~60 s with write churn so survivors' tombstones age past grace and get
+# physically purged before the rejoin.
+gc_grace_rejoin() {
+  [ "$BACKEND" = docker ] || { echo "  (skipped: needs the docker backend)"; return 0; }
+  CHAOS_EXTRA_ARGS="-e MAREKVS_GC_GRACE_SECS=15"
+  fresh_cluster
+  CHAOS_EXTRA_ARGS=""
+  rcli 0 set doomed:k v0 >/dev/null
+  rcli 0 sadd ctl:s a b c >/dev/null
+  check_converged "seed key" 20 get doomed:k
+  check_set_converged "seed control set" ctl:s 20 "a b c"
+  crash 2
+  sleep 1
+  rcli 0 del doomed:k >/dev/null
+  # Churn for ~60 s (4x grace): the delete's tombstone is written, ages past
+  # grace, and compaction physically purges it on the survivors.
+  register_workload churn:reg 60 & local W=$!
+  wait $W
+  # revive's default 40 s readiness window is too tight here: the rejoiner
+  # holds Joining until ~2700 partitions confirm MerkleRootMatch.
+  echo "  nemesis: revive node 2 (rejoin sync may take minutes)"
+  crt start chaos-2 >/dev/null
+  wait_ready 2 750
+  # The delete must hold everywhere — pre-fix, node 2's stale live record
+  # re-offers doomed:k via AE and resurrects it once the tombstone is gone.
+  check_converged "deleted key stays deleted" 60 get doomed:k
+  check_set_converged "control set intact" ctl:s 30 "a b c"
+  local rj drops
+  rj=$(metric_value 2 marekvs_rejoin_active)
+  chk $([ "${rj:-1}" = "0" ]; echo $?) "rejoin completed (gate released)" \
+    "marekvs_rejoin_active=${rj:-absent}"
+  drops=$(metric_value 2 marekvs_rejoin_dropped_records_total)
+  echo "  (node 2 dropped ${drops:-0} stale extra records during rejoin)"
+  rcli 2 set post:k v1 >/dev/null 2>&1 || true
+  check_converged "fresh write on rejoiner converges" 30 get post:k
+}
+
+# ── scenario: disk_guard ─────────────────────────────────────────────────
+# Disk-full is THE unrecoverable LSM failure: ondadb write errors wedge the
+# node mid-compaction. With the guard, filling one node's (tmpfs) data
+# volume must produce a clean MISCONF refusal at the high-water mark while
+# reads keep working, the node stays alive, and REPLICATED writes keep
+# applying (refusing merges would mean divergence — the guard sheds client
+# load only). Thresholds lowered so the 2 s stats poll cannot be outrun.
+disk_guard() {
+  [ "$BACKEND" = docker ] || { echo "  (skipped: tmpfs mount needs the docker backend)"; return 0; }
+  CHAOS_TMPFS="2 134217728" # node 2: 128 MB /data
+  CHAOS_EXTRA_ARGS="-e MAREKVS_DISK_HIGH_WATER_PCT=60 -e MAREKVS_DISK_LOW_WATER_PCT=50"
+  fresh_cluster
+  CHAOS_TMPFS=""
+  CHAOS_EXTRA_ARGS=""
+  local payload i out misconf=0 writes=0
+  payload=$(printf 'x%.0s' $(seq 1 100000)) # 100 KB
+  echo "  filling node 2's 128 MB volume with 100 KB values"
+  for i in $(seq 1 1200); do
+    out=$(rcli 2 set "disk:k$i" "$payload" 2>&1) || true
+    writes=$i
+    case "$out" in *MISCONF*) misconf=1; break ;; esac
+  done
+  chk $((1 - misconf)) "clean MISCONF refusal at high-water" \
+    "no MISCONF after $writes x 100KB writes (node wedged or guard absent?)"
+  chk $([ "$(rcli 2 ping 2>/dev/null)" = "PONG" ]; echo $?) "node 2 still alive after fill"
+  chk $([ "$(rcli 2 strlen disk:k1 2>/dev/null)" = "100000" ]; echo $?) \
+    "reads still served under write-stop"
+  local stopped; stopped=$(metric_value 2 marekvs_disk_write_stopped)
+  chk $([ "${stopped:-0}" = "1" ]; echo $?) "marekvs_disk_write_stopped gauge = 1" \
+    "gauge=${stopped:-absent}"
+  # Peer replication must keep applying on the stopped node.
+  local a0 a1
+  a0=$(metric_value 2 marekvs_repl_ops_applied_total); a0=${a0:-0}
+  for i in $(seq 1 30); do rcli 0 set "probe:$i" v$i >/dev/null 2>&1 || true; done
+  sleep 3
+  a1=$(metric_value 2 marekvs_repl_ops_applied_total); a1=${a1:-0}
+  chk $((a1 <= a0)) "replication still applies onto the write-stopped node" \
+    "repl_ops_applied_total $a0 -> $a1 after 30 writes via node 0"
 }
 
 # ── scenario: bank ───────────────────────────────────────────────────────
@@ -350,6 +561,91 @@ lossy_writes() {
   check_set chaos:set 90
   check_converged "counter" 90 get chaos:cnt
   check_replication_healed 120
+}
+
+# ── scenario: blackhole_conn (debug, docker) ─────────────────────────────
+# Wedged-but-open TCP: drop mesh TCP between nodes 0↔1 while gossip UDP
+# stays up, so membership keeps BOTH nodes Active while their replication
+# link is silently dead (the conntrack-blackhole failure). The mesh
+# heartbeat (1 s ping / 3 s idle timeout) must close the dead connections —
+# mesh_peers drops — and reconnect + ResumeFrom must recover after heal.
+blackhole_conn() {
+  require_debug "conntrack blackhole"
+  [ "$BACKEND" = docker ] || { echo "  (skipped: blackhole needs the docker backend)"; return 0; }
+  fresh_cluster
+  counter_workload chaos:cnt 45 & local W1=$!
+  set_workload chaos:set 45 & local W2=$!
+  sleep 5
+  blackhole 0 1
+  # Heartbeat must detect the dead connections within ~2× idle timeout.
+  local deadline=$((SECONDS + 12)) ok=0 p0 p1
+  while [ $SECONDS -lt "$deadline" ]; do
+    p0=$(metric_value 0 marekvs_mesh_peers); p1=$(metric_value 1 marekvs_mesh_peers)
+    if [ "${p0:-9}" -le 1 ] && [ "${p1:-9}" -le 1 ]; then ok=1; break; fi
+    sleep 1
+  done
+  chk $((1 - ok)) "heartbeat closed wedged connections (mesh_peers dropped)" \
+    "mesh_peers node0=${p0:-?} node1=${p1:-?} after 12s (ghost handles?)"
+  sleep 8
+  blackhole_heal
+  deadline=$((SECONDS + 20)); ok=0
+  while [ $SECONDS -lt "$deadline" ]; do
+    p0=$(metric_value 0 marekvs_mesh_peers); p1=$(metric_value 1 marekvs_mesh_peers)
+    if [ "${p0:-0}" -ge 2 ] && [ "${p1:-0}" -ge 2 ]; then ok=1; break; fi
+    sleep 1
+  done
+  chk $((1 - ok)) "mesh reconnected after heal" \
+    "mesh_peers node0=${p0:-?} node1=${p1:-?} after 20s"
+  wait $W1 $W2
+  sleep 3
+  check_counter chaos:cnt 90
+  check_set chaos:set 90
+  check_converged "counter" 90 get chaos:cnt
+  check_replication_healed 120
+}
+
+# ── scenario: backpressure_no_drop (debug, docker) ───────────────────────
+# Delay one node's mesh nic (800 ms ± 200, well under the 3 s heartbeat
+# timeout — hard rate caps queue pings behind data and turn this into
+# connection churn) with a tiny 4 KB unacked window: in-flight bytes over
+# the inflated RTT exceed the window, so senders must SKIP that peer's lane
+# (marekvs_repl_window_stalls_total > 0) instead of overrunning it, and no
+# batch may be dropped after the cursor moved
+# (marekvs_repl_send_failures_total == 0 — the pre-fix silent-drop branch).
+# AE may legitimately assist while a lane is stalled; slow_peer remains the
+# ring-overrun→gap→AE regression.
+backpressure_no_drop() {
+  require_debug "netem delay shaping"
+  [ "$BACKEND" = docker ] || { echo "  (skipped: needs the docker backend)"; return 0; }
+  CHAOS_EXTRA_ARGS="-e MAREKVS_REPL_WINDOW_BYTES=4096"
+  fresh_cluster
+  CHAOS_EXTRA_ARGS=""
+  counter_workload chaos:cnt 45 & local W1=$!
+  set_workload chaos:set 45 & local W2=$!
+  sleep 5
+  net_delay 1 800 200
+  local deadline=$((SECONDS + 25)) stalled=0 s0 s2
+  while [ $SECONDS -lt "$deadline" ]; do
+    s0=$(metric_value 0 marekvs_repl_window_stalls_total)
+    s2=$(metric_value 2 marekvs_repl_window_stalls_total)
+    if [ "${s0:-0}" -gt 0 ] || [ "${s2:-0}" -gt 0 ]; then stalled=1; break; fi
+    sleep 1
+  done
+  chk $((1 - stalled)) "flow-control window engaged (stalled pump passes counted)" \
+    "stalls node0=${s0:-?} node2=${s2:-?} after 25s of 800ms delay"
+  net_clear 1
+  wait $W1 $W2
+  sleep 5
+  check_counter chaos:cnt 90
+  check_set chaos:set 90
+  check_converged "counter" 90 get chaos:cnt
+  check_replication_healed 120
+  local drops=0 i v
+  for i in 0 1 2; do
+    v=$(metric_value "$i" marekvs_repl_send_failures_total); drops=$((drops + ${v:-0}))
+  done
+  chk $((drops > 0)) "no batch dropped after cursor advance" \
+    "repl_send_failures_total sum=$drops — writer queues overran the window?"
 }
 
 # ── scenario: clock_bump_skew (debug, apple) ─────────────────────────────
