@@ -1668,14 +1668,12 @@ impl ReplEngine {
                     self.mesh.send_ctl(peer, PeerMsg::RepairOps { pid, ops });
                 }
             }
-            PeerMsg::RepairOps { ops, .. } => {
+            PeerMsg::RepairOps { pid, ops } => {
                 self.engine
                     .metrics
                     .ae_repair_ops_total
                     .inc_by(ops.len() as u64);
-                for op in ops {
-                    self.apply_op_from(op, Some(peer)).await;
-                }
+                self.apply_ops_batch(pid, ops, Some(peer)).await;
             }
             PeerMsg::BootstrapReq { pid } => {
                 // Refuse pids we do not own: a joiner acting on a partial
@@ -1713,9 +1711,7 @@ impl ReplEngine {
                 }
             }
             PeerMsg::BootstrapChunk { pid, ops } => {
-                for op in ops {
-                    self.apply_op_from(op, Some(peer)).await;
-                }
+                self.apply_ops_batch(pid, ops, Some(peer)).await;
                 let mut g = self.gate.lock();
                 g.last_chunk_at.insert(pid, Instant::now());
                 g.chunks_applied += 1;
@@ -1789,6 +1785,55 @@ impl ReplEngine {
                     // local list op re-derives the range including this record.
                     if tag == b'q' {
                         marekvs_engine::cmd::list::invalidate_hint(ctx, &userkey);
+                    }
+                }
+            })
+            .await;
+    }
+
+    /// Apply a same-partition batch of records in ONE shard-thread closure.
+    /// Bootstrap chunks and repair batches previously paid one channel
+    /// round trip PER RECORD (apply_op_from), which made a 100k-record join
+    /// apply-bound: chunks queued for minutes, the join gate's progress
+    /// signal looked dead, and retries amplified the streams.
+    pub async fn apply_ops_batch(&self, pid: Pid, ops: Vec<ReplOp>, origin: Option<NodeId>) {
+        if ops.is_empty() {
+            return;
+        }
+        // HLC receive rule for every record BEFORE the batch lands (same
+        // semantics as apply_op_from).
+        for op in &ops {
+            if let Some((env, _)) = Envelope::decode(&op.value) {
+                if self.store.hlc.is_drifted(env.hlc) {
+                    tracing::warn!(hlc = env.hlc, "clamping far-future remote HLC");
+                }
+                self.store.hlc.observe(env.hlc);
+            }
+        }
+        let attr = origin.unwrap_or(u16::MAX);
+        self.store
+            .run(pid, move |ctx| {
+                let _guard = store::set_apply_origin(attr);
+                for op in &ops {
+                    let Some(p) = ikey::parse(&op.ikey) else {
+                        continue;
+                    };
+                    if p.pid != pid {
+                        // Wrong-partition record in a per-pid batch: apply
+                        // via the slow path is impossible on this shard —
+                        // skip and let AE repair (should not happen).
+                        tracing::warn!(pid, "batch record for foreign pid skipped");
+                        continue;
+                    }
+                    if p.tag == b'z' {
+                        marekvs_engine::cmd::zset::apply_member_record(
+                            ctx, p.userkey, p.suffix, &op.value,
+                        );
+                    } else {
+                        store::write_merged(ctx, &op.ikey, &op.value);
+                        if p.tag == b'q' {
+                            marekvs_engine::cmd::list::invalidate_hint(ctx, p.userkey);
+                        }
                     }
                 }
             })
