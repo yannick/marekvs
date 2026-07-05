@@ -171,9 +171,6 @@ struct RejoinState {
     /// Scope resolved (requires a view with ≥1 Active other member).
     scoped: bool,
     unsynced: HashSet<Pid>,
-    /// Everything this node wrote predates its death: records older than
-    /// this wall-ms that only we hold are forfeit, not served.
-    cutoff_wall_ms: u64,
 }
 
 /// Join-gate state (design/06 §Join): a node holds phase Joining — invisible
@@ -529,7 +526,6 @@ impl ReplEngine {
                 active: rejoin_needed,
                 scoped: false,
                 unsynced: HashSet::new(),
-                cutoff_wall_ms: alive_last,
             }),
             streams_served: Mutex::new(HashMap::new()),
             ae_roots: Mutex::new(HashMap::new()),
@@ -1664,39 +1660,42 @@ impl ReplEngine {
                 ikey_hashes,
             } => {
                 let ops = ae::records_by_hash(&self.store, pid, bucket, &ikey_hashes).await;
-                let (rejoin_active, rejoin_home, cutoff) = {
+                let (rejoin_active, rejoin_home) = {
                     let r = self.rejoin.lock();
-                    (r.active, r.unsynced.contains(&pid), r.cutoff_wall_ms)
+                    (r.active, r.unsynced.contains(&pid))
                 };
                 if rejoin_active
                     && rejoin_home
                     && self.cluster.future_co_owners(pid).contains(&peer)
                 {
-                    // gc_grace rejoin: records our CO-OWNER requests from an
-                    // unsynced home partition are, by construction, records
-                    // ONLY WE hold — written before we died, so their
-                    // delete-tombstones may already be purged cluster-wide.
-                    // Serving them would resurrect deletes; drop them
-                    // instead (Cassandra's down-past-gc_grace rule). The
-                    // co-owner restriction is load-bearing: any OTHER
-                    // requester (e.g. a crash-era owner still being
-                    // re-replicated) legitimately lacks most of the
-                    // partition, and honoring its want-set would destroy
-                    // our valid copy.
+                    // gc_grace rejoin: every record our CO-OWNER requests
+                    // from an unsynced home partition is dropped
+                    // UNCONDITIONALLY (Cassandra's down-past-gc_grace rule).
+                    // A node down longer than gc_grace received nothing while
+                    // down, so everything it holds predates its crash; the
+                    // co-owner had the whole outage to converge and is
+                    // authoritative. A record it lacks (hence requests) is
+                    // either a replicated-then-deleted resurrection or a
+                    // never-shipped write forfeit by the rule — both drop.
+                    //
+                    // (An earlier HLC-vs-last-heartbeat gate left records
+                    // written in the seconds between the final heartbeat and
+                    // the crash neither dropped nor served — the partition
+                    // root then never re-matched and the rejoin hung forever.
+                    // The co-owner restriction is what makes unconditional
+                    // drop safe: any OTHER requester — e.g. a crash-era owner
+                    // still re-replicating — legitimately lacks most of the
+                    // partition and is refused below WITHOUT deletion.)
                     let mut dropped = 0u64;
                     for op in ops {
-                        let stale = Envelope::decode(&op.value)
-                            .is_some_and(|(e, _)| (e.hlc >> 16) < cutoff);
-                        if stale {
-                            let ik = op.ikey;
-                            self.store
-                                .run(pid, move |ctx| {
-                                    let _g = store::suppress_commit_hook();
-                                    store::del_raw(ctx, &ik);
-                                })
-                                .await;
-                            dropped += 1;
-                        }
+                        let ik = op.ikey;
+                        self.store
+                            .run(pid, move |ctx| {
+                                let _g = store::suppress_commit_hook();
+                                store::del_raw(ctx, &ik);
+                            })
+                            .await;
+                        dropped += 1;
                     }
                     if dropped > 0 {
                         self.engine
