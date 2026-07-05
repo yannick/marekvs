@@ -55,30 +55,67 @@ State is published in gossip; placement reads it.
 On boot with existing data: if `meta` records a clean shutdown, the gossip view
 shows ownership unchanged since `last_alive`, **and**
 `now − last_alive ≤ gc_grace`, the node skips bootstrap: cursor-resume
-(`ResumeFrom` to each peer) closes the gap, then `Active`. If
-`now − last_alive > gc_grace` → **pull-only until synced**
-([05](05-consistency-anti-entropy.md#tombstone-lifecycle--gc-safe-point)).
+(`ResumeFrom` to each peer) closes the gap, then `Active`. `last_alive` is the
+`alive:last` meta heartbeat, written every `min(gc_grace/4, 30 s)` — only
+while Active/Leaving, so a crash mid-rejoin keeps measuring downtime from the
+pre-death timestamp. If `now − last_alive > gc_grace` → **pull-only until
+synced** ([05](05-consistency-anti-entropy.md#tombstone-lifecycle--gc-safe-point)):
+the node stays Joining (held by the join gate) and Merkle-syncs each
+data-bearing home partition against its **pre-outage co-owner** — placement
+computed with itself included — never a current-view owner, which can be an
+empty crash-era owner whose want-set would destroy valid data. Stale extras
+only the rejoiner holds are dropped when the co-owner requests them; all
+other requesters are refused without deletion; `MerkleRootMatch{pid}` marks
+each partition done. A sole survivor (no Active peers) stands down and
+serves.
 
 ## Join / bootstrap
 
-A joining node computes the partitions it will own once Active
-(placement with itself included), then per partition:
+A joining node computes the partitions it will own once Active (placement
+with itself included) and holds phase **Joining** — invisible to HRW,
+`/ready` 503 — until every one of them is bootstrapped: the **join gate**.
+(The old "simplified v1" join was a fixed 2 s sleep before `Active`; a
+scale-up node went Active with an empty store, HRW immediately routed ~1/n
+of partitions to it, and its reads *and* other nodes' read-throughs served
+nils until AE.) Per partition:
 
 ```
-NeedPid ── BootstrapReq{pid} ──► source picks MVCC snapshot at seq S
-                                 (ondaDB checkpoint / snapshot iterator)
-Streaming: BootstrapChunk × n    4 MiB chunks, lz4, ≤ 64 MiB/s per node,
-                                 ≤ 8 concurrent partition streams each way
-Streaming ── BootstrapDone{S} ──► Tailing: ReplOps with seq > S from
-                                  the source's ring (standard cursor)
-Tailing ── lag < 1000 ops ──► Synced
+NeedPid ── BootstrapReq{pid} ──► donor streams a shard-consistent closure
+Streaming: BootstrapChunk × n    256-op chunks, lz4 bulk lane, paced at
+                                 MAREKVS_BOOTSTRAP_RATE_MB (64 MiB/s, 0=∞)
+Streaming ── BootstrapDone{pid} ──► pid leaves the gate's pending set
 ```
 
-- Chunks apply through the normal **merge** path (idempotent — a crashed
-  bootstrap restarts safely; a concurrent client write to the joining node
-  can't be clobbered).
+- Chunks apply through the normal **merge** path, one batch per shard
+  closure (idempotent — a crashed bootstrap restarts safely; a concurrent
+  client write to the joining node can't be clobbered).
+- **Crash resume**: unfinished pids are persisted under the meta key
+  `join:pending` and re-requested at boot even though locally non-empty.
+- **Retries** use a capped per-pid backoff (5/10/20 s), deferred whenever
+  *any* chunk applied since the last sweep (`BootstrapDone` counts as
+  progress): a donor streams its request queue sequentially, so "no chunk
+  yet" usually means "still queued", not "lost" — naive fixed-interval
+  retries were measured re-streaming every partition ~6×.
+- **Donors refuse** `BootstrapReq` for pids they don't own (a joiner on a
+  partial early gossip view can pick the wrong donor; streaming an empty
+  copy + Done would mark the pid bootstrapped forever) and dedup duplicate
+  (peer, pid) streams within a 20 s window (9× stream amplification
+  measured without it). No reply = the joiner's backoff re-requests from
+  the right owner once views converge.
+- `/metrics` and `/ready` serve **before** the gate — a long bootstrap is
+  observable (`marekvs_join_gate_pending_pids`,
+  `marekvs_bootstraps_completed_total`,
+  `marekvs_bootstrap_bytes_sent_total`), not a black box.
+- `MAREKVS_JOIN_TIMEOUT_SECS` (default 0 = wait forever) is an operator
+  escape hatch: on expiry the node goes Active with incomplete bootstrap
+  (loud log + `marekvs_join_gate_timeouts_total`). Waiting forever is the
+  safe default — a node that cannot finish bootstrap must stay unready
+  rather than serve empty reads.
+- **Post-join residual**: writes that landed on donors during the join, and
+  read-through races, heal within the ~15 s AE bound — documented AP
+  staleness, not a gate condition.
 - Preferred source: current `H1(pid)`; any home works.
-- When **all** future-owned pids are `Synced`, the node flips
+- When **all** future-owned pids are done, the node flips
   `Joining → Active` in one gossip update — a single atomic ownership change
   per node, no per-partition placement churn. Previous owners that drop out of
   `owners(pid)` demote those partitions to cold.
@@ -89,11 +126,15 @@ preStop hook → node sets `Leaving`:
 
 1. New placement (excluding it from top-N) makes new owners bootstrap-pull
    from it — it is the cheapest source, having everything.
-2. Each new owner sends `HandoffAck{pid}` once Synced.
-3. When all owed pids are acked — or `terminationGracePeriodSeconds = 300`
-   expires — the node sets `Left` and exits. On expiry, the remaining pids
-   fall back to crash-repair from surviving homes; no data is lost while N−1
-   other homes live.
+2. The node drains its replication backlog: exit waits (bounded by
+   `terminationGracePeriodSeconds`) until every peer has **acked** — not
+   merely been sent — everything up to the ring head. (`HandoffAck` is
+   removed from the wire: a per-pid handoff ack added nothing over
+   acked-drain plus AE, and was never consumed.)
+3. When the backlog reaches zero — or the grace period expires — the node
+   sets `Left` and exits. On expiry, any remaining pids fall back to
+   crash-repair from surviving homes; no data is lost while N−1 other homes
+   live.
 4. Throughout `Leaving` the node still serves clients and replication
    (the Service deselects it via readiness only at the very end).
 

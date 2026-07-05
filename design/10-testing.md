@@ -68,8 +68,14 @@ counters exact, so the harness now *asserts* them.
 - **Scenarios** (`tests/chaos/chaos_test.sh`): crash_restart,
   partition_divergence, partition_no_resurrect (SREM/DEL on the majority
   side while an island holds the record — resurrection is the classic AP
-  bug), freeze_thaw, rolling_churn, wipe_replace, membership_churn, and a
-  bank test (atomic same-hash-tag Lua transfers; total conserved on every
+  bug), freeze_thaw, rolling_churn, wipe_replace, membership_churn,
+  join_empty_reads (a scale-up node must be gated Joining until
+  bootstrapped, never serving — or causing peers to read-through — empty
+  homes), interest_flood (the interest-map hard cap under a
+  unique-key-scanning client), disk_guard (write-stop MISCONF engages at
+  high-water and releases; docker), gc_grace_rejoin (a node down past
+  gc_grace must drop its stale extras, not resurrect deletes; docker), and
+  a bank test (atomic same-hash-tag Lua transfers; total conserved on every
   node's final read through graceful churn).
 - **Invariants after every scenario**: Jepsen counter/set acceptance on
   every node, total convergence, and
@@ -137,6 +143,15 @@ coreutils) carries them; `CHAOS_DEBUG=1` selects it and adds `NET_ADMIN`
   enough to overrun the replication ring and force the gap→AE repair path
   (verified: 126 ring-gap warnings, data still converged); `lossy_writes`
   runs 25 % loss + 5 % corruption under load.
+- **blackhole_conn** (docker, debug): iptables DROP (not RST) on an
+  established mesh connection — the conntrack blackhole of risky
+  assumption 4. The mesh heartbeat must close the wedged connection within
+  the ~3 s idle timeout and reconnect once traffic resumes.
+- **backpressure_no_drop** (docker, debug): a slowed peer fills its 4 MiB
+  unacked window — the sender must stall only that peer's lane
+  (`marekvs_repl_window_stalls_total` moves) and no acked write may be
+  dropped; the ring-as-retransmit-buffer resumes cleanly when the peer
+  catches up.
 - **Clock bump/strobe** (`just chaos-clock`, apple): per-VM clocks let one
   node's wall clock be skewed with `date -s` (CAP_SYS_TIME). Bugs 5 and 6
   came from here. `assert_skewed` fails the run if the skew was a no-op, so
@@ -156,9 +171,11 @@ Chaos Mesh (or Litmus) on a kind/k3s cluster in CI-nightly:
   (drain/handoff, zero client errors expected on the Service),
   scale 3→9→3 soak;
 - **wedged-connection pathology** (assumption 4): iptables DROP (not RST) on
-  an established ctl connection — assert staleness ceiling is the 60 s lease
-  timer, alert fires, and heartbeat timeout recovers within 3 s once traffic
-  resumes;
+  an established ctl connection — the mesh heartbeat now bounds detection at
+  ~3 s (idle-timeout close; covered at container level by the
+  `blackhole_conn` chaos scenario), with the 60 s lease timer as the
+  absolute backstop; assert the close fires, the alert fires, and the
+  connection recovers once traffic resumes;
 - apiserver outage: cluster keeps serving (gossip-only dependence), new pods
   simply can't seed until DNS returns;
 - disk pressure: cold-partition purge kicks in; ondaDB `Busy`/stall behavior
