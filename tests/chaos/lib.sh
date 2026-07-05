@@ -158,8 +158,20 @@ cluster_down() {
   for i in $(seq 0 9); do
     crt rm -f "chaos-$i" >/dev/null 2>&1 || true
   done
+  # Safety sweep: also remove any container still running a marekvs image.
+  # An apple `container run` without --name (e.g. an ad-hoc probe) leaves a
+  # UUID-named container the chaos-N loop above can't see; without this it
+  # lingers forever (a stray debug cluster was found exactly that way).
   if [ "$BACKEND" = docker ]; then
+    local stray
+    stray=$(docker ps -aq --filter "ancestor=marekvs:debug" --filter "ancestor=marekvs:dev" 2>/dev/null | sort -u)
+    [ -n "$stray" ] && docker rm -f $stray >/dev/null 2>&1 || true
     docker network rm "$MESH_NET" "$EDGE_NET" >/dev/null 2>&1 || true
+  else
+    local id
+    for id in $(container ls -a 2>/dev/null | awk '/marekvs:(debug|dev)/ {print $1}'); do
+      container rm -f "$id" >/dev/null 2>&1 || true
+    done
   fi
 }
 

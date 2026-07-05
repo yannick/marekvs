@@ -109,12 +109,12 @@ test-replicaof: build
 
 # ══ run ══════════════════════════════════════════════════════════════════
 
-# run a single local node (data in ./.data/n0)
+# run a single local node — RESP :6379, metrics :9121 (data ./.data/n0)
 [group('run')]
 run *ARGS:
     MAREKVS_DATA_DIR=.data/n0 cargo run -p marekvs-server -- {{ARGS}}
 
-# run a local 3-node cluster on ports 6379/6380/6381 (foreground, ctrl-c stops all)
+# run a local 3-node cluster, ctrl-c stops all — RESP 6379/6380/6381, metrics 9121-9123
 [group('run')]
 run-cluster: build
     ./tests/local_cluster.sh target/debug/marekvs-server 3
@@ -143,7 +143,7 @@ docker-build: _stage-ctx
     @printf '{{bold}}{{cyan}}▸ docker build → {{image}}{{reset}}\n'
     docker build -f .build-ctx/marekvs/Dockerfile -t {{image}} .build-ctx
 
-# start a 3-node cluster via docker compose (ports 16379-16381)
+# start a 3-node docker compose cluster — RESP on host 16379/16380/16381
 [group('docker')]
 docker-up:
     ./tests/preflight.sh 16379 16380 16381
@@ -174,7 +174,7 @@ apple-build: _stage-ctx
     container system start || true
     container build -f .build-ctx/marekvs/Dockerfile -t {{image}} .build-ctx
 
-# start a 3-node cluster using apple containers
+# start a 3-node apple-container cluster — each node on its container IP :6379 / :9121 (no host ports)
 [group('apple')]
 apple-up: apple-build
     ./tests/apple_cluster.sh up {{image}}
@@ -256,6 +256,46 @@ chaos-clock: debug-apple-build
 grudge-test:
     python3 tests/chaos/grudge.py --test
 
+# Docker host ports — RESP 26379/26380/26381, metrics 27121/27122/27123.
+# Apple: no host ports; connect on each container IP :6379 / :9121 (printed
+# by the recipe). Debug image (grudge/netem tools; NET_ADMIN+SYS_TIME).
+# start a 3-node debug cluster and leave it running (`just chaos-down` to stop)
+[group('chaos')]
+chaos-up backend="docker": (_chaos-img backend)
+    #!/usr/bin/env bash
+    set -euo pipefail
+    CHAOS_DEBUG=1 BACKEND={{backend}} bash -c 'source tests/chaos/lib.sh; cluster_up'
+    if [ "{{backend}}" = docker ]; then
+        printf '{{bold}}{{green}}debug cluster up{{reset}} — redis-cli -p 26379|26380|26381 · metrics :27121-27123\n'
+    else
+        CHAOS_DEBUG=1 BACKEND=apple bash -c 'source tests/chaos/lib.sh
+        for i in 0 1 2; do echo "  chaos-$i: $(apple_ip chaos-$i):6379 (metrics :9121)"; done'
+    fi
+
+# stop the running debug cluster and sweep any stray marekvs containers
+[group('chaos')]
+chaos-down backend="docker":
+    CHAOS_DEBUG=1 BACKEND={{backend}} bash -c 'source tests/chaos/lib.sh; cluster_down'
+    @printf '{{dim}}debug cluster stopped (stray marekvs containers swept){{reset}}\n'
+
+# show the running debug cluster's containers + published ports
+[group('chaos')]
+chaos-status backend="docker":
+    #!/usr/bin/env bash
+    if [ "{{backend}}" = docker ]; then
+        # default columns already include NAMES / PORTS / STATUS (a Go
+        # --format template would be mangled by just interpolation)
+        docker ps --filter ancestor=marekvs:debug
+    else
+        container ls 2>/dev/null | awk 'NR==1 || /marekvs:debug/'
+    fi
+
+# pick the right debug image build for the backend (internal)
+[private]
+_chaos-img backend:
+    #!/usr/bin/env bash
+    if [ "{{backend}}" = docker ]; then just debug-build; else just debug-apple-build; fi
+
 # ══ kubernetes ═══════════════════════════════════════════════════════════
 
 # apply the example deployment from k8s/ (see k8s/README.md)
@@ -303,7 +343,7 @@ operator-delete:
 
 bench_requests := env_var_or_default("BENCH_REQUESTS", "20000")
 
-# start both engines in docker (marekvs :16391, keydb :16390)
+# start the bench engines in docker — marekvs host :16391, KeyDB :16390
 [group('bench')]
 bench-up: docker-build
     ./tests/preflight.sh 16390 16391
