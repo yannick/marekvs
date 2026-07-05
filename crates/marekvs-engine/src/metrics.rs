@@ -54,6 +54,8 @@ pub struct Metrics {
     pub ring_ops: IntGauge,
     pub ring_bytes: IntGauge,
     pub join_gate_pending_pids: IntGauge,
+    pub rejoin_active: IntGauge,
+    pub rejoin_dropped_records_total: IntCounter,
     pub interest_entries: IntGauge,
     pub interest_rejected_total: IntCounter,
     pub bootstraps_completed_total: IntCounter,
@@ -255,6 +257,16 @@ impl Metrics {
                 "Replication ring occupancy (bytes)"
             ),
 
+            rejoin_active: gauge!(
+                registry,
+                "marekvs_rejoin_active",
+                "1 while the gc_grace pull-only rejoin is syncing home partitions"
+            ),
+            rejoin_dropped_records_total: counter!(
+                registry,
+                "marekvs_rejoin_dropped_records_total",
+                "Stale extra records shed during a gc_grace rejoin instead of being served"
+            ),
             interest_entries: gauge!(
                 registry,
                 "marekvs_interest_entries",

@@ -18,7 +18,7 @@ source tests/chaos/lib.sh
 SCENARIOS=("$@")
 [ ${#SCENARIOS[@]} -gt 0 ] || {
   SCENARIOS=(crash_restart freeze_thaw rolling_churn wipe_replace membership_churn join_empty_reads interest_flood bank)
-  [ "$BACKEND" = docker ] && SCENARIOS+=(disk_guard)
+  [ "$BACKEND" = docker ] && SCENARIOS+=(disk_guard gc_grace_rejoin)
   [ "$BACKEND" = docker ] && SCENARIOS+=(partition_divergence partition_no_resurrect)
 }
 
@@ -321,6 +321,46 @@ interest_flood() {
   sleep 3
   check_set chaos:set
   check_converged "set still converges at cap" 45 scard chaos:set
+}
+
+# ── scenario: gc_grace_rejoin (docker) ───────────────────────────────────
+# Cassandra's oldest rule: a node down longer than gc_grace must NOT rejoin
+# as an authority — its live records whose tombstones were purged elsewhere
+# would resurrect deletes. With the fix, the rejoiner holds phase Joining,
+# pull-syncs each home partition from a healthy owner, DROPS the stale
+# extras only it holds (instead of serving them), and goes Active only when
+# every partition's Merkle root matches. gc_grace shrunk to 15 s; downtime
+# ~60 s with write churn so survivors' tombstones age past grace and get
+# physically purged before the rejoin.
+gc_grace_rejoin() {
+  [ "$BACKEND" = docker ] || { echo "  (skipped: needs the docker backend)"; return 0; }
+  CHAOS_EXTRA_ARGS="-e MAREKVS_GC_GRACE_SECS=15"
+  fresh_cluster
+  CHAOS_EXTRA_ARGS=""
+  rcli 0 set doomed:k v0 >/dev/null
+  rcli 0 sadd ctl:s a b c >/dev/null
+  check_converged "seed key" 20 get doomed:k
+  check_set_converged "seed control set" ctl:s 20 "a b c"
+  crash 2
+  sleep 1
+  rcli 0 del doomed:k >/dev/null
+  # Churn for ~60 s (4x grace): the delete's tombstone is written, ages past
+  # grace, and compaction physically purges it on the survivors.
+  register_workload churn:reg 60 & local W=$!
+  wait $W
+  revive 2
+  # The delete must hold everywhere — pre-fix, node 2's stale live record
+  # re-offers doomed:k via AE and resurrects it once the tombstone is gone.
+  check_converged "deleted key stays deleted" 60 get doomed:k
+  check_set_converged "control set intact" ctl:s 30 "a b c"
+  local rj drops
+  rj=$(metric_value 2 marekvs_rejoin_active)
+  chk $([ "${rj:-1}" = "0" ]; echo $?) "rejoin completed (gate released)" \
+    "marekvs_rejoin_active=${rj:-absent}"
+  drops=$(metric_value 2 marekvs_rejoin_dropped_records_total)
+  echo "  (node 2 dropped ${drops:-0} stale extra records during rejoin)"
+  rcli 2 set post:k v1 >/dev/null 2>&1 || true
+  check_converged "fresh write on rejoiner converges" 30 get post:k
 }
 
 # ── scenario: disk_guard ─────────────────────────────────────────────────

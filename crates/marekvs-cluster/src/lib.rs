@@ -177,6 +177,9 @@ pub struct Cluster {
     pub replicas_n: usize,
     view: Arc<RwLock<Arc<View>>>,
     view_tx: watch::Sender<u64>,
+    /// Local mirror of the gossiped self phase (chitchat has no cheap sync
+    /// read of own state; consumers like the alive-heartbeat need one).
+    self_phase: RwLock<NodePhase>,
 }
 
 impl Cluster {
@@ -216,6 +219,7 @@ impl Cluster {
             replicas_n: cfg.replicas_n,
             view: Arc::new(RwLock::new(Arc::new(View::default()))),
             view_tx,
+            self_phase: RwLock::new(NodePhase::Joining),
         });
 
         // Watch live-node changes and rebuild the placement view.
@@ -284,7 +288,13 @@ impl Cluster {
         let chitchat = self.handle.chitchat();
         let mut guard = chitchat.lock().await;
         guard.self_node_state().set("state", phase.as_str());
+        *self.self_phase.write() = phase;
         tracing::info!(phase = phase.as_str(), "node phase changed");
+    }
+
+    /// Our own current phase (local mirror of the gossiped state).
+    pub fn phase(&self) -> NodePhase {
+        *self.self_phase.read()
     }
 
     pub async fn set_kv(&self, key: &str, value: &str) {

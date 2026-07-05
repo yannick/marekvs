@@ -152,6 +152,29 @@ const COLD_START_SETTLE: Duration = Duration::from_secs(6);
 /// Survives a crash mid-bootstrap: those pids are re-requested at boot even
 /// though locally non-empty (chunks are merge-idempotent).
 const JOIN_PENDING_KEY: &[u8] = b"join:pending";
+/// Meta key: wall-ms heartbeat proving this node was recently alive.
+/// Written only while Active/Leaving — a crash mid-rejoin must keep
+/// measuring downtime from the PRE-death timestamp or the restart would
+/// skip the rejoin.
+const ALIVE_LAST_KEY: &[u8] = b"alive:last";
+
+/// gc_grace pull-only rejoin (assessment Tier-1 #3, Cassandra's oldest
+/// rule): a node down longer than gc_grace may hold live records whose
+/// delete-tombstones were already purged cluster-wide. Rejoining as an
+/// authority would resurrect those deletes. Instead the node stays Joining
+/// (via the join gate), pull-syncs each home partition against a healthy
+/// owner through the ordinary Merkle machinery, and DROPS the stale extras
+/// only it holds (the sync source's RequestKeys enumerates exactly those)
+/// rather than serving them. Completion = MerkleRootMatch per partition.
+struct RejoinState {
+    active: bool,
+    /// Scope resolved (requires a view with ≥1 Active other member).
+    scoped: bool,
+    unsynced: HashSet<Pid>,
+    /// Everything this node wrote predates its death: records older than
+    /// this wall-ms that only we hold are forfeit, not served.
+    cutoff_wall_ms: u64,
+}
 
 /// Join-gate state (design/06 §Join): a node holds phase Joining — invisible
 /// to HRW placement, /ready 503, RESP not yet listening — until every
@@ -178,12 +201,16 @@ struct JoinGate {
 
 /// Pure gate predicate (unit-tested):
 /// - anything pending (bootstrap or rejoin) → not ready
+/// - a rejoin that has not resolved its scope yet holds the gate whenever
+///   Active others exist (the scope may still turn out non-empty); with no
+///   Active others the sole-survivor rules below apply
 /// - Active others exist → ready only after a sweep against such a view
 /// - only Joining others exist → cold start, ready after the settle window
 /// - alone → ready
 fn join_ready(
     pending: usize,
     rejoin: usize,
+    rejoin_unscoped: bool,
     swept_active_view: bool,
     active_others: bool,
     any_others: bool,
@@ -193,7 +220,7 @@ fn join_ready(
         return false;
     }
     if active_others {
-        return swept_active_view;
+        return swept_active_view && !rejoin_unscoped;
     }
     if any_others {
         return cold_settled;
@@ -336,6 +363,8 @@ pub struct ReplEngine {
     flows: Mutex<HashMap<NodeId, PeerFlow>>,
     /// Join gate: bootstrap/rejoin completion tracking (design/06 §Join).
     gate: Mutex<JoinGate>,
+    /// gc_grace pull-only rejoin state (Tier-1 #3).
+    rejoin: Mutex<RejoinState>,
     started: Instant,
 }
 
@@ -399,6 +428,31 @@ impl ReplEngine {
             );
         }
 
+        // gc_grace rejoin detection: down longer than the tombstone
+        // retention → our home partitions may resurrect purged deletes;
+        // enter pull-only sync (Tier-1 #3).
+        let alive_last = {
+            let store = store.clone();
+            store
+                .run(0, |ctx| match ctx.db.get(&ctx.meta, ALIVE_LAST_KEY) {
+                    Ok(v) if v.len() == 8 => u64::from_be_bytes(v.as_slice().try_into().unwrap()),
+                    _ => 0,
+                })
+                .await
+        };
+        let down_ms = store::now_ms().saturating_sub(alive_last);
+        let rejoin_needed =
+            !standalone_cfg && alive_last > 0 && down_ms > store::gc_grace().as_millis() as u64;
+        if rejoin_needed {
+            tracing::warn!(
+                down_secs = down_ms / 1000,
+                gc_grace_secs = store::gc_grace().as_secs(),
+                "down longer than gc_grace: entering pull-only rejoin — home \
+                 partitions sync (and shed stale extras) before serving"
+            );
+            engine.metrics.rejoin_active.set(1);
+        }
+
         let repl = Arc::new(ReplEngine {
             store: store.clone(),
             engine: engine.clone(),
@@ -414,6 +468,12 @@ impl ReplEngine {
                 resume_pids,
                 ..JoinGate::default()
             }),
+            rejoin: Mutex::new(RejoinState {
+                active: rejoin_needed,
+                scoped: false,
+                unsynced: HashSet::new(),
+                cutoff_wall_ms: alive_last,
+            }),
             started: Instant::now(),
         });
 
@@ -423,6 +483,11 @@ impl ReplEngine {
             let ring = ring.clone();
             let self_node = store.node_id;
             store.set_commit_hook(Some(Arc::new(move |seq: u64, ops: &[ondadb::CommitOp]| {
+                // Node-local maintenance writes (rejoin extras deletion)
+                // must not enter the ring.
+                if store::commit_hook_suppressed() {
+                    return;
+                }
                 // Configured-standalone with no discovered members → nobody
                 // will ever read the ring; skip the per-record clones. See
                 // Ring::buffering_needed for why this must NOT be gated on
@@ -472,6 +537,11 @@ impl ReplEngine {
         // 6b. Join-gate bootstrap retry tick.
         repl.clone().spawn_join_retry();
 
+        // 6c. gc_grace rejoin driver (exits immediately when not needed).
+        if rejoin_needed {
+            repl.clone().spawn_rejoin();
+        }
+
         // 7. Pub/sub cluster fan-out.
         {
             let mesh = mesh.clone();
@@ -497,10 +567,31 @@ impl ReplEngine {
     fn spawn_stats(self: Arc<Self>) {
         tokio::spawn(async move {
             let mut fs_warned = false;
+            let alive_every = store::gc_grace().div_f32(4.0).min(Duration::from_secs(30));
+            let mut alive_at: Option<Instant> = None;
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let m = &self.engine.metrics;
                 self.update_disk_guard(&mut fs_warned);
+                // alive:last heartbeat — only while Active/Leaving: a crash
+                // mid-rejoin must keep measuring downtime from the PRE-death
+                // timestamp, or a restart during rejoin would skip it.
+                if matches!(self.cluster.phase(), NodePhase::Active | NodePhase::Leaving)
+                    && alive_at.is_none_or(|t| t.elapsed() >= alive_every)
+                {
+                    alive_at = Some(Instant::now());
+                    let now = store::now_ms();
+                    self.store
+                        .run(0, move |ctx| {
+                            let _ = ctx.db.put(
+                                &ctx.meta,
+                                ALIVE_LAST_KEY,
+                                &now.to_be_bytes(),
+                                Duration::ZERO,
+                            );
+                        })
+                        .await;
+                }
                 let (ops, bytes) = self.ring.occupancy();
                 m.ring_ops.set(ops as i64);
                 m.ring_bytes.set(bytes as i64);
@@ -724,6 +815,10 @@ impl ReplEngine {
                 g.swept_active_view,
             )
         };
+        let rejoin_unscoped = {
+            let r = self.rejoin.lock();
+            r.active && !r.scoped
+        };
         let active_others = view
             .members
             .iter()
@@ -732,6 +827,7 @@ impl ReplEngine {
         join_ready(
             pending,
             rejoin,
+            rejoin_unscoped,
             swept,
             active_others,
             any_others,
@@ -776,6 +872,120 @@ impl ReplEngine {
             let peer = others[(self.pseudo_rand() % others.len() as u64) as usize];
             let root = ae::partition_root(&self.store, pid).await;
             self.mesh.send_ctl(peer, PeerMsg::MerkleRoot { pid, root });
+        }
+    }
+
+    /// gc_grace rejoin driver: resolve the sync scope once a view with
+    /// Active others exists, then probe each unsynced home partition with an
+    /// ordinary MerkleRoot every round — the reactive AE machinery pulls
+    /// what we lack, and RequestKeys enumerates the stale extras we shed.
+    /// MerkleRootMatch per pid marks completion. Exits when done.
+    fn spawn_rejoin(self: Arc<Self>) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(AE_ROUND).await;
+                if !self.rejoin.lock().active {
+                    return;
+                }
+                let view = self.cluster.view();
+                let self_id = self.store.node_id;
+                let active_others = view
+                    .members
+                    .iter()
+                    .any(|m| m.node != self_id && m.phase == NodePhase::Active);
+                if !self.rejoin.lock().scoped {
+                    if !active_others {
+                        // Sole survivor: the join gate's cold/alone rules let
+                        // the node go Active with nobody to sync from — and
+                        // there is no other copy to protect. Stand down.
+                        if self.cluster.phase() == NodePhase::Active {
+                            tracing::warn!(
+                                "gc_grace rejoin: Active with no Active peers \
+                                 (sole survivor) — pull-only sync skipped"
+                            );
+                            self.finish_rejoin();
+                            return;
+                        }
+                        continue;
+                    }
+                    // Scope: home partitions with local data need a full
+                    // sync; empty ones take the normal bootstrap gate.
+                    let mut unsynced: HashSet<Pid> = HashSet::new();
+                    for pid in self.cluster.future_owned_pids() {
+                        if ae::partition_root(&self.store, pid).await != 0 {
+                            unsynced.insert(pid);
+                        }
+                    }
+                    self.gate.lock().rejoin_pending = unsynced.clone();
+                    let empty = unsynced.is_empty();
+                    {
+                        let mut r = self.rejoin.lock();
+                        r.unsynced = unsynced;
+                        r.scoped = true;
+                    }
+                    tracing::info!(
+                        pids = self.gate.lock().rejoin_pending.len(),
+                        "gc_grace rejoin: pull-only sync scoped"
+                    );
+                    if empty {
+                        self.finish_rejoin();
+                        return;
+                    }
+                }
+                let pids: Vec<Pid> = self.rejoin.lock().unsynced.iter().copied().collect();
+                let n = self.cluster.replicas_n;
+                for pid in pids {
+                    let owners: Vec<NodeId> = view
+                        .owners(pid, n)
+                        .into_iter()
+                        .filter(|o| {
+                            *o != self_id
+                                && view
+                                    .members
+                                    .iter()
+                                    .any(|m| m.node == *o && m.phase == NodePhase::Active)
+                        })
+                        .collect();
+                    if owners.is_empty() {
+                        continue;
+                    }
+                    let peer = owners[(self.pseudo_rand() % owners.len() as u64) as usize];
+                    let root = ae::partition_root(&self.store, pid).await;
+                    if root == 0 {
+                        // Drained empty (all extras dropped, nothing pulled
+                        // yet counts as synced-empty for placement purposes).
+                        self.complete_rejoin_pid(pid);
+                        continue;
+                    }
+                    self.mesh.send_ctl(peer, PeerMsg::MerkleRoot { pid, root });
+                }
+            }
+        });
+    }
+
+    fn finish_rejoin(&self) {
+        {
+            let mut r = self.rejoin.lock();
+            r.active = false;
+            r.unsynced.clear();
+        }
+        self.gate.lock().rejoin_pending.clear();
+        self.engine.metrics.rejoin_active.set(0);
+        tracing::info!("gc_grace rejoin complete");
+    }
+
+    fn complete_rejoin_pid(&self, pid: Pid) {
+        let done = {
+            let mut r = self.rejoin.lock();
+            if !r.active {
+                return;
+            }
+            r.unsynced.remove(&pid);
+            r.scoped && r.unsynced.is_empty()
+        };
+        self.gate.lock().rejoin_pending.remove(&pid);
+        if done {
+            self.finish_rejoin();
         }
     }
 
@@ -1069,7 +1279,7 @@ impl ReplEngine {
                 // with each other and the origin's copy is invisible forever.
                 // The exchange is push-only (no_backfill) so a non-owner
                 // never accumulates partition data it merely offered to.
-                if round % 3 == 0 {
+                if round % 3 == 0 && !self.rejoin.lock().active {
                     let owned_set: std::collections::HashSet<Pid> = owned.iter().copied().collect();
                     for pid in 0..marekvs_core::PARTITIONS as Pid {
                         if owned_set.contains(&pid) {
@@ -1216,13 +1426,20 @@ impl ReplEngine {
                     self.mesh.send_ctl(peer, PeerMsg::MerkleRootMatch { pid });
                 }
             }
-            PeerMsg::MerkleRootMatch { .. } => {
-                // Consumed by the gc_grace rejoin driver (per-pid sync
-                // confirmation); no-op otherwise.
+            PeerMsg::MerkleRootMatch { pid } => {
+                // gc_grace rejoin: this partition is confirmed in sync with
+                // a healthy owner; no-op outside a rejoin.
+                self.complete_rejoin_pid(pid);
             }
             PeerMsg::MerkleBuckets { pid, digests } => {
                 let ours = ae::bucket_digests(&self.store, pid).await;
                 let we_own = self.cluster.owned_pids().contains(&pid);
+                // A rejoining node owns nothing (it is Joining) but WANTS
+                // backfill for the home partitions it is re-syncing.
+                let rejoin_wants = {
+                    let r = self.rejoin.lock();
+                    r.active && r.unsynced.contains(&pid)
+                };
                 for (bucket, (a, b)) in ours.iter().zip(digests.iter()).enumerate() {
                     if a != b {
                         let entries = ae::bucket_entries(&self.store, pid, bucket as u8).await;
@@ -1232,7 +1449,7 @@ impl ReplEngine {
                                 pid,
                                 bucket: bucket as u8,
                                 entries,
-                                no_backfill: !we_own,
+                                no_backfill: !we_own && !rejoin_wants,
                             },
                         );
                     }
@@ -1277,7 +1494,46 @@ impl ReplEngine {
                 ikey_hashes,
             } => {
                 let ops = ae::records_by_hash(&self.store, pid, bucket, &ikey_hashes).await;
-                if !ops.is_empty() {
+                let (rejoin_active, rejoin_home, cutoff) = {
+                    let r = self.rejoin.lock();
+                    (r.active, r.unsynced.contains(&pid), r.cutoff_wall_ms)
+                };
+                if rejoin_active && rejoin_home {
+                    // gc_grace rejoin: records the sync source requests from
+                    // an unsynced home partition are, by construction,
+                    // records ONLY WE hold — written before we died, so
+                    // their delete-tombstones may already be purged
+                    // cluster-wide. Serving them would resurrect deletes;
+                    // drop them instead (Cassandra's down-past-gc_grace
+                    // rule, scoped to exactly what healthy owners lack).
+                    let mut dropped = 0u64;
+                    for op in ops {
+                        let stale = Envelope::decode(&op.value)
+                            .is_some_and(|(e, _)| (e.hlc >> 16) < cutoff);
+                        if stale {
+                            let ik = op.ikey;
+                            self.store
+                                .run(pid, move |ctx| {
+                                    let _g = store::suppress_commit_hook();
+                                    store::del_raw(ctx, &ik);
+                                })
+                                .await;
+                            dropped += 1;
+                        }
+                    }
+                    if dropped > 0 {
+                        self.engine
+                            .metrics
+                            .rejoin_dropped_records_total
+                            .inc_by(dropped);
+                        tracing::info!(pid, dropped, "rejoin: dropped stale extra records");
+                    }
+                } else if rejoin_active && !self.cluster.future_owned_pids().contains(&pid) {
+                    // Non-home stranded data on a >gc_grace rejoiner: refuse
+                    // to serve while rejoining, but do NOT delete — it may
+                    // be the last copy of validly-unshipped writes. (After
+                    // Active, stranded-AE resumes; documented residual.)
+                } else if !ops.is_empty() {
                     self.mesh.send_ctl(peer, PeerMsg::RepairOps { pid, ops });
                 }
             }
@@ -1707,8 +1963,8 @@ mod join_gate_tests {
 
     #[test]
     fn pending_work_holds_the_gate() {
-        assert!(!join_ready(1, 0, true, true, true, true));
-        assert!(!join_ready(0, 1, true, true, true, true));
+        assert!(!join_ready(1, 0, false, true, true, true, true));
+        assert!(!join_ready(0, 1, false, true, true, true, true));
     }
 
     #[test]
@@ -1716,8 +1972,18 @@ mod join_gate_tests {
         // Active others visible but no bootstrap sweep ran against that
         // view yet: the gate must hold (the sweep may still find empty
         // future-owned pids).
-        assert!(!join_ready(0, 0, false, true, true, true));
-        assert!(join_ready(0, 0, true, true, true, true));
+        assert!(!join_ready(0, 0, false, false, true, true, true));
+        assert!(join_ready(0, 0, false, true, true, true, true));
+    }
+
+    #[test]
+    fn unscoped_rejoin_holds_the_gate_with_active_others() {
+        // A gc_grace rejoin whose scope is not yet resolved may still turn
+        // out non-empty — the gate must hold while Active others exist.
+        assert!(!join_ready(0, 0, true, true, true, true, true));
+        // Sole survivor: no Active others → the alone/cold rules apply and
+        // the rejoin driver stands down after the gate passes.
+        assert!(join_ready(0, 0, true, true, false, false, true));
     }
 
     #[test]
@@ -1725,12 +1991,12 @@ mod join_gate_tests {
         // Others exist but nobody is Active: either a cluster cold start
         // (no data anywhere — ready) or gossip lag (state keys not yet
         // delivered — hold). The settle window separates the two.
-        assert!(!join_ready(0, 0, false, false, true, false));
-        assert!(join_ready(0, 0, false, false, true, true));
+        assert!(!join_ready(0, 0, false, false, false, true, false));
+        assert!(join_ready(0, 0, false, false, false, true, true));
     }
 
     #[test]
     fn alone_is_ready_immediately() {
-        assert!(join_ready(0, 0, false, false, false, false));
+        assert!(join_ready(0, 0, false, false, false, false, false));
     }
 }
