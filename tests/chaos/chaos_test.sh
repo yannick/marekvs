@@ -278,8 +278,10 @@ join_empty_reads() {
   done
   chk $((miss > 0)) "no empty reads immediately after join" \
     "$miss empty replies out of 792 sampled (node3 dbsize=$db3 at ready)"
-  chk $((db3 < 1000)) "joiner bootstrapped before Active" \
-    "node3 dbsize=$db3 at first PONG — went Active with an empty store?"
+  # RF=2 over 4 nodes: node 3 homes ~half the 100k keyspace (~50k keys).
+  # The pre-gate code showed dbsize ≈ 3k at first PONG (2 s of bootstrap).
+  chk $((db3 < 20000)) "joiner bootstrapped before Active" \
+    "node3 dbsize=$db3 at first PONG — went Active with a near-empty store?"
   crt rm -f chaos-3 >/dev/null 2>&1 || true
   N=3 check_replication_healed 90
 }
