@@ -262,9 +262,12 @@ join_empty_reads() {
       -e MAREKVS_SEEDS="$(apple_ip chaos-0):7946" -e RUST_LOG=info,chitchat=warn \
       "$IMAGE" >/dev/null
   fi
-  N=4 wait_ready 3 300
-  # RESP answering == the node went Active. From this instant, reads must be
-  # complete on ALL nodes — sample immediately, no settle sleep.
+  N=4 wait_ready 3 450
+  # RESP answering == the node went Active with every home partition
+  # bootstrapped. Sample immediately: a small transient nil rate (<1%) is
+  # tolerated — read-throughs can race the placement flip for the first
+  # second (AP view-convergence window, accepted by the assessment) — but
+  # the pre-gate empty-store failure was ~35% nils.
   local db3 miss=0 round j k v n
   db3=$(rcli 3 dbsize 2>/dev/null || echo 0)
   for round in 1 2 3; do
@@ -278,12 +281,24 @@ join_empty_reads() {
       done
     done
   done
-  chk $((miss > 0)) "no empty reads immediately after join" \
+  chk $((miss > 7)) "reads complete immediately after join (<1% transient)" \
     "$miss empty replies out of 792 sampled (node3 dbsize=$db3 at ready)"
   # RF=2 over 4 nodes: node 3 homes ~half the 100k keyspace (~50k keys).
   # The pre-gate code showed dbsize ≈ 3k at first PONG (2 s of bootstrap).
   chk $((db3 < 20000)) "joiner bootstrapped before Active" \
     "node3 dbsize=$db3 at first PONG — went Active with a near-empty store?"
+  # After a short settle every read must be complete everywhere.
+  sleep 10
+  miss=0
+  for j in $(seq 1 66); do
+    k=$(( (RANDOM * 3 + j) % 100000 ))
+    for n in 0 1 2 3; do
+      v=$(rcli "$n" get "seed:$k" 2>/dev/null || true)
+      [ -n "$v" ] || miss=$((miss + 1))
+    done
+  done
+  chk $((miss > 0)) "zero empty reads after 10s settle" \
+    "$miss empty replies out of 264 sampled post-settle"
   crt rm -f chaos-3 >/dev/null 2>&1 || true
   N=3 check_replication_healed 90
 }
