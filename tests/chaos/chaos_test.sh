@@ -271,7 +271,9 @@ join_empty_reads() {
     for j in $(seq 1 66); do
       k=$(( (RANDOM * 3 + j) % 100000 ))
       for n in 0 1 2 3; do
-        v=$(rcli "$n" get "seed:$k" 2>/dev/null)
+        # `|| true`: one transient connection error must count as a miss,
+        # not abort the whole suite (set -e).
+        v=$(rcli "$n" get "seed:$k" 2>/dev/null || true)
         [ -n "$v" ] || miss=$((miss + 1))
       done
     done
