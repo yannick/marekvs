@@ -4,7 +4,6 @@ description = "Kubernetes operator for marekvs: MarekvsCluster CRD, safe scaling
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
 
 [dependencies]
 kube = { version = "4", features = ["runtime", "derive"] }
