@@ -18,6 +18,7 @@ source tests/chaos/lib.sh
 SCENARIOS=("$@")
 [ ${#SCENARIOS[@]} -gt 0 ] || {
   SCENARIOS=(crash_restart freeze_thaw rolling_churn wipe_replace membership_churn join_empty_reads interest_flood bank)
+  [ "$BACKEND" = docker ] && SCENARIOS+=(disk_guard)
   [ "$BACKEND" = docker ] && SCENARIOS+=(partition_divergence partition_no_resurrect)
 }
 
@@ -318,6 +319,46 @@ interest_flood() {
   sleep 3
   check_set chaos:set
   check_converged "set still converges at cap" 45 scard chaos:set
+}
+
+# ── scenario: disk_guard ─────────────────────────────────────────────────
+# Disk-full is THE unrecoverable LSM failure: ondadb write errors wedge the
+# node mid-compaction. With the guard, filling one node's (tmpfs) data
+# volume must produce a clean MISCONF refusal at the high-water mark while
+# reads keep working, the node stays alive, and REPLICATED writes keep
+# applying (refusing merges would mean divergence — the guard sheds client
+# load only). Thresholds lowered so the 2 s stats poll cannot be outrun.
+disk_guard() {
+  [ "$BACKEND" = docker ] || { echo "  (skipped: tmpfs mount needs the docker backend)"; return 0; }
+  CHAOS_TMPFS="2 134217728" # node 2: 128 MB /data
+  CHAOS_EXTRA_ARGS="-e MAREKVS_DISK_HIGH_WATER_PCT=60 -e MAREKVS_DISK_LOW_WATER_PCT=50"
+  fresh_cluster
+  CHAOS_TMPFS=""
+  CHAOS_EXTRA_ARGS=""
+  local payload i out misconf=0 writes=0
+  payload=$(printf 'x%.0s' $(seq 1 100000)) # 100 KB
+  echo "  filling node 2's 128 MB volume with 100 KB values"
+  for i in $(seq 1 1200); do
+    out=$(rcli 2 set "disk:k$i" "$payload" 2>&1) || true
+    writes=$i
+    case "$out" in *MISCONF*) misconf=1; break ;; esac
+  done
+  chk $((1 - misconf)) "clean MISCONF refusal at high-water" \
+    "no MISCONF after $writes x 100KB writes (node wedged or guard absent?)"
+  chk $([ "$(rcli 2 ping 2>/dev/null)" = "PONG" ]; echo $?) "node 2 still alive after fill"
+  chk $([ "$(rcli 2 strlen disk:k1 2>/dev/null)" = "100000" ]; echo $?) \
+    "reads still served under write-stop"
+  local stopped; stopped=$(metric_value 2 marekvs_disk_write_stopped)
+  chk $([ "${stopped:-0}" = "1" ]; echo $?) "marekvs_disk_write_stopped gauge = 1" \
+    "gauge=${stopped:-absent}"
+  # Peer replication must keep applying on the stopped node.
+  local a0 a1
+  a0=$(metric_value 2 marekvs_repl_ops_applied_total); a0=${a0:-0}
+  for i in $(seq 1 30); do rcli 0 set "probe:$i" v$i >/dev/null 2>&1 || true; done
+  sleep 3
+  a1=$(metric_value 2 marekvs_repl_ops_applied_total); a1=${a1:-0}
+  chk $((a1 <= a0)) "replication still applies onto the write-stopped node" \
+    "repl_ops_applied_total $a0 -> $a1 after 30 writes via node 0"
 }
 
 # ── scenario: bank ───────────────────────────────────────────────────────

@@ -144,8 +144,34 @@ pub struct Store {
     pub meta: Arc<ColumnFamily>,
     pub hlc: Arc<Hlc>,
     pub node_id: NodeId,
+    /// Data directory, kept for filesystem usage stats (disk-full guard).
+    pub data_dir: std::path::PathBuf,
     shards: Vec<Sender<Job>>,
     shard_handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+/// (total_bytes, available_bytes) of the filesystem holding `path`, via
+/// statvfs. `None` on failure or non-unix. Available = f_bavail (space left
+/// for unprivileged writers — the number that matters before ENOSPC).
+#[cfg(unix)]
+pub fn fs_usage(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    let frsize = if st.f_frsize > 0 {
+        st.f_frsize as u64
+    } else {
+        st.f_bsize as u64
+    };
+    Some((st.f_blocks as u64 * frsize, st.f_bavail as u64 * frsize))
+}
+
+#[cfg(not(unix))]
+pub fn fs_usage(_path: &std::path::Path) -> Option<(u64, u64)> {
+    None
 }
 
 impl Drop for Store {
@@ -208,6 +234,7 @@ impl Store {
             meta,
             hlc,
             node_id: cfg.node_id,
+            data_dir: std::path::PathBuf::from(&cfg.data_dir),
             shards,
             shard_handles,
         }))

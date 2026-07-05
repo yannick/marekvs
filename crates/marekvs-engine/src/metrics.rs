@@ -65,6 +65,12 @@ pub struct Metrics {
     pub cluster_effective_rf_min: IntGauge,
     pub cluster_owned_partitions: IntGauge,
 
+    // --- disk (repl stats task; also the operator disk-autoscale signal) ---
+    pub disk_total_bytes: IntGauge,
+    pub disk_avail_bytes: IntGauge,
+    pub db_total_bytes: IntGauge,
+    pub disk_write_stopped: IntGauge,
+
     // --- process ---
     pub uptime_seconds: IntGauge,
     pub info: IntGaugeVec, // {version, node_id} = 1
@@ -293,6 +299,27 @@ impl Metrics {
                 registry,
                 "marekvs_cluster_owned_partitions",
                 "Partitions this node homes"
+            ),
+
+            disk_total_bytes: gauge!(
+                registry,
+                "marekvs_disk_total_bytes",
+                "Size of the filesystem holding the data directory"
+            ),
+            disk_avail_bytes: gauge!(
+                registry,
+                "marekvs_disk_avail_bytes",
+                "Available bytes on the filesystem holding the data directory"
+            ),
+            db_total_bytes: gauge!(
+                registry,
+                "marekvs_db_total_bytes",
+                "On-disk SSTable bytes reported by the storage engine"
+            ),
+            disk_write_stopped: gauge!(
+                registry,
+                "marekvs_disk_write_stopped",
+                "1 while client write commands are refused (disk above high-water)"
             ),
 
             uptime_seconds: gauge!(registry, "marekvs_uptime_seconds", "Process uptime"),

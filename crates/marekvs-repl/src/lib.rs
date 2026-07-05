@@ -201,6 +201,24 @@ fn join_ready(
     true
 }
 
+/// Disk write-stop thresholds: (high, low) used-percent, with hysteresis so
+/// the guard cannot flap at the boundary. `low` is clamped below `high`.
+fn disk_water_marks() -> (u8, u8) {
+    static V: OnceLock<(u8, u8)> = OnceLock::new();
+    *V.get_or_init(|| {
+        let pct = |name: &str, default: u8| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<u8>().ok())
+                .filter(|&v| v > 0 && v <= 100)
+                .unwrap_or(default)
+        };
+        let high = pct("MAREKVS_DISK_HIGH_WATER_PCT", 90);
+        let low = pct("MAREKVS_DISK_LOW_WATER_PCT", 85).min(high.saturating_sub(1));
+        (high, low)
+    })
+}
+
 /// Per-peer unacked send window (bytes). Design/05 defaults table: 4 MiB.
 fn repl_window_bytes() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
@@ -460,9 +478,11 @@ impl ReplEngine {
 
     fn spawn_stats(self: Arc<Self>) {
         tokio::spawn(async move {
+            let mut fs_warned = false;
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let m = &self.engine.metrics;
+                self.update_disk_guard(&mut fs_warned);
                 let (ops, bytes) = self.ring.occupancy();
                 m.ring_ops.set(ops as i64);
                 m.ring_bytes.set(bytes as i64);
@@ -490,6 +510,58 @@ impl ReplEngine {
                     .set(self.cluster.owned_pids().len() as i64);
             }
         });
+    }
+
+    /// Disk gauges + write-stop hysteresis (design item #6): stop client
+    /// writes at MAREKVS_DISK_HIGH_WATER_PCT used, resume at
+    /// MAREKVS_DISK_LOW_WATER_PCT — disk-full is THE unrecoverable LSM
+    /// failure (ondadb write errors wedge the node mid-compaction), so it
+    /// must become a clean MISCONF error instead. Replication/AE keep
+    /// applying (refusing merges = divergence); statvfs failure fails OPEN
+    /// with one log line — the gauges going absent is the alert.
+    fn update_disk_guard(&self, fs_warned: &mut bool) {
+        let m = &self.engine.metrics;
+        m.db_total_bytes
+            .set(self.store.db.stats().total_bytes as i64);
+        let Some((total, avail)) = store::fs_usage(&self.store.data_dir) else {
+            if !*fs_warned {
+                *fs_warned = true;
+                tracing::warn!(dir = %self.store.data_dir.display(), "statvfs failed; disk guard inactive");
+            }
+            return;
+        };
+        m.disk_total_bytes.set(total as i64);
+        m.disk_avail_bytes.set(avail as i64);
+        if total == 0 {
+            return;
+        }
+        let used_pct = ((total - avail.min(total)) * 100 / total) as u8;
+        let stopped = self
+            .engine
+            .write_stopped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let (high, low) = disk_water_marks();
+        if !stopped && used_pct >= high {
+            self.engine
+                .write_stopped
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            m.disk_write_stopped.set(1);
+            tracing::error!(
+                used_pct,
+                high,
+                "disk above high-water mark: refusing client write commands"
+            );
+        } else if stopped && used_pct <= low {
+            self.engine
+                .write_stopped
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            m.disk_write_stopped.set(0);
+            tracing::info!(
+                used_pct,
+                low,
+                "disk back below low-water mark: accepting writes"
+            );
+        }
     }
 
     fn req_id(&self) -> u64 {

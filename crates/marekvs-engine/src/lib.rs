@@ -63,6 +63,10 @@ pub struct Session {
     /// MULTI queue (v1.1): Some = transaction open; the bool flags a queueing
     /// error (EXEC must abort).
     pub multi: Option<(Vec<Vec<Vec<u8>>>, bool)>,
+    /// Internal apply path (REPLICAOF upstream writes): exempt from client
+    /// guards like the disk write-stop — refusing applies would silently
+    /// diverge a follower, and convergent merges are how the node heals.
+    pub internal: bool,
 }
 
 impl Session {
@@ -77,6 +81,7 @@ impl Session {
             authenticated: true,
             should_close: false,
             multi: None,
+            internal: false,
         }
     }
 
@@ -113,6 +118,13 @@ pub struct Engine {
     /// Live client-connection count (INFO connected_clients), maintained by
     /// the server's connection loop.
     pub clients: std::sync::atomic::AtomicI64,
+    /// Disk high-water write stop (design item: disk-full is THE
+    /// unrecoverable LSM failure — ondadb write errors wedge the node
+    /// mid-compaction). Set/cleared with hysteresis by the stats task;
+    /// checked in cmd::dispatch for client write commands only — peer
+    /// replication, AE and bootstrap apply via `apply_op_from` (bypasses
+    /// dispatch) and REPLICAOF applies with `Session.internal`.
+    pub write_stopped: std::sync::atomic::AtomicBool,
     /// Stable per-boot run id (40 hex chars, Redis convention).
     pub run_id: String,
     /// Prometheus registry + handles (design/07 §Observability).
@@ -152,6 +164,7 @@ impl Engine {
             started_at_ms: store::now_ms(),
             cluster_info: parking_lot::RwLock::new(None),
             replicaof: parking_lot::RwLock::new(None),
+            write_stopped: std::sync::atomic::AtomicBool::new(false),
             tcp_port: std::sync::atomic::AtomicU16::new(6379),
             clients: std::sync::atomic::AtomicI64::new(0),
             metrics,
@@ -197,6 +210,90 @@ impl Engine {
         if let Some(rt) = rt {
             rt.fetch(userkey).await;
         }
+    }
+
+    /// Commands refused while the disk write-stop is engaged. ALL mutating
+    /// commands, deliberately including DEL/UNLINK/EXPIRE/FLUSHALL: LSM
+    /// deletes write tombstones and GROW disk until compaction reclaims —
+    /// the escape hatch at high-water is operator action (grow the volume),
+    /// not more writes. EVAL/EVALSHA may write (Redis blocks them under OOM
+    /// for the same reason).
+    pub fn is_write_command(name: &str) -> bool {
+        matches!(
+            name,
+            "SET"
+                | "SETNX"
+                | "SETEX"
+                | "PSETEX"
+                | "GETSET"
+                | "GETDEL"
+                | "GETEX"
+                | "APPEND"
+                | "INCR"
+                | "DECR"
+                | "INCRBY"
+                | "DECRBY"
+                | "INCRBYFLOAT"
+                | "MSET"
+                | "MSETNX"
+                | "SETRANGE"
+                | "DEL"
+                | "UNLINK"
+                | "FLUSHALL"
+                | "FLUSHDB"
+                | "EXPIRE"
+                | "PEXPIRE"
+                | "EXPIREAT"
+                | "PEXPIREAT"
+                | "EXPIREMEMBER"
+                | "EXPIREMEMBERAT"
+                | "PEXPIREMEMBERAT"
+                | "PERSIST"
+                | "RENAME"
+                | "RENAMENX"
+                | "HSET"
+                | "HSETNX"
+                | "HMSET"
+                | "HDEL"
+                | "HINCRBY"
+                | "HINCRBYFLOAT"
+                | "SADD"
+                | "SREM"
+                | "SPOP"
+                | "SMOVE"
+                | "SUNIONSTORE"
+                | "SINTERSTORE"
+                | "SDIFFSTORE"
+                | "ZADD"
+                | "ZINCRBY"
+                | "ZREM"
+                | "ZPOPMIN"
+                | "ZPOPMAX"
+                | "ZREMRANGEBYSCORE"
+                | "LPUSH"
+                | "RPUSH"
+                | "LPUSHX"
+                | "RPUSHX"
+                | "LPOP"
+                | "RPOP"
+                | "LSET"
+                | "LREM"
+                | "LTRIM"
+                | "LINSERT"
+                | "LMOVE"
+                | "RPOPLPUSH"
+                | "BLPOP"
+                | "BRPOP"
+                | "BLMOVE"
+                | "BRPOPLPUSH"
+                | "XADD"
+                | "XDEL"
+                | "XTRIM"
+                | "PFADD"
+                | "PFMERGE"
+                | "EVAL"
+                | "EVALSHA"
+        )
     }
 
     /// Whether a command is safe for concurrent pipeline dispatch: pure data
@@ -423,5 +520,75 @@ impl Engine {
         self.metrics
             .observe_command(&name, start.elapsed().as_secs_f64(), errored);
         reply.write(out);
+    }
+}
+
+#[cfg(test)]
+mod write_command_tests {
+    use super::Engine;
+
+    #[test]
+    fn writes_are_classified() {
+        for c in [
+            "SET",
+            "DEL",
+            "UNLINK",
+            "FLUSHALL",
+            "EXPIRE",
+            "SADD",
+            "SPOP",
+            "HSET",
+            "HINCRBY",
+            "ZADD",
+            "ZPOPMIN",
+            "LPUSH",
+            "RPOPLPUSH",
+            "BLPOP",
+            "XADD",
+            "XTRIM",
+            "PFADD",
+            "PFMERGE",
+            "EVAL",
+            "EVALSHA",
+            "INCRBYFLOAT",
+            "GETDEL",
+            "GETEX",
+            "RENAME",
+            "MSETNX",
+        ] {
+            assert!(Engine::is_write_command(c), "{c} must be write-gated");
+        }
+    }
+
+    #[test]
+    fn reads_and_admin_pass() {
+        for c in [
+            "GET",
+            "MGET",
+            "EXISTS",
+            "TTL",
+            "SCAN",
+            "KEYS",
+            "SMEMBERS",
+            "HGETALL",
+            "ZRANGE",
+            "LRANGE",
+            "XRANGE",
+            "PFCOUNT",
+            "INFO",
+            "CONFIG",
+            "PING",
+            "AUTH",
+            "SUBSCRIBE",
+            "PUBLISH",
+            "DBSIZE",
+            "SCRIPT",
+            "COMMAND",
+            "CLIENT",
+            "SHUTDOWN",
+            "REPLICAOF",
+        ] {
+            assert!(!Engine::is_write_command(c), "{c} must not be write-gated");
+        }
     }
 }

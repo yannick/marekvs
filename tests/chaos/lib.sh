@@ -102,6 +102,9 @@ seeds() {
 # tunables: CHAOS_EXTRA_ARGS="-e MAREKVS_GC_GRACE_SECS=20". Scenarios that
 # set it must reset it (fresh_cluster keeps whatever is exported).
 CHAOS_EXTRA_ARGS=${CHAOS_EXTRA_ARGS:-}
+# "<i> <bytes>": mount a tmpfs of that size as node i's /data (docker only) —
+# the disk-full fault for the write-stop guard scenario.
+CHAOS_TMPFS=${CHAOS_TMPFS:-}
 
 node_run() { # <i> — create + start node i
   local i=$1
@@ -111,6 +114,11 @@ node_run() { # <i> — create + start node i
   if [ "$BACKEND" = docker ]; then
     local caps=()
     [ "$CHAOS_DEBUG" = 1 ] && caps=(--cap-add NET_ADMIN --cap-add SYS_TIME)
+    if [ -n "$CHAOS_TMPFS" ]; then
+      local ti tsz
+      read -r ti tsz <<<"$CHAOS_TMPFS"
+      [ "$ti" = "$i" ] && extra+=(--mount "type=tmpfs,destination=/data,tmpfs-size=$tsz")
+    fi
     docker run -d --name "chaos-$i" "${caps[@]}" "${extra[@]}" \
       --network "$EDGE_NET" --ip "$(edge_ip "$i")" \
       -p "$(resp_port "$i"):6379" -p "$(metrics_port "$i"):9121" \
