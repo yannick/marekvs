@@ -21,9 +21,13 @@ covers restarts and brief blips at near-zero cost, and is exact (no digests).
 Per owned partition: a 2-level digest.
 
 - **256 leaf buckets**: `bucket = xxh3_64(ikey) & 0xFF`.
-- **Bucket digest** = xxh3 over the sorted `(ikey, hlc)` stream of the bucket.
-  Only key + version are digested — value bytes don't matter; version equality
-  implies value equality (envelopes are written once at origin).
+- **Bucket digest** = XOR-fold of `xxh3(ikey ‖ hlc ‖ value_hash)` over the
+  bucket's records — commutative, so no sorting needed. Digests are
+  **content-aware** (`value_hash = xxh3(stored bytes)`), not just
+  version-aware: merged CRDT records (PN counters, HLL) can hold *different*
+  slot sets under the *same* envelope version (symmetric max), so an
+  `(ikey, hlc)`-only digest calls two divergent replicas identical and
+  repair never fires (chaos clock-skew finding, design/10).
 - **Root** = xxh3 over the 256 bucket digests.
 
 Buckets are **dirty-marked** by the commit hook (a bit set, nothing else) and
@@ -42,8 +46,8 @@ for each owned pid this round:
     → MerkleRoot{pid, root}
     if roots differ:
         ← MerkleBuckets{pid, [256 × u64]}
-        → per differing bucket: BucketKeys{pid, bucket, [(ikey_hash, hlc)]}
-        ↔ push/pull ReplOps for keys whose hlc differs or that are missing
+        → per differing bucket: BucketKeys{pid, bucket, [(ikey_hash, hlc, value_hash)]}
+        ↔ push/pull ReplOps for keys whose hlc or content differs or that are missing
 ```
 
 Runs on the `bulk` connection, lz4-framed. Steady-state cost: one 12-byte root
@@ -137,29 +141,59 @@ with the tombstone flag (and, for element removes, observed dots). GC:
 <a name="defaults-table"></a>
 Single source of truth — other documents reference, never restate, these.
 
-| Parameter | Default | Notes |
-|---|---|---|
-| replicas N | 3 | per-key homes; also the minimum node floor |
-| partitions P | 4096 | fixed at cluster creation; u16 prefix, 12 bits used |
-| gossip interval | 500 ms | chitchat |
-| failure detection | ~5 s | phi-accrual (chitchat defaults) |
-| ae_round | 5 s | ±20 % jitter |
-| ae_partitions_per_round | max(512, owned/2) | keeps rotation ≤ 2 rounds |
-| **published staleness bound** | **15 s worst / ms typical** | derivation above |
-| merkle buckets / partition | 256 | dirty-marked, scan-on-sync |
-| interest_lease | 60 s | connection-scoped |
-| interest renew interval | 15 s | batched, only actually-read keys |
-| peer heartbeat / timeout | 1 s / 3 s | ctl connection, application-level |
-| interest_escalate | 4096 keys/partition | → whole-partition subscription |
-| interest_max_entries | 1,000,000 | ~120 MB, LRU-evict |
-| replication ring | 128 MiB / 262,144 ops | overrun → dirty-pair + AE |
-| repl batch | 256 ops / 256 KiB / 2 ms linger | |
-| per-peer unacked window | 4 MiB | |
-| gc_grace | 1 h | down longer ⇒ pull-only until synced |
-| ttl_skew_grace | 5 s | |
-| max_clock_drift | 5 s | clamp + log |
-| repair_delay | 30 s + jitter | absorbs quick pod restarts |
-| bootstrap concurrency / rate | 8 streams / 64 MiB/s | lz4, per node each direction |
-| cold_purge_delay | 15 m | after losing ownership |
-| terminationGracePeriodSeconds | 300 | pod spec |
-| ondaDB sync_mode | Interval 128 ms | durability window per node |
+**Where set** says what changing the value takes: `env VAR` = startup
+environment variable (restart to change), `const (crate)` = compile-time
+constant (rebuild to change), `manifest` = the k8s pod spec, `design` = a
+design target **not yet implemented** (the Notes column says what the code
+does instead). **Runtime** = adjustable on a live node without a restart.
+
+`CONFIG SET` is *accepted and ignored* (Redis-client compat; config is
+env-driven). The only knob changeable at runtime is the upstream master via
+the `REPLICAOF`/`SLAVEOF` command.
+
+| Parameter | Default | Where set | Runtime | Notes |
+|---|---|---|---|---|
+| replicas N | 3 | env `MAREKVS_REPLICAS_N` | no | per-key homes; also the minimum node floor; must match cluster-wide |
+| partitions P | 4096 | const (marekvs-core `PARTITIONS`) | no | fixed at cluster creation; u16 prefix, 12 bits used |
+| shard threads | cores − 2, min 2 | env `MAREKVS_SHARDS` | no | storage/execution threads per node |
+| gossip interval | 500 ms | const (marekvs-server) | no | chitchat |
+| failure detection | ~5 s | chitchat defaults | no | phi-accrual |
+| gossip dead-node grace | 1 h | const (marekvs-cluster) | no | chitchat `marked_for_deletion_grace_period` |
+| ae_round | 5 s + 0–2 s jitter | const (marekvs-repl `AE_ROUND`) | no | jitter is uniform 0–2 s, not ±20 % |
+| ae_partitions_per_round | all owned pids | design | — | per-round cap (max(512, owned/2)) unimplemented; every round walks all owned pids, so the ≤ 2-round rotation bound holds trivially |
+| stranded-record AE | every 3rd round | const (marekvs-repl) | no | push-only roots for non-owned pids with local data (chaos finding, design/10) |
+| **published staleness bound** | **15 s worst / ms typical** | derived | — | derivation above |
+| merkle buckets / partition | 256 | const (marekvs-repl `BUCKETS`) | no | content-aware digests: (ikey, hlc, value_hash) |
+| interest_lease | 60 s | const (marekvs-repl `INTEREST_LEASE`) | no | connection-scoped |
+| interest renew interval | — | design (15 s) | — | `InterestRenew` msg exists and is handled but never sent; leases refresh by re-fetch on expiry |
+| read-through fetch timeout | 300 ms | const (marekvs-repl `FETCH_TIMEOUT`) | no | miss → serve local/empty, AE reconciles |
+| peer heartbeat / timeout | — | design (1 s / 3 s) | — | not implemented; peer liveness = TCP disconnect + gossip failure detection |
+| interest_escalate | — | design (4096 keys/pid) | — | whole-partition escalation unimplemented |
+| interest_max_entries | — | design (1,000,000) | — | no cap/LRU on the interest map; expired entries GC'd each AE round |
+| replication ring | 128 MiB / 262,144 ops | const (marekvs-repl `RING_MAX_*`) | no | overrun → ring gap warning + AE backstop |
+| repl batch | 256 ops / pump on notify or 50 ms tick | const (marekvs-repl `BATCH_MAX_OPS`) | no | design byte cap (256 KiB) + 2 ms linger unimplemented |
+| per-peer unacked window | — | design (4 MiB) | — | `AckSeq` is received and ignored; no send-window flow control |
+| ring high-water persist | 1 s | const (marekvs-repl) | no | restart resumes seq space +1,000,000 above persisted HW |
+| mesh writer queue | 4096 msgs | const (marekvs-repl) | no | per-peer, per-lane |
+| mesh reconnect backoff | 100 ms → 5 s | const (marekvs-repl) | no | exponential |
+| gc_grace | 1 h | const (marekvs-engine `GC_GRACE`) | no | tombstone TTL; the pull-only-until-synced rejoin rule is **not yet enforced** |
+| ttl_skew_grace | — | design (5 s) | — | expiry is materialized by the sweep as an ordinary tombstone write; digest-exclusion grace unimplemented |
+| expiry sweep budget | 128 records | const (marekvs-engine) | no | incremental cursor walk between shard jobs |
+| max_clock_drift | 5 s | const (marekvs-core `MAX_CLOCK_DRIFT_MS`) | no | remote HLC clamp + loud log |
+| repair_delay | — | design (30 s + jitter) | — | unimplemented; AE repairs fire on the next round |
+| bootstrap chunking | 256 ops/chunk, sequential | const (marekvs-repl) | no | lz4 bulk lane; design 8 streams / 64 MiB/s rate cap unimplemented |
+| cold_purge_delay | — | design (15 m) | — | unimplemented; data kept after losing ownership (feeds stranded-record AE) |
+| terminationGracePeriodSeconds | 60 | manifest (k8s/statefulset.yaml) | k8s edit | drain typically completes in ~3 s |
+| listen addresses | :6379 / :7373 / :7946 / :9121 | env `MAREKVS_{RESP,MESH,GOSSIP,METRICS}_ADDR` | no | RESP / mesh / gossip(UDP) / metrics+probes |
+| node identity | hostname ordinal, else 0 | env `MAREKVS_NODE_ID` | no | `marekvs-3` → 3; StatefulSet needs no per-pod config |
+| data dir | `.data/n0` | env `MAREKVS_DATA_DIR` | no | |
+| seeds | empty | env `MAREKVS_SEEDS` | no | chitchat re-resolves DNS names continuously |
+| advertise IP | 127.0.0.1 | env `MAREKVS_ADVERTISE_IP` | no | `auto` = self-detect the pod IP |
+| cluster name | `marekvs` | env `MAREKVS_CLUSTER` | no | gossip cluster isolation |
+| requirepass | off | env `MAREKVS_REQUIREPASS` | no | `CONFIG SET requirepass` is ignored like all CONFIG SET |
+| upstream Redis master | none | env `MAREKVS_REPLICAOF` | **yes** — `REPLICAOF`/`SLAVEOF` cmd | live-migration ingest (design/03); node stays writable |
+| script time limit | 20 ms | env `MAREKVS_SCRIPT_TIME_LIMIT_MS` | no | read per EVAL, but the process env is fixed at exec |
+| Lua allocator limit | 16 MiB | const (marekvs-engine) | no | per script VM |
+| blocking-list poll | 50 ms | const (marekvs-engine `POLL_MS`) | no | BLPOP/BRPOP wakeup granularity |
+| ondaDB sync_mode | Interval, 128 ms | ondadb default | no | durability window per node |
+| log level | `info` | env `RUST_LOG` | no | |
