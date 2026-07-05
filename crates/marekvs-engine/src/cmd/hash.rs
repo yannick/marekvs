@@ -12,7 +12,9 @@ use crate::store::{
 use crate::Engine;
 use marekvs_core::envelope::{head, Envelope, RecordType};
 use marekvs_core::ikey;
-use marekvs_core::merge::{element_add, element_dots, element_remove, element_value};
+use marekvs_core::merge::{
+    element_add, element_add_ttl, element_dots, element_remove, element_value,
+};
 
 pub(crate) fn hash_del_hlc(ctx: &ShardCtx, key: &[u8]) -> Result<u64, ()> {
     check_type(ctx, key, head::CTYPE_HASH)
@@ -49,6 +51,17 @@ fn read_element_checked(ctx: &ShardCtx, key: &[u8], field: &[u8], del: u64) -> O
 
 fn write_field(ctx: &ShardCtx, key: &[u8], field: &[u8], value: &[u8]) {
     let rec = element_add(RecordType::HashField, ctx.hlc.now(), ctx.node_id, value);
+    write_merged(ctx, &ikey::hash_field_key(key, field), &rec);
+}
+
+fn write_field_ttl(ctx: &ShardCtx, key: &[u8], field: &[u8], value: &[u8], ttl: u64) {
+    let rec = element_add_ttl(
+        RecordType::HashField,
+        ctx.hlc.now(),
+        ctx.node_id,
+        value,
+        ttl,
+    );
     write_merged(ctx, &ikey::hash_field_key(key, field), &rec);
 }
 
@@ -205,6 +218,422 @@ pub async fn hdel(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
                 }
             }
             Reply::Int(n)
+        })
+        .await
+}
+
+#[derive(Clone, Copy)]
+enum ExpireCond {
+    None,
+    Nx,
+    Xx,
+    Gt,
+    Lt,
+}
+
+#[derive(Clone, Copy)]
+enum HashExpireMode {
+    Deadline(u64),
+    Persist,
+    KeepTtl,
+    None,
+}
+
+fn read_field_env(
+    ctx: &ShardCtx,
+    key: &[u8],
+    field: &[u8],
+    del: u64,
+) -> Option<(Envelope, Vec<u8>)> {
+    let raw = get_raw(ctx, &ikey::hash_field_key(key, field))?;
+    let (env, pay) = Envelope::decode(&raw)?;
+    visible(&env, pay, del, now_ms())?;
+    let value = element_value(pay)?;
+    Some((env, value))
+}
+
+fn ttl_condition_passes(current: u64, new_deadline: u64, cond: ExpireCond) -> bool {
+    match cond {
+        ExpireCond::None => true,
+        ExpireCond::Nx => current == 0,
+        ExpireCond::Xx => current != 0,
+        // Redis treats a non-volatile item as infinite TTL for GT/LT.
+        ExpireCond::Gt => current != 0 && new_deadline > current,
+        ExpireCond::Lt => current == 0 || new_deadline < current,
+    }
+}
+
+fn set_field_deadline(
+    ctx: &ShardCtx,
+    key: &[u8],
+    field: &[u8],
+    del: u64,
+    deadline: u64,
+    cond: ExpireCond,
+) -> i64 {
+    let Some((env, value)) = read_field_env(ctx, key, field, del) else {
+        return -2;
+    };
+    if !ttl_condition_passes(env.ttl_deadline_ms, deadline, cond) {
+        return 0;
+    }
+    if deadline != 0 && deadline <= now_ms() {
+        if remove_field(ctx, key, field, del) {
+            return 2;
+        }
+        return -2;
+    }
+    write_field_ttl(ctx, key, field, &value, deadline);
+    1
+}
+
+fn field_ttl_status(ctx: &ShardCtx, key: &[u8], field: &[u8], del: u64, millis: bool) -> i64 {
+    let Some((env, _)) = read_field_env(ctx, key, field, del) else {
+        return -2;
+    };
+    if env.ttl_deadline_ms == 0 {
+        return -1;
+    }
+    let remain = env.ttl_deadline_ms.saturating_sub(now_ms());
+    if millis {
+        remain as i64
+    } else {
+        (remain / 1000) as i64
+    }
+}
+
+fn field_expiretime_status(
+    ctx: &ShardCtx,
+    key: &[u8],
+    field: &[u8],
+    del: u64,
+    millis: bool,
+) -> i64 {
+    let Some((env, _)) = read_field_env(ctx, key, field, del) else {
+        return -2;
+    };
+    if env.ttl_deadline_ms == 0 {
+        -1
+    } else if millis {
+        env.ttl_deadline_ms as i64
+    } else {
+        (env.ttl_deadline_ms / 1000) as i64
+    }
+}
+
+fn parse_fields_block(args: &[Vec<u8>], i: usize) -> Result<Vec<Vec<u8>>, Reply> {
+    if args.get(i).is_none_or(|a| !eq_ignore_case(a, "FIELDS")) {
+        return Err(Reply::syntax());
+    }
+    let Some(n) = args.get(i + 1).and_then(|b| parse_u64(b)) else {
+        return Err(Reply::not_int());
+    };
+    let n = n as usize;
+    if n == 0 || args.len() != i + 2 + n {
+        return Err(Reply::syntax());
+    }
+    Ok(args[i + 2..].to_vec())
+}
+
+fn deadline_from(n: i64, mult: u64, absolute: bool) -> u64 {
+    if absolute {
+        (n.max(0) as u64) * mult
+    } else if n <= 0 {
+        1
+    } else {
+        now_ms() + n as u64 * mult
+    }
+}
+
+pub async fn hexpire(engine: &Arc<Engine>, args: &[Vec<u8>], mult: u64, absolute: bool) -> Reply {
+    if args.len() < 5 {
+        return Reply::wrong_args("hexpire");
+    }
+    let Some(n) = parse_i64(&args[2]) else {
+        return Reply::not_int();
+    };
+    let mut cond = ExpireCond::None;
+    let mut i = 3;
+    if args.get(i).is_some_and(|a| {
+        eq_ignore_case(a, "NX")
+            || eq_ignore_case(a, "XX")
+            || eq_ignore_case(a, "GT")
+            || eq_ignore_case(a, "LT")
+    }) {
+        cond = if eq_ignore_case(&args[i], "NX") {
+            ExpireCond::Nx
+        } else if eq_ignore_case(&args[i], "XX") {
+            ExpireCond::Xx
+        } else if eq_ignore_case(&args[i], "GT") {
+            ExpireCond::Gt
+        } else {
+            ExpireCond::Lt
+        };
+        i += 1;
+    }
+    let fields = match parse_fields_block(args, i) {
+        Ok(f) => f,
+        Err(r) => return r,
+    };
+    let key = args[1].clone();
+    let deadline = deadline_from(n, mult, absolute);
+    engine
+        .store
+        .run_key(&args[1], move |ctx| {
+            let Ok(del) = hash_del_hlc(ctx, &key) else {
+                return Reply::wrongtype();
+            };
+            Reply::Array(
+                fields
+                    .iter()
+                    .map(|f| Reply::Int(set_field_deadline(ctx, &key, f, del, deadline, cond)))
+                    .collect(),
+            )
+        })
+        .await
+}
+
+pub async fn httl(engine: &Arc<Engine>, args: &[Vec<u8>], millis: bool, expiretime: bool) -> Reply {
+    if args.len() < 4 {
+        return Reply::wrong_args("httl");
+    }
+    let fields = match parse_fields_block(args, 2) {
+        Ok(f) => f,
+        Err(r) => return r,
+    };
+    let key = args[1].clone();
+    engine.ensure_local(&key).await;
+    engine
+        .store
+        .run_key(&args[1], move |ctx| {
+            let Ok(del) = hash_del_hlc(ctx, &key) else {
+                return Reply::wrongtype();
+            };
+            Reply::Array(
+                fields
+                    .iter()
+                    .map(|f| {
+                        Reply::Int(if expiretime {
+                            field_expiretime_status(ctx, &key, f, del, millis)
+                        } else {
+                            field_ttl_status(ctx, &key, f, del, millis)
+                        })
+                    })
+                    .collect(),
+            )
+        })
+        .await
+}
+
+pub async fn hpersist(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 4 {
+        return Reply::wrong_args("hpersist");
+    }
+    let fields = match parse_fields_block(args, 2) {
+        Ok(f) => f,
+        Err(r) => return r,
+    };
+    let key = args[1].clone();
+    engine
+        .store
+        .run_key(&args[1], move |ctx| {
+            let Ok(del) = hash_del_hlc(ctx, &key) else {
+                return Reply::wrongtype();
+            };
+            Reply::Array(
+                fields
+                    .iter()
+                    .map(|f| {
+                        let Some((env, _)) = read_field_env(ctx, &key, f, del) else {
+                            return Reply::Int(-2);
+                        };
+                        if env.ttl_deadline_ms == 0 {
+                            Reply::Int(-1)
+                        } else {
+                            Reply::Int(set_field_deadline(ctx, &key, f, del, 0, ExpireCond::None))
+                        }
+                    })
+                    .collect(),
+            )
+        })
+        .await
+}
+
+pub async fn hgetdel(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 4 {
+        return Reply::wrong_args("hgetdel");
+    }
+    let fields = match parse_fields_block(args, 2) {
+        Ok(f) => f,
+        Err(r) => return r,
+    };
+    let key = args[1].clone();
+    engine
+        .store
+        .run_key(&args[1], move |ctx| {
+            let Ok(del) = hash_del_hlc(ctx, &key) else {
+                return Reply::wrongtype();
+            };
+            Reply::Array(
+                fields
+                    .iter()
+                    .map(|f| {
+                        let val = read_element_checked(ctx, &key, f, del)
+                            .map(Reply::Bulk)
+                            .unwrap_or(Reply::Null);
+                        remove_field(ctx, &key, f, del);
+                        val
+                    })
+                    .collect(),
+            )
+        })
+        .await
+}
+
+fn parse_hash_expiration(
+    args: &[Vec<u8>],
+    i: &mut usize,
+    allow_persist: bool,
+    allow_keepttl: bool,
+) -> Result<HashExpireMode, Reply> {
+    if *i >= args.len() {
+        return Ok(HashExpireMode::None);
+    }
+    if allow_persist && eq_ignore_case(&args[*i], "PERSIST") {
+        *i += 1;
+        return Ok(HashExpireMode::Persist);
+    }
+    if allow_keepttl && eq_ignore_case(&args[*i], "KEEPTTL") {
+        *i += 1;
+        return Ok(HashExpireMode::KeepTtl);
+    }
+    let (mult, absolute) = if eq_ignore_case(&args[*i], "EX") {
+        (1000, false)
+    } else if eq_ignore_case(&args[*i], "PX") {
+        (1, false)
+    } else if eq_ignore_case(&args[*i], "EXAT") {
+        (1000, true)
+    } else if eq_ignore_case(&args[*i], "PXAT") {
+        (1, true)
+    } else {
+        return Ok(HashExpireMode::None);
+    };
+    let Some(n) = args.get(*i + 1).and_then(|b| parse_i64(b)) else {
+        return Err(Reply::not_int());
+    };
+    *i += 2;
+    Ok(HashExpireMode::Deadline(deadline_from(n, mult, absolute)))
+}
+
+pub async fn hgetex(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 4 {
+        return Reply::wrong_args("hgetex");
+    }
+    let mut i = 2;
+    let mode = match parse_hash_expiration(args, &mut i, true, false) {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    let fields = match parse_fields_block(args, i) {
+        Ok(f) => f,
+        Err(r) => return r,
+    };
+    let key = args[1].clone();
+    engine
+        .store
+        .run_key(&args[1], move |ctx| {
+            let Ok(del) = hash_del_hlc(ctx, &key) else {
+                return Reply::wrongtype();
+            };
+            Reply::Array(
+                fields
+                    .iter()
+                    .map(|f| {
+                        let Some((env, value)) = read_field_env(ctx, &key, f, del) else {
+                            return Reply::Null;
+                        };
+                        match mode {
+                            HashExpireMode::Deadline(d) => {
+                                set_field_deadline(ctx, &key, f, del, d, ExpireCond::None);
+                            }
+                            HashExpireMode::Persist => {
+                                if env.ttl_deadline_ms != 0 {
+                                    set_field_deadline(ctx, &key, f, del, 0, ExpireCond::None);
+                                }
+                            }
+                            HashExpireMode::KeepTtl | HashExpireMode::None => {}
+                        }
+                        Reply::Bulk(value)
+                    })
+                    .collect(),
+            )
+        })
+        .await
+}
+
+pub async fn hsetex(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 5 {
+        return Reply::wrong_args("hsetex");
+    }
+    let key = args[1].clone();
+    let mut i = 2;
+    let mut fnx = false;
+    let mut fxx = false;
+    if args
+        .get(i)
+        .is_some_and(|a| eq_ignore_case(a, "FNX") || eq_ignore_case(a, "FXX"))
+    {
+        fnx = eq_ignore_case(&args[i], "FNX");
+        fxx = eq_ignore_case(&args[i], "FXX");
+        i += 1;
+    }
+    let mode = match parse_hash_expiration(args, &mut i, false, true) {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    if args.get(i).is_none_or(|a| !eq_ignore_case(a, "FVS")) {
+        return Reply::syntax();
+    }
+    let Some(n) = args.get(i + 1).and_then(|b| parse_u64(b)) else {
+        return Reply::not_int();
+    };
+    let n = n as usize;
+    if n == 0 || args.len() != i + 2 + n * 2 {
+        return Reply::syntax();
+    }
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> = args[i + 2..]
+        .chunks(2)
+        .map(|c| (c[0].clone(), c[1].clone()))
+        .collect();
+    engine
+        .store
+        .run_key(&args[1], move |ctx| {
+            let Ok(del) = hash_del_hlc(ctx, &key) else {
+                return Reply::wrongtype();
+            };
+            if fnx && pairs.iter().any(|(f, _)| field_exists(ctx, &key, f, del)) {
+                return Reply::Int(0);
+            }
+            if fxx && pairs.iter().any(|(f, _)| !field_exists(ctx, &key, f, del)) {
+                return Reply::Int(0);
+            }
+            ensure_head(ctx, &key, head::CTYPE_HASH);
+            for (f, v) in &pairs {
+                let ttl = match mode {
+                    HashExpireMode::Deadline(d) => d,
+                    HashExpireMode::KeepTtl => read_field_env(ctx, &key, f, del)
+                        .map(|(env, _)| env.ttl_deadline_ms)
+                        .unwrap_or(0),
+                    HashExpireMode::Persist | HashExpireMode::None => 0,
+                };
+                if ttl != 0 && ttl <= now_ms() {
+                    write_field_ttl(ctx, &key, f, v, ttl);
+                    remove_field(ctx, &key, f, del);
+                } else {
+                    write_field_ttl(ctx, &key, f, v, ttl);
+                }
+            }
+            Reply::Int(1)
         })
         .await
 }

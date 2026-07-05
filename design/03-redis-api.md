@@ -83,8 +83,7 @@ documented — no order-statistic tree over an LSM in v1.
 |---|---|
 | LPUSH, RPUSH, LPUSHX, RPUSHX, LPOP, RPOP, LLEN, LRANGE, LINDEX, LSET, LREM, LTRIM, LINSERT, LPOS | v1 |
 | LMOVE, RPOPLPUSH, LMPOP | v1 |
-| BLPOP, BRPOP, BLMOVE, BRPOPLPUSH | v1.1 ✓ (50 ms polling; wakes on replicated pushes too) |
-| BLMPOP | planned |
+| BLPOP, BRPOP, BLMOVE, BRPOPLPUSH, BLMPOP | v1.1 ✓ (50 ms polling; wakes on replicated pushes too) |
 
 **Consistency caveat (prominent in user docs):** lists are position-keyed
 per-element LWW registers (v1.2), not a sequence CRDT. Single-node order is

@@ -43,6 +43,8 @@ A few settings are live-reconfigurable via `CONFIG SET`: `requirepass`,
 | `EXPIRE` `PEXPIRE` `EXPIREAT` `PEXPIREAT` `PERSIST` | Set / clear expiry. |
 | `KEYS` `SCAN` `RANDOMKEY` | Enumerate keys. |
 | `RENAME` `RENAMENX` | Rename keys. |
+| `COPY` | Copy a key within DB 0; supports `REPLACE` and accepts `DB 0`. |
+| `OBJECT` | Compatibility introspection: `ENCODING`, `REFCOUNT`, `IDLETIME`, `FREQ`, `HELP`. |
 | `EXPIREMEMBER` `EXPIREMEMBERAT` `PEXPIREMEMBERAT` | KeyDB-style per-member TTL. |
 | `TTL key member` | Per-member TTL read (KeyDB extension). |
 
@@ -67,7 +69,12 @@ resets the counter. See [counters](../data-model/#counters).
 | Command | Notes |
 |---|---|
 | `HSET` `HMSET` `HSETNX` `HGET` `HMGET` `HGETALL` | Field get / set. |
+| `HGETDEL` | Return and delete one or more fields using `FIELDS n field ...`. |
 | `HDEL` `HEXISTS` `HLEN` `HKEYS` `HVALS` `HSTRLEN` | Field inspection. |
+| `HEXPIRE` `HPEXPIRE` `HEXPIREAT` `HPEXPIREAT` | Set field-level TTLs using `FIELDS n field ...`; supports `NX`/`XX`/`GT`/`LT`. |
+| `HTTL` `HPTTL` `HEXPIRETIME` `HPEXPIRETIME` `HPERSIST` | Read or clear field-level TTL metadata. |
+| `HGETEX` | Return fields and optionally set `EX`/`PX`/`EXAT`/`PXAT` or `PERSIST`. |
+| `HSETEX` | Set field/value pairs using `FVS n field value ...`; supports `FNX`/`FXX`, expiry options, and `KEEPTTL`. |
 | `HINCRBY` `HINCRBYFLOAT` | Field arithmetic. |
 | `HRANDFIELD` `HSCAN` | Sample / iterate. |
 
@@ -87,9 +94,21 @@ Concurrent `SADD`s on different nodes both survive (ORSWOT merge).
 | Command | Notes |
 |---|---|
 | `ZADD` `ZINCRBY` `ZREM` | Add / mutate. |
-| `ZSCORE` `ZMSCORE` `ZCARD` `ZRANK` `ZREVRANK` `ZCOUNT` | Inspect. |
-| `ZRANGE` `ZRANGEBYSCORE` `ZREVRANGE` `ZREVRANGEBYSCORE` | Range queries. |
-| `ZPOPMIN` `ZPOPMAX` `ZREMRANGEBYSCORE` `ZSCAN` | Pop / trim / iterate. |
+| `ZSCORE` `ZMSCORE` `ZCARD` `ZRANK` `ZREVRANK` `ZCOUNT` `ZLEXCOUNT` | Inspect. |
+| `ZRANGE` `ZRANGEBYSCORE` `ZREVRANGE` `ZREVRANGEBYSCORE` `ZRANGEBYLEX` `ZREVRANGEBYLEX` | Range queries. |
+| `ZRANDMEMBER` | Return one or more members, optionally `WITHSCORES`. |
+| `ZRANGESTORE` | Store a `ZRANGE` result in a destination key. |
+| `ZPOPMIN` `ZPOPMAX` `BZPOPMIN` `BZPOPMAX` `ZMPOP` `BZMPOP` | Pop commands, including blocking variants. |
+| `ZREMRANGEBYSCORE` `ZREMRANGEBYRANK` `ZREMRANGEBYLEX` | Range deletion. |
+| `ZUNION` `ZINTER` `ZDIFF` | Return sorted-set algebra results; supports `WEIGHTS`, `AGGREGATE`, and `WITHSCORES`. |
+| `ZUNIONSTORE` `ZINTERSTORE` `ZDIFFSTORE` `ZINTERCARD` | Store or count sorted-set algebra results. |
+| `ZSCAN` | Iterate members and scores. |
+
+```note
+Lexicographical sorted-set operations are implemented as scans over live members
+(`O(N)`). `ZRANDMEMBER` follows marekvs' deterministic sampling style rather
+than making distribution guarantees.
+```
 
 ## Lists
 
@@ -99,7 +118,8 @@ Concurrent `SADD`s on different nodes both survive (ORSWOT merge).
 | `LPOP` `RPOP` `LLEN` `LRANGE` `LINDEX` | Pop / read. |
 | `LSET` `LREM` `LTRIM` `LINSERT` `LPOS` | Mutate / search. |
 | `LMOVE` `RPOPLPUSH` | Move between lists. |
-| `BLPOP` `BRPOP` `BLMOVE` `BRPOPLPUSH` | Blocking variants. |
+| `LMPOP` | Pop multiple elements from the first non-empty list. |
+| `BLPOP` `BRPOP` `BLMOVE` `BRPOPLPUSH` `BLMPOP` | Blocking variants. |
 
 ```note
 Lists are per-element position-keyed LWW registers. Blocking commands poll at
@@ -113,11 +133,14 @@ collide on a position — see the [list caveat](../data-model/#lists).
 |---|---|
 | `XADD` `XLEN` `XDEL` `XTRIM` | Append / size / trim. |
 | `XRANGE` `XREVRANGE` `XREAD` | Read entries. |
+| `XSETID` | Set last-generated-id metadata, with optional `ENTRIESADDED` and `MAXDELETEDID`. |
+| `XINFO STREAM` | Return stream metadata, length, first/last entry, and placeholder radix/group fields. |
 
 ```warning
 **Consumer groups are not implemented** — `XGROUP`, `XREADGROUP`, `XACK`,
-`XCLAIM`, `XAUTOCLAIM`, `XPENDING`, `XSETID`, and `XINFO` are absent. Streams
-provide raw, at-least-once entry operations only.
+`XCLAIM`, `XAUTOCLAIM`, `XPENDING`, and `XINFO GROUPS`/`XINFO CONSUMERS` are
+absent. Streams provide raw, at-least-once entry operations plus basic stream
+metadata.
 ```
 
 ## HyperLogLog
@@ -157,11 +180,9 @@ compare-and-swap.
 These are **not** in the dispatch table, even though some clients or older design
 notes assume them. Calling one returns an error:
 
-- **Keyspace:** `COPY`, `OBJECT`, `SORT`, `DUMP`, `RESTORE`, `MOVE`
-- **Sorted set:** `ZMPOP`, `ZRANDMEMBER`, `ZRANGESTORE`, `ZREMRANGEBYRANK`,
-  `ZREMRANGEBYLEX`, `ZLEXCOUNT`
-- **List:** `LMPOP`
-- **Stream:** `XSETID`, `XINFO`, consumer-group commands
+- **Keyspace:** `SORT`, `DUMP`, `RESTORE`, `MOVE`
+- **Stream:** consumer-group commands (`XGROUP`, `XREADGROUP`, `XACK`,
+  `XCLAIM`, `XAUTOCLAIM`, `XPENDING`, `XINFO GROUPS`, `XINFO CONSUMERS`)
 - **Cluster / HA:** `WAIT`, `FAILOVER`, `CLUSTER`, `FUNCTION` (no Redis Cluster
   protocol, no `MOVED`/`ASK`)
 - **Modules / extras:** `GEO*`, `JSON*`, bitfield/bit ops, `CLIENT TRACKING`

@@ -211,7 +211,8 @@ the same entry). `XDEL` / `XTRIM` write per-entry LWW tombstones.
 ```planned Consumer groups
 `XGROUP` / `XREADGROUP` / `XACK` and the rest of the consumer-group surface are
 **not implemented**. Streams currently expose only the raw entry operations:
-`XADD`, `XLEN`, `XRANGE`, `XREVRANGE`, `XREAD`, `XDEL`, `XTRIM`.
+`XADD`, `XLEN`, `XRANGE`, `XREVRANGE`, `XREAD`, `XDEL`, `XTRIM`, plus basic
+metadata operations `XSETID` and `XINFO STREAM`.
 ```
 
 ### Lists

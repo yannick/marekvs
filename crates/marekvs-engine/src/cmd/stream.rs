@@ -11,12 +11,82 @@ use std::sync::Arc;
 use crate::cmd::{eq_ignore_case, parse_u64};
 use crate::reply::Reply;
 use crate::store::{
-    check_type, ensure_head, get_head, get_raw, new_lww, new_tombstone, now_ms, scan_prefix,
-    visible, write_merged, ShardCtx,
+    check_type, ensure_head, get_raw, new_lww, new_tombstone, now_ms, scan_prefix, visible,
+    write_merged, ShardCtx,
 };
 use crate::Engine;
 use marekvs_core::envelope::{head, Envelope, RecordType};
 use marekvs_core::ikey::{self, Tag};
+
+const STREAM_META_MAGIC: &[u8; 4] = b"MVS1";
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StreamMeta {
+    last_id: (u64, u64),
+    entries_added: u64,
+    max_deleted_id: (u64, u64),
+}
+
+fn encode_stream_head(del_hlc: u64, meta: StreamMeta) -> Vec<u8> {
+    let mut out = head::encode(head::CTYPE_STREAM, del_hlc);
+    out.extend_from_slice(STREAM_META_MAGIC);
+    out.extend_from_slice(&meta.last_id.0.to_be_bytes());
+    out.extend_from_slice(&meta.last_id.1.to_be_bytes());
+    out.extend_from_slice(&meta.entries_added.to_be_bytes());
+    out.extend_from_slice(&meta.max_deleted_id.0.to_be_bytes());
+    out.extend_from_slice(&meta.max_deleted_id.1.to_be_bytes());
+    out
+}
+
+fn decode_stream_meta(payload: &[u8]) -> StreamMeta {
+    let base = 9;
+    if payload.len() < base + 44 || &payload[base..base + 4] != STREAM_META_MAGIC {
+        return StreamMeta::default();
+    }
+    let mut p = base + 4;
+    let read = |buf: &[u8], p: &mut usize| -> u64 {
+        let v = u64::from_be_bytes(buf[*p..*p + 8].try_into().unwrap());
+        *p += 8;
+        v
+    };
+    let last_ms = read(payload, &mut p);
+    let last_seq = read(payload, &mut p);
+    let entries_added = read(payload, &mut p);
+    let del_ms = read(payload, &mut p);
+    let del_seq = read(payload, &mut p);
+    StreamMeta {
+        last_id: (last_ms, last_seq),
+        entries_added,
+        max_deleted_id: (del_ms, del_seq),
+    }
+}
+
+fn stream_head(ctx: &ShardCtx, key: &[u8]) -> Option<(Envelope, u64, StreamMeta)> {
+    let raw = get_raw(ctx, &ikey::head_key(key))?;
+    let (env, pay) = Envelope::decode(&raw)?;
+    let (ctype, del) = head::decode(pay)?;
+    if ctype != head::CTYPE_STREAM {
+        return None;
+    }
+    Some((env, del, decode_stream_meta(pay)))
+}
+
+fn write_stream_head(ctx: &ShardCtx, key: &[u8], ttl: u64, del: u64, meta: StreamMeta) {
+    let env = Envelope::head(ctx.hlc.now(), ctx.node_id).with_ttl(ttl);
+    write_merged(
+        ctx,
+        &ikey::head_key(key),
+        &env.encode_with(&encode_stream_head(del, meta)),
+    );
+}
+
+fn max_id(a: (u64, u64), b: (u64, u64)) -> (u64, u64) {
+    if a >= b {
+        a
+    } else {
+        b
+    }
+}
 
 // ---------------------------------------------------------------------------
 // field/value payload codec (private varint copies)
@@ -179,6 +249,14 @@ fn stream_last_id(ctx: &ShardCtx, key: &[u8]) -> Option<(u64, u64)> {
     last
 }
 
+fn effective_last_id(ctx: &ShardCtx, key: &[u8], meta: StreamMeta) -> Option<(u64, u64)> {
+    match stream_last_id(ctx, key) {
+        Some(scan) => Some(max_id(meta.last_id, scan)),
+        None if meta.last_id != (0, 0) => Some(meta.last_id),
+        None => None,
+    }
+}
+
 fn entry_visible(ctx: &ShardCtx, key: &[u8], ms: u64, seq: u64, del: u64) -> bool {
     let Some(v) = get_raw(ctx, &ikey::stream_entry_key(key, ms, seq)) else {
         return false;
@@ -268,12 +346,14 @@ pub async fn xadd(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             if check_type(ctx, &key, head::CTYPE_STREAM).is_err() {
                 return Reply::wrongtype();
             }
-            let stream_exists = matches!(get_head(ctx, &key), Some((env, t, _))
-                if t == head::CTYPE_STREAM && !env.is_tombstone() && !env.is_expired(now_ms()));
+            let head_state = stream_head(ctx, &key);
+            let stream_exists = matches!(head_state, Some((env, _, _))
+                if !env.is_tombstone() && !env.is_expired(now_ms()));
             if nomkstream && !stream_exists {
                 return Reply::Null;
             }
-            let last = stream_last_id(ctx, &key);
+            let meta = head_state.map(|(_, _, m)| m).unwrap_or_default();
+            let last = effective_last_id(ctx, &key, meta);
             let (ms, seq) = match spec {
                 IdSpec::Auto => {
                     let mut ms = now_ms();
@@ -318,12 +398,21 @@ pub async fn xadd(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             };
 
             ensure_head(ctx, &key, head::CTYPE_STREAM);
-            let del = head_del(ctx, &key);
+            let (head_env, del, mut meta) = stream_head(ctx, &key).unwrap_or_else(|| {
+                (
+                    Envelope::head(ctx.hlc.now(), ctx.node_id),
+                    head_del(ctx, &key),
+                    StreamMeta::default(),
+                )
+            });
             let rec = new_lww(ctx, RecordType::StreamEntry, &encode_fields(&fields), 0);
             write_merged(ctx, &ikey::stream_entry_key(&key, ms, seq), &rec);
+            meta.last_id = max_id(meta.last_id, (ms, seq));
+            meta.entries_added = meta.entries_added.saturating_add(1);
             if let Some(n) = maxlen {
                 trim_maxlen(ctx, &key, del, n);
             }
+            write_stream_head(ctx, &key, head_env.ttl_deadline_ms, del, meta);
             Reply::Bulk(fmt_id(ms, seq))
         })
         .await
@@ -501,6 +590,7 @@ pub async fn xdel(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
                 return Reply::wrongtype();
             };
             let mut n = 0;
+            let mut max_deleted = (0, 0);
             for id in &id_args {
                 let Some((ms, seq)) = parse_range_id(id, true) else {
                     return Reply::err(
@@ -510,7 +600,14 @@ pub async fn xdel(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
                 if entry_visible(ctx, &key, ms, seq, del) {
                     let tomb = new_tombstone(ctx, RecordType::StreamEntry);
                     write_merged(ctx, &ikey::stream_entry_key(&key, ms, seq), &tomb);
+                    max_deleted = max_id(max_deleted, (ms, seq));
                     n += 1;
+                }
+            }
+            if n > 0 {
+                if let Some((head_env, del, mut meta)) = stream_head(ctx, &key) {
+                    meta.max_deleted_id = max_id(meta.max_deleted_id, max_deleted);
+                    write_stream_head(ctx, &key, head_env.ttl_deadline_ms, del, meta);
                 }
             }
             Reply::Int(n)
@@ -542,7 +639,129 @@ pub async fn xtrim(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             let Ok(del) = check_type(ctx, &key, head::CTYPE_STREAM) else {
                 return Reply::wrongtype();
             };
-            Reply::Int(trim_maxlen(ctx, &key, del, maxlen))
+            let before = collect_entries(ctx, &key, del);
+            let n = trim_maxlen(ctx, &key, del, maxlen);
+            if n > 0 {
+                if let Some((head_env, del, mut meta)) = stream_head(ctx, &key) {
+                    let max_deleted = before
+                        .iter()
+                        .take(n as usize)
+                        .fold((0, 0), |acc, (ms, seq, _)| max_id(acc, (*ms, *seq)));
+                    meta.max_deleted_id = max_id(meta.max_deleted_id, max_deleted);
+                    write_stream_head(ctx, &key, head_env.ttl_deadline_ms, del, meta);
+                }
+            }
+            Reply::Int(n)
+        })
+        .await
+}
+
+pub async fn xsetid(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 3 {
+        return Reply::wrong_args("xsetid");
+    }
+    let key = args[1].clone();
+    let Some(id) = parse_range_id(&args[2], true) else {
+        return Reply::err("ERR Invalid stream ID specified as stream command argument");
+    };
+    let mut entries_added: Option<u64> = None;
+    let mut max_deleted_id: Option<(u64, u64)> = None;
+    let mut i = 3;
+    while i < args.len() {
+        if eq_ignore_case(&args[i], "ENTRIESADDED") {
+            let Some(n) = args.get(i + 1).and_then(|b| parse_u64(b)) else {
+                return Reply::not_int();
+            };
+            entries_added = Some(n);
+            i += 2;
+        } else if eq_ignore_case(&args[i], "MAXDELETEDID") {
+            let Some(mid) = args.get(i + 1).and_then(|b| parse_range_id(b, true)) else {
+                return Reply::err("ERR Invalid stream ID specified as stream command argument");
+            };
+            max_deleted_id = Some(mid);
+            i += 2;
+        } else {
+            return Reply::syntax();
+        }
+    }
+    engine
+        .store
+        .run_key(&args[1], move |ctx| {
+            let Some((head_env, del, mut meta)) = stream_head(ctx, &key) else {
+                return Reply::err("ERR no such key");
+            };
+            if let Some(last) = stream_last_id(ctx, &key) {
+                if id < last {
+                    return Reply::err(
+                        "ERR The ID specified in XSETID is smaller than the target stream top item",
+                    );
+                }
+            }
+            meta.last_id = id;
+            if let Some(n) = entries_added {
+                meta.entries_added = n;
+            }
+            if let Some(mid) = max_deleted_id {
+                meta.max_deleted_id = mid;
+            }
+            write_stream_head(ctx, &key, head_env.ttl_deadline_ms, del, meta);
+            Reply::ok()
+        })
+        .await
+}
+
+pub async fn xinfo(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 2 {
+        return Reply::wrong_args("xinfo");
+    }
+    if !eq_ignore_case(&args[1], "STREAM") {
+        if eq_ignore_case(&args[1], "HELP") {
+            return Reply::Array(vec![
+                Reply::bulk_str("XINFO STREAM <key>"),
+                Reply::bulk_str("XINFO HELP"),
+            ]);
+        }
+        return Reply::err("ERR unknown subcommand");
+    }
+    if args.len() != 3 {
+        return Reply::wrong_args("xinfo stream");
+    }
+    let key = args[2].clone();
+    engine.ensure_local(&key).await;
+    engine
+        .store
+        .run_key(&args[2], move |ctx| {
+            let Some((_head_env, del, meta)) = stream_head(ctx, &key) else {
+                return Reply::wrongtype();
+            };
+            let entries = collect_entries(ctx, &key, del);
+            let last_id = effective_last_id(ctx, &key, meta).unwrap_or((0, 0));
+            let first = entries
+                .first()
+                .map_or(Reply::Null, |(ms, seq, pay)| entry_reply(*ms, *seq, pay));
+            let last = entries
+                .last()
+                .map_or(Reply::Null, |(ms, seq, pay)| entry_reply(*ms, *seq, pay));
+            Reply::Array(vec![
+                Reply::bulk_str("length"),
+                Reply::Int(entries.len() as i64),
+                Reply::bulk_str("radix-tree-keys"),
+                Reply::Int(1),
+                Reply::bulk_str("radix-tree-nodes"),
+                Reply::Int(2),
+                Reply::bulk_str("last-generated-id"),
+                Reply::Bulk(fmt_id(last_id.0, last_id.1)),
+                Reply::bulk_str("max-deleted-entry-id"),
+                Reply::Bulk(fmt_id(meta.max_deleted_id.0, meta.max_deleted_id.1)),
+                Reply::bulk_str("entries-added"),
+                Reply::Int(meta.entries_added as i64),
+                Reply::bulk_str("groups"),
+                Reply::Int(0),
+                Reply::bulk_str("first-entry"),
+                first,
+                Reply::bulk_str("last-entry"),
+                last,
+            ])
         })
         .await
 }

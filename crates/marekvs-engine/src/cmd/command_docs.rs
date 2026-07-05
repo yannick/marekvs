@@ -205,6 +205,400 @@ const CF: &[&str] = &["readonly", "fast"]; // read, fast
 const CW: &[&str] = &["write", "denyoom"]; // write, may allocate
 const CWF: &[&str] = &["write", "denyoom", "fast"];
 const CRO: &[&str] = &["readonly"];
+const CWM: &[&str] = &["write", "denyoom", "movablekeys"];
+const CROM: &[&str] = &["readonly", "movablekeys"];
+const CBM: &[&str] = &["write", "blocking", "movablekeys"];
+
+const COPY_OPTS: &[Arg] = &[
+    Arg {
+        token: Some("DB"),
+        optional: true,
+        ..arg("destination-db", "integer")
+    },
+    Arg {
+        token: Some("REPLACE"),
+        optional: true,
+        ..arg("replace", "pure-token")
+    },
+];
+
+const OBJECT_ARGS: &[Arg] = &[
+    arg("subcommand", "string"),
+    Arg {
+        optional: true,
+        ..A_KEY
+    },
+];
+
+const HASH_FIELDS: &[Arg] = &[
+    Arg {
+        token: Some("FIELDS"),
+        ..arg("fields", "pure-token")
+    },
+    arg("numfields", "integer"),
+    Arg {
+        multiple: true,
+        ..arg("field", "string")
+    },
+];
+
+const HASH_EXPIRE_COND: &[Arg] = &[
+    Arg {
+        token: Some("NX"),
+        ..arg("nx", "pure-token")
+    },
+    Arg {
+        token: Some("XX"),
+        ..arg("xx", "pure-token")
+    },
+    Arg {
+        token: Some("GT"),
+        ..arg("gt", "pure-token")
+    },
+    Arg {
+        token: Some("LT"),
+        ..arg("lt", "pure-token")
+    },
+];
+
+const HASH_EXPIRE_ARGS: &[Arg] = &[
+    A_KEY,
+    arg("time", "integer"),
+    Arg {
+        optional: true,
+        args: HASH_EXPIRE_COND,
+        ..arg("condition", "oneof")
+    },
+    Arg {
+        args: HASH_FIELDS,
+        ..arg("fields", "block")
+    },
+];
+
+const HASH_TTL_ARGS: &[Arg] = &[
+    A_KEY,
+    Arg {
+        args: HASH_FIELDS,
+        ..arg("fields", "block")
+    },
+];
+
+const HGETEX_EXPIRATION: &[Arg] = &[
+    Arg {
+        token: Some("EX"),
+        ..arg("seconds", "integer")
+    },
+    Arg {
+        token: Some("PX"),
+        ..arg("milliseconds", "integer")
+    },
+    Arg {
+        token: Some("EXAT"),
+        ..arg("unix-time-seconds", "unix-time")
+    },
+    Arg {
+        token: Some("PXAT"),
+        ..arg("unix-time-milliseconds", "unix-time")
+    },
+    Arg {
+        token: Some("PERSIST"),
+        ..arg("persist", "pure-token")
+    },
+];
+
+const HGETEX_ARGS: &[Arg] = &[
+    A_KEY,
+    Arg {
+        optional: true,
+        args: HGETEX_EXPIRATION,
+        ..arg("expiration", "oneof")
+    },
+    Arg {
+        args: HASH_FIELDS,
+        ..arg("fields", "block")
+    },
+];
+
+const HSETEX_COND: &[Arg] = &[
+    Arg {
+        token: Some("FNX"),
+        ..arg("fnx", "pure-token")
+    },
+    Arg {
+        token: Some("FXX"),
+        ..arg("fxx", "pure-token")
+    },
+];
+
+const HSETEX_EXPIRATION: &[Arg] = &[
+    Arg {
+        token: Some("EX"),
+        ..arg("seconds", "integer")
+    },
+    Arg {
+        token: Some("PX"),
+        ..arg("milliseconds", "integer")
+    },
+    Arg {
+        token: Some("EXAT"),
+        ..arg("unix-time-seconds", "unix-time")
+    },
+    Arg {
+        token: Some("PXAT"),
+        ..arg("unix-time-milliseconds", "unix-time")
+    },
+    Arg {
+        token: Some("KEEPTTL"),
+        ..arg("keepttl", "pure-token")
+    },
+];
+
+const HSETEX_FVS: &[Arg] = &[
+    Arg {
+        token: Some("FVS"),
+        ..arg("fvs", "pure-token")
+    },
+    arg("num-field-value-pairs", "integer"),
+    Arg {
+        multiple: true,
+        args: &[arg("field", "string"), arg("value", "string")],
+        ..arg("field-value", "block")
+    },
+];
+
+const HSETEX_ARGS: &[Arg] = &[
+    A_KEY,
+    Arg {
+        optional: true,
+        args: HSETEX_COND,
+        ..arg("condition", "oneof")
+    },
+    Arg {
+        optional: true,
+        args: HSETEX_EXPIRATION,
+        ..arg("expiration", "oneof")
+    },
+    Arg {
+        args: HSETEX_FVS,
+        ..arg("field-values", "block")
+    },
+];
+
+const ZRANGE_OPTS: &[Arg] = &[
+    Arg {
+        token: Some("BYSCORE"),
+        optional: true,
+        ..arg("byscore", "pure-token")
+    },
+    Arg {
+        token: Some("BYLEX"),
+        optional: true,
+        ..arg("bylex", "pure-token")
+    },
+    Arg {
+        token: Some("REV"),
+        optional: true,
+        ..arg("rev", "pure-token")
+    },
+    Arg {
+        token: Some("LIMIT"),
+        optional: true,
+        args: &[arg("offset", "integer"), arg("count", "integer")],
+        ..arg("limit", "block")
+    },
+    Arg {
+        token: Some("WITHSCORES"),
+        optional: true,
+        ..arg("withscores", "pure-token")
+    },
+];
+
+const ZRANGE_ARGS: &[Arg] = &[
+    A_KEY,
+    arg("start", "string"),
+    arg("stop", "string"),
+    Arg {
+        optional: true,
+        multiple: true,
+        args: ZRANGE_OPTS,
+        ..arg("options", "oneof")
+    },
+];
+
+const ZRANGESTORE_ARGS: &[Arg] = &[
+    Arg {
+        key_spec_index: Some(0),
+        ..arg("dst", "key")
+    },
+    Arg {
+        key_spec_index: Some(1),
+        ..arg("src", "key")
+    },
+    arg("start", "string"),
+    arg("stop", "string"),
+    Arg {
+        optional: true,
+        multiple: true,
+        args: ZRANGE_OPTS,
+        ..arg("options", "oneof")
+    },
+];
+
+const ZLEX_RANGE_ARGS: &[Arg] = &[
+    A_KEY,
+    arg("min", "string"),
+    arg("max", "string"),
+    Arg {
+        token: Some("LIMIT"),
+        optional: true,
+        args: &[arg("offset", "integer"), arg("count", "integer")],
+        ..arg("limit", "block")
+    },
+];
+
+const ZMPOP_TAIL: &[Arg] = &[
+    Arg {
+        multiple: true,
+        ..arg("key", "key")
+    },
+    arg("where", "oneof"),
+    Arg {
+        token: Some("COUNT"),
+        optional: true,
+        ..arg("count", "integer")
+    },
+];
+
+const ZMPOP_ARGS: &[Arg] = &[
+    arg("numkeys", "integer"),
+    Arg {
+        args: ZMPOP_TAIL,
+        ..arg("data", "block")
+    },
+];
+
+const BZMPOP_ARGS: &[Arg] = &[
+    arg("timeout", "double"),
+    arg("numkeys", "integer"),
+    Arg {
+        args: ZMPOP_TAIL,
+        ..arg("data", "block")
+    },
+];
+
+const ZSETOP_ARGS: &[Arg] = &[
+    arg("numkeys", "integer"),
+    Arg {
+        multiple: true,
+        ..arg("key", "key")
+    },
+    Arg {
+        token: Some("WEIGHTS"),
+        optional: true,
+        multiple: true,
+        ..arg("weight", "double")
+    },
+    Arg {
+        token: Some("AGGREGATE"),
+        optional: true,
+        ..arg("aggregate", "oneof")
+    },
+    Arg {
+        token: Some("WITHSCORES"),
+        optional: true,
+        ..arg("withscores", "pure-token")
+    },
+];
+
+const ZSETSTORE_ARGS: &[Arg] = &[
+    Arg {
+        key_spec_index: Some(0),
+        ..arg("destination", "key")
+    },
+    arg("numkeys", "integer"),
+    Arg {
+        multiple: true,
+        key_spec_index: Some(1),
+        ..arg("key", "key")
+    },
+    Arg {
+        token: Some("WEIGHTS"),
+        optional: true,
+        multiple: true,
+        ..arg("weight", "double")
+    },
+    Arg {
+        token: Some("AGGREGATE"),
+        optional: true,
+        ..arg("aggregate", "oneof")
+    },
+];
+
+const ZINTERCARD_ARGS: &[Arg] = &[
+    arg("numkeys", "integer"),
+    Arg {
+        multiple: true,
+        ..arg("key", "key")
+    },
+    Arg {
+        token: Some("LIMIT"),
+        optional: true,
+        ..arg("limit", "integer")
+    },
+];
+
+const LMPOP_TAIL: &[Arg] = &[
+    Arg {
+        multiple: true,
+        ..arg("key", "key")
+    },
+    arg("where", "oneof"),
+    Arg {
+        token: Some("COUNT"),
+        optional: true,
+        ..arg("count", "integer")
+    },
+];
+
+const LMPOP_ARGS: &[Arg] = &[
+    arg("numkeys", "integer"),
+    Arg {
+        args: LMPOP_TAIL,
+        ..arg("data", "block")
+    },
+];
+
+const BLMPOP_ARGS: &[Arg] = &[
+    arg("timeout", "double"),
+    arg("numkeys", "integer"),
+    Arg {
+        args: LMPOP_TAIL,
+        ..arg("data", "block")
+    },
+];
+
+const XSETID_ARGS: &[Arg] = &[
+    A_KEY,
+    arg("last-id", "string"),
+    Arg {
+        token: Some("ENTRIESADDED"),
+        optional: true,
+        ..arg("entries-added", "integer")
+    },
+    Arg {
+        token: Some("MAXDELETEDID"),
+        optional: true,
+        ..arg("max-deleted-id", "string")
+    },
+];
+
+const XINFO_ARGS: &[Arg] = &[
+    arg("subcommand", "string"),
+    Arg {
+        optional: true,
+        ..A_KEY
+    },
+];
 
 #[rustfmt::skip]
 static TABLE: &[CommandDoc] = &[
@@ -290,6 +684,10 @@ static TABLE: &[CommandDoc] = &[
         &[A_KEY, Arg { key_spec_index: Some(1), ..arg("newkey", "key") }]),
     with_args(cmd("renamenx", 3, CWF, 1, 2, 1, "Renames a key only when the target key name doesn't exist.", "1.0.0", "generic"),
         &[A_KEY, Arg { key_spec_index: Some(1), ..arg("newkey", "key") }]),
+    with_args(cmd("copy", -3, CWF, 1, 2, 1, "Copies the value stored at the source key to the destination key.", "6.2.0", "generic"),
+        &[A_KEY, Arg { key_spec_index: Some(1), ..arg("destination", "key") }, Arg { optional: true, multiple: true, args: COPY_OPTS, ..arg("options", "oneof") }]),
+    with_args(cmd("object", -2, CRO, 2, 2, 1, "Returns static object introspection compatibility information.", "2.2.3", "generic"),
+        OBJECT_ARGS),
     with_args(cmd("touch", -2, CF, 1, -1, 1, "Returns the number of existing keys out of those specified.", "3.2.1", "generic"), ARGS_KEYS),
 
     // --- strings ---
@@ -337,6 +735,19 @@ static TABLE: &[CommandDoc] = &[
     with_complexity(with_args(cmd("hgetall", 2, CRO, 1, 1, 1, "Returns all fields and values in a hash.", "2.0.0", "hash"), ARGS_KEY), "O(N)"),
     with_args(cmd("hdel", -3, CWF, 1, 1, 1, "Deletes one or more fields and their values from a hash. Deletes the hash if no fields remain.", "2.0.0", "hash"),
         &[A_KEY, Arg { multiple: true, ..arg("field", "string") }]),
+    with_args(cmd("hgetdel", -4, CWF, 1, 1, 1, "Returns and deletes one or more hash fields.", "8.0.0", "hash"),
+        &[A_KEY, Arg { args: HASH_FIELDS, ..arg("fields", "block") }]),
+    with_args(cmd("hexpire", -6, CWF, 1, 1, 1, "Sets expiration on one or more hash fields in seconds.", "7.4.0", "hash"), HASH_EXPIRE_ARGS),
+    with_args(cmd("hpexpire", -6, CWF, 1, 1, 1, "Sets expiration on one or more hash fields in milliseconds.", "7.4.0", "hash"), HASH_EXPIRE_ARGS),
+    with_args(cmd("hexpireat", -6, CWF, 1, 1, 1, "Sets hash field expiration to a Unix timestamp in seconds.", "7.4.0", "hash"), HASH_EXPIRE_ARGS),
+    with_args(cmd("hpexpireat", -6, CWF, 1, 1, 1, "Sets hash field expiration to a Unix timestamp in milliseconds.", "7.4.0", "hash"), HASH_EXPIRE_ARGS),
+    with_args(cmd("httl", -4, CF, 1, 1, 1, "Returns hash field TTLs in seconds.", "7.4.0", "hash"), HASH_TTL_ARGS),
+    with_args(cmd("hpttl", -4, CF, 1, 1, 1, "Returns hash field TTLs in milliseconds.", "7.4.0", "hash"), HASH_TTL_ARGS),
+    with_args(cmd("hexpiretime", -4, CF, 1, 1, 1, "Returns hash field expiration timestamps in seconds.", "7.4.0", "hash"), HASH_TTL_ARGS),
+    with_args(cmd("hpexpiretime", -4, CF, 1, 1, 1, "Returns hash field expiration timestamps in milliseconds.", "7.4.0", "hash"), HASH_TTL_ARGS),
+    with_args(cmd("hpersist", -4, CWF, 1, 1, 1, "Removes expiration from one or more hash fields.", "7.4.0", "hash"), HASH_TTL_ARGS),
+    with_args(cmd("hgetex", -5, CWF, 1, 1, 1, "Returns hash fields and optionally updates their expiration.", "8.0.0", "hash"), HGETEX_ARGS),
+    with_args(cmd("hsetex", -6, CWF, 1, 1, 1, "Sets hash fields and optionally sets their expiration.", "8.0.0", "hash"), HSETEX_ARGS),
     with_args(cmd("hexists", 3, CF, 1, 1, 1, "Determines whether a field exists in a hash.", "2.0.0", "hash"), ARGS_KEY_FIELD),
     with_args(cmd("hlen", 2, CF, 1, 1, 1, "Returns the number of fields in a hash.", "2.0.0", "hash"), ARGS_KEY),
     with_complexity(with_args(cmd("hkeys", 2, CRO, 1, 1, 1, "Returns all fields in a hash.", "2.0.0", "hash"), ARGS_KEY), "O(N)"),
@@ -394,9 +805,7 @@ static TABLE: &[CommandDoc] = &[
     with_args(cmd("zrem", -3, CWF, 1, 1, 1, "Removes one or more members from a sorted set. Deletes the sorted set if all members were removed.", "1.2.0", "sorted_set"),
         &[A_KEY, Arg { multiple: true, ..arg("member", "string") }]),
     with_complexity(with_args(cmd("zrange", -4, CRO, 1, 1, 1, "Returns members in a sorted set within a range of indexes.", "1.2.0", "sorted_set"),
-        &[A_KEY, arg("start", "string"), arg("stop", "string"),
-          Arg { token: Some("REV"), optional: true, ..arg("rev", "pure-token") },
-          Arg { token: Some("LIMIT"), optional: true, ..arg("limit", "oneof") }]), "O(log(N)+M)"),
+        ZRANGE_ARGS), "O(N)"),
     with_complexity(with_args(cmd("zrangebyscore", -4, CRO, 1, 1, 1, "Returns members in a sorted set within a range of scores.", "1.0.5", "sorted_set"),
         &[A_KEY, arg("min", "double"), arg("max", "double")]), "O(log(N)+M)"),
     with_complexity(with_args(cmd("zrevrangebyscore", -4, CRO, 1, 1, 1, "Returns members in a sorted set within a range of scores in reverse order.", "2.2.0", "sorted_set"),
@@ -409,12 +818,35 @@ static TABLE: &[CommandDoc] = &[
         &[A_KEY, arg("member", "string")]), "O(log(N))"),
     with_complexity(with_args(cmd("zcount", 4, CF, 1, 1, 1, "Returns the count of members in a sorted set that have scores within a range.", "2.0.0", "sorted_set"),
         &[A_KEY, arg("min", "double"), arg("max", "double")]), "O(log(N))"),
+    with_complexity(with_args(cmd("zlexcount", 4, CF, 1, 1, 1, "Returns the count of members in a sorted set within a lexicographical range.", "2.8.9", "sorted_set"),
+        &[A_KEY, arg("min", "string"), arg("max", "string")]), "O(N)"),
+    with_args(cmd("zrandmember", -2, CRO, 1, 1, 1, "Returns one or more members from a sorted set.", "6.2.0", "sorted_set"),
+        &[A_KEY, Arg { optional: true, ..arg("count", "integer") }, Arg { token: Some("WITHSCORES"), optional: true, ..arg("withscores", "pure-token") }]),
+    with_args(cmd("zrangestore", -5, CW, 1, 2, 1, "Stores a sorted-set range into a destination key.", "6.2.0", "sorted_set"),
+        ZRANGESTORE_ARGS),
+    with_args(cmd("zrangebylex", -4, CRO, 1, 1, 1, "Returns sorted-set members within a lexicographical range.", "2.8.9", "sorted_set"), ZLEX_RANGE_ARGS),
+    with_args(cmd("zrevrangebylex", -4, CRO, 1, 1, 1, "Returns sorted-set members within a lexicographical range in reverse order.", "2.8.9", "sorted_set"), ZLEX_RANGE_ARGS),
     with_complexity(with_args(cmd("zpopmin", -2, CWF, 1, 1, 1, "Returns the lowest-scoring members from a sorted set after removing them. Deletes the sorted set if empty.", "5.0.0", "sorted_set"),
         &[A_KEY, Arg { optional: true, ..arg("count", "integer") }]), "O(log(N)*M)"),
     with_complexity(with_args(cmd("zpopmax", -2, CWF, 1, 1, 1, "Returns the highest-scoring members from a sorted set after removing them. Deletes the sorted set if empty.", "5.0.0", "sorted_set"),
         &[A_KEY, Arg { optional: true, ..arg("count", "integer") }]), "O(log(N)*M)"),
+    with_args(cmd("bzpopmin", -3, &["write", "blocking", "fast"], 1, -2, 1, "Blocks until it can pop the lowest-scoring member from one sorted set.", "5.0.0", "sorted_set"), ARGS_KEYS),
+    with_args(cmd("bzpopmax", -3, &["write", "blocking", "fast"], 1, -2, 1, "Blocks until it can pop the highest-scoring member from one sorted set.", "5.0.0", "sorted_set"), ARGS_KEYS),
+    with_args(cmd("zmpop", -4, CWM, 0, 0, 0, "Pops members from the first non-empty sorted set.", "7.0.0", "sorted_set"), ZMPOP_ARGS),
+    with_args(cmd("bzmpop", -5, CBM, 0, 0, 0, "Blocks until it can pop members from the first non-empty sorted set.", "7.0.0", "sorted_set"), BZMPOP_ARGS),
     with_complexity(with_args(cmd("zremrangebyscore", 4, CW, 1, 1, 1, "Removes members in a sorted set within a range of scores. Deletes the sorted set if empty.", "1.2.0", "sorted_set"),
         &[A_KEY, arg("min", "double"), arg("max", "double")]), "O(log(N)+M)"),
+    with_args(cmd("zremrangebyrank", 4, CW, 1, 1, 1, "Removes members in a sorted set within a rank range.", "2.0.0", "sorted_set"),
+        &[A_KEY, arg("start", "integer"), arg("stop", "integer")]),
+    with_args(cmd("zremrangebylex", 4, CW, 1, 1, 1, "Removes members in a sorted set within a lexicographical range.", "2.8.9", "sorted_set"),
+        &[A_KEY, arg("min", "string"), arg("max", "string")]),
+    with_args(cmd("zunion", -3, CROM, 0, 0, 0, "Returns the union of multiple sorted sets.", "6.2.0", "sorted_set"), ZSETOP_ARGS),
+    with_args(cmd("zinter", -3, CROM, 0, 0, 0, "Returns the intersection of multiple sorted sets.", "6.2.0", "sorted_set"), ZSETOP_ARGS),
+    with_args(cmd("zdiff", -3, CROM, 0, 0, 0, "Returns the difference of multiple sorted sets.", "6.2.0", "sorted_set"), ZSETOP_ARGS),
+    with_args(cmd("zunionstore", -4, CWM, 0, 0, 0, "Stores the union of multiple sorted sets.", "2.0.0", "sorted_set"), ZSETSTORE_ARGS),
+    with_args(cmd("zinterstore", -4, CWM, 0, 0, 0, "Stores the intersection of multiple sorted sets.", "2.0.0", "sorted_set"), ZSETSTORE_ARGS),
+    with_args(cmd("zdiffstore", -4, CWM, 0, 0, 0, "Stores the difference of multiple sorted sets.", "6.2.0", "sorted_set"), ZSETSTORE_ARGS),
+    with_args(cmd("zintercard", -3, CROM, 0, 0, 0, "Returns the cardinality of a sorted-set intersection.", "7.0.0", "sorted_set"), ZINTERCARD_ARGS),
     with_args(cmd("zscan", -3, CRO, 1, 1, 1, "Iterates over members and scores of a sorted set.", "2.8.0", "sorted_set"),
         &[A_KEY, arg("cursor", "integer")]),
 
@@ -449,6 +881,7 @@ static TABLE: &[CommandDoc] = &[
           arg("wherefrom", "oneof"), arg("whereto", "oneof")]),
     with_args(cmd("rpoplpush", 3, CW, 1, 2, 1, "Returns the last element of a list after removing and pushing it to another list. Deletes the list if the last element was moved.", "1.2.0", "list"),
         &[Arg { key_spec_index: Some(0), ..arg("source", "key") }, Arg { key_spec_index: Some(1), ..arg("destination", "key") }]),
+    with_args(cmd("lmpop", -4, CWM, 0, 0, 0, "Returns multiple elements from the first non-empty list.", "7.0.0", "list"), LMPOP_ARGS),
     with_args(cmd("blpop", -3, &["write", "blocking", "fast"], 1, -2, 1, "Removes and returns the first element in a list, or blocks until one is available.", "2.0.0", "list"),
         &[Arg { multiple: true, ..A_KEY }, arg("timeout", "double")]),
     with_args(cmd("brpop", -3, &["write", "blocking", "fast"], 1, -2, 1, "Removes and returns the last element in a list, or blocks until one is available.", "2.0.0", "list"),
@@ -458,6 +891,7 @@ static TABLE: &[CommandDoc] = &[
           arg("wherefrom", "oneof"), arg("whereto", "oneof"), arg("timeout", "double")]),
     with_args(cmd("brpoplpush", 4, &["write", "denyoom", "blocking"], 1, 2, 1, "Pops an element from a list, pushes it to another list and returns it. Block until an element is available otherwise.", "2.2.0", "list"),
         &[Arg { key_spec_index: Some(0), ..arg("source", "key") }, Arg { key_spec_index: Some(1), ..arg("destination", "key") }, arg("timeout", "double")]),
+    with_args(cmd("blmpop", -5, CBM, 0, 0, 0, "Blocks until it can return multiple elements from the first non-empty list.", "7.0.0", "list"), BLMPOP_ARGS),
 
     // --- streams ---
     with_args(cmd("xadd", -5, CWF, 1, 1, 1, "Appends a new message to a stream. Creates the key if it doesn't exist.", "5.0.0", "stream"),
@@ -470,7 +904,7 @@ static TABLE: &[CommandDoc] = &[
     with_complexity(with_args(cmd("xrevrange", -4, CRO, 1, 1, 1, "Returns the messages from a stream within a range of IDs in reverse order.", "5.0.0", "stream"),
         &[A_KEY, arg("end", "string"), arg("start", "string"),
           Arg { token: Some("COUNT"), optional: true, ..arg("count", "integer") }]), "O(N)"),
-    with_args(cmd("xread", -4, &["readonly", "blocking"], 0, 0, 0, "Returns messages from multiple streams with IDs greater than the ones requested. Blocks until a message is available otherwise.", "5.0.0", "stream"),
+    with_args(cmd("xread", -4, &["readonly", "blocking", "movablekeys"], 0, 0, 0, "Returns messages from multiple streams with IDs greater than the ones requested. Blocks until a message is available otherwise.", "5.0.0", "stream"),
         &[Arg { token: Some("COUNT"), optional: true, ..arg("count", "integer") },
           Arg { token: Some("BLOCK"), optional: true, ..arg("milliseconds", "integer") },
           arg("streams", "pure-token")]),
@@ -478,6 +912,8 @@ static TABLE: &[CommandDoc] = &[
         &[A_KEY, Arg { multiple: true, ..arg("id", "string") }]),
     with_complexity(with_args(cmd("xtrim", -4, &["write"], 1, 1, 1, "Deletes messages from the beginning of a stream.", "5.0.0", "stream"),
         &[A_KEY, arg("strategy", "oneof"), arg("threshold", "string")]), "O(N)"),
+    with_args(cmd("xsetid", -3, CWF, 1, 1, 1, "Sets a stream's last-generated id metadata.", "5.0.0", "stream"), XSETID_ARGS),
+    with_args(cmd("xinfo", -2, CRO, 0, 0, 0, "Returns stream introspection information.", "5.0.0", "stream"), XINFO_ARGS),
 
     // --- pub/sub ---
     with_args(cmd("subscribe", -2, &["pubsub", "loading", "stale", "fast"], 0, 0, 0, "Listens for messages published to channels.", "2.0.0", "pubsub"),
@@ -645,4 +1081,69 @@ pub fn getkeys(argv: &[Vec<u8>]) -> Reply {
         return Reply::err("ERR Invalid arguments specified for command");
     }
     Reply::Array(keys)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn catalog_names_are_unique() {
+        let mut seen = HashSet::new();
+        for d in all() {
+            assert!(
+                seen.insert(d.name),
+                "duplicate COMMAND DOCS entry for {}",
+                d.name
+            );
+        }
+    }
+
+    #[test]
+    fn newly_added_commands_have_argument_docs() {
+        for name in [
+            "copy",
+            "object",
+            "hgetdel",
+            "hexpire",
+            "hpexpire",
+            "hexpireat",
+            "hpexpireat",
+            "httl",
+            "hpttl",
+            "hexpiretime",
+            "hpexpiretime",
+            "hpersist",
+            "hgetex",
+            "hsetex",
+            "zlexcount",
+            "bzpopmin",
+            "bzpopmax",
+            "zmpop",
+            "bzmpop",
+            "zrandmember",
+            "zrangestore",
+            "zrangebylex",
+            "zrevrangebylex",
+            "zremrangebyrank",
+            "zremrangebylex",
+            "zunion",
+            "zinter",
+            "zdiff",
+            "zunionstore",
+            "zinterstore",
+            "zdiffstore",
+            "zintercard",
+            "lmpop",
+            "blmpop",
+            "xsetid",
+            "xinfo",
+        ] {
+            let doc = find(name).unwrap_or_else(|| panic!("missing COMMAND DOCS entry for {name}"));
+            assert!(!doc.args.is_empty(), "{name} should document its arguments");
+            let _ = docs_value(doc);
+        }
+    }
 }
