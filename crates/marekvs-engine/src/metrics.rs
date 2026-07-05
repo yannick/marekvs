@@ -54,6 +54,7 @@ pub struct Metrics {
     pub ring_ops: IntGauge,
     pub ring_bytes: IntGauge,
     pub join_gate_pending_pids: IntGauge,
+    pub bootstrap_bytes_sent_total: IntCounter,
     pub rejoin_active: IntGauge,
     pub rejoin_dropped_records_total: IntCounter,
     pub interest_entries: IntGauge,
@@ -257,6 +258,11 @@ impl Metrics {
                 "Replication ring occupancy (bytes)"
             ),
 
+            bootstrap_bytes_sent_total: counter!(
+                registry,
+                "marekvs_bootstrap_bytes_sent_total",
+                "Payload bytes streamed to joining peers (rate-paced)"
+            ),
             rejoin_active: gauge!(
                 registry,
                 "marekvs_rejoin_active",

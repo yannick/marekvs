@@ -264,6 +264,19 @@ fn disk_min_avail_bytes() -> u64 {
     })
 }
 
+/// Bootstrap stream pacing in bytes/s (design/06 defaults table: 64 MiB/s);
+/// MAREKVS_BOOTSTRAP_RATE_MB, 0 = unlimited.
+fn bootstrap_rate_bytes_per_sec() -> u64 {
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MAREKVS_BOOTSTRAP_RATE_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(64)
+            .saturating_mul(1024 * 1024)
+    })
+}
+
 /// Per-peer unacked send window (bytes). Design/05 defaults table: 4 MiB.
 fn repl_window_bytes() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
@@ -1713,6 +1726,12 @@ impl ReplEngine {
     /// Stream a partition to a joining/repairing peer (design/06 §Bootstrap).
     async fn stream_partition(&self, peer: NodeId, pid: Pid) {
         let mut sent = 0usize;
+        // Rate pacing (design/06: 64 MiB/s): unthrottled streaming saturates
+        // the donor's disk/network during scale events — exactly when p99
+        // matters most. Sleep just enough to hold the configured rate.
+        let rate = bootstrap_rate_bytes_per_sec();
+        let started = Instant::now();
+        let mut streamed_bytes: u64 = 0;
         loop {
             let offset = sent;
             let chunk: Vec<ReplOp> = self
@@ -1741,12 +1760,27 @@ impl ReplEngine {
                 break;
             }
             sent += chunk.len();
+            let chunk_bytes: u64 = chunk
+                .iter()
+                .map(|o| (o.ikey.len() + o.value.len()) as u64)
+                .sum();
             if !self
                 .mesh
                 .send_bulk(peer, PeerMsg::BootstrapChunk { pid, ops: chunk })
                 .await
             {
                 return;
+            }
+            streamed_bytes += chunk_bytes;
+            self.engine
+                .metrics
+                .bootstrap_bytes_sent_total
+                .inc_by(chunk_bytes);
+            if rate > 0 {
+                let due = Duration::from_secs_f64(streamed_bytes as f64 / rate as f64);
+                if let Some(ahead) = due.checked_sub(started.elapsed()) {
+                    tokio::time::sleep(ahead).await;
+                }
             }
         }
         self.mesh
