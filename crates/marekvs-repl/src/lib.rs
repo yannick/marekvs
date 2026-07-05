@@ -421,10 +421,12 @@ impl ReplEngine {
         standalone_cfg: bool,
     ) -> Arc<ReplEngine> {
         let (incoming_tx, incoming_rx) = mpsc::channel(8192);
+        let (ae_tx, ae_rx) = mpsc::channel(8192);
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let mesh = Mesh::new(
             store.node_id,
             incoming_tx,
+            ae_tx,
             events_tx,
             Some((
                 engine.metrics.mesh_input_bytes_total.clone(),
@@ -582,6 +584,9 @@ impl ReplEngine {
 
         // 3. Incoming message pump.
         repl.clone().spawn_incoming(incoming_rx);
+        // Separate pump for the heavy AE/bootstrap lane: digest scans and
+        // partition streams must not head-of-line-block fetches.
+        repl.clone().spawn_incoming(ae_rx);
 
         // 4. Peer (re)connect events: send ResumeFrom on connect.
         repl.clone().spawn_peer_events(events_rx);

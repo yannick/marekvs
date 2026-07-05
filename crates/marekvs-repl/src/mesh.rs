@@ -65,18 +65,43 @@ pub struct Mesh {
     /// containers); reconnect loops check this slot each iteration and exit
     /// when superseded, and maintain_peer for the new address takes over.
     dial_addrs: parking_lot::Mutex<HashMap<NodeId, SocketAddr>>,
-    /// (peer, msg) stream consumed by the ReplEngine.
+    /// (peer, msg) stream consumed by the ReplEngine — latency-sensitive
+    /// lane (Repl/Ack/Fetch/Check/Interest/Publish).
     pub incoming_tx: mpsc::Sender<(NodeId, PeerMsg)>,
+    /// Heavy-work lane: anti-entropy + bootstrap messages. Digest scans and
+    /// partition streams must never head-of-line-block read-through
+    /// fetches on the latency lane (chaos join_empty_reads: post-join AE
+    /// bursts starved fetches into their 300 ms timeout → nil reads).
+    pub ae_tx: mpsc::Sender<(NodeId, PeerMsg)>,
     /// Peers connected/disconnected notifications (peer, connected). Fired
     /// on ctl-slot transitions only: bulk connects would trigger redundant
     /// ResumeFrom / interest churn.
     pub events_tx: mpsc::UnboundedSender<(NodeId, bool)>,
 }
 
+/// True for messages served on the heavy AE/bootstrap lane. Bootstrap
+/// chunk/done ordering is preserved: a connection's frames are routed
+/// per-message but every Bootstrap*/AE frame goes to the SAME lane.
+fn is_heavy_lane(msg: &PeerMsg) -> bool {
+    matches!(
+        msg,
+        PeerMsg::MerkleRoot { .. }
+            | PeerMsg::MerkleRootMatch { .. }
+            | PeerMsg::MerkleBuckets { .. }
+            | PeerMsg::BucketKeys { .. }
+            | PeerMsg::RepairOps { .. }
+            | PeerMsg::RequestKeys { .. }
+            | PeerMsg::BootstrapReq { .. }
+            | PeerMsg::BootstrapChunk { .. }
+            | PeerMsg::BootstrapDone { .. }
+    )
+}
+
 impl Mesh {
     pub fn new(
         node_id: NodeId,
         incoming_tx: mpsc::Sender<(NodeId, PeerMsg)>,
+        ae_tx: mpsc::Sender<(NodeId, PeerMsg)>,
         events_tx: mpsc::UnboundedSender<(NodeId, bool)>,
         traffic: Option<(prometheus::IntCounter, prometheus::IntCounter)>,
         conn_timeouts: Option<prometheus::IntCounter>,
@@ -88,6 +113,7 @@ impl Mesh {
             peers: RwLock::new(HashMap::new()),
             dial_addrs: parking_lot::Mutex::new(HashMap::new()),
             incoming_tx,
+            ae_tx,
             events_tx,
         })
     }
@@ -300,6 +326,11 @@ impl Mesh {
                             let _ = tx.try_send(PeerMsg::Pong { nonce });
                         }
                         PeerMsg::Pong { .. } => {}
+                        msg if is_heavy_lane(&msg) => {
+                            if self.ae_tx.send((peer, msg)).await.is_err() {
+                                break Ok(());
+                            }
+                        }
                         msg => {
                             if self.incoming_tx.send((peer, msg)).await.is_err() {
                                 break Ok(());
