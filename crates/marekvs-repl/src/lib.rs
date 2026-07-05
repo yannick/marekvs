@@ -6,11 +6,11 @@ pub mod ae;
 pub mod mesh;
 pub mod ring;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use marekvs_cluster::Cluster;
@@ -36,6 +36,90 @@ const RING_SEQ_RESTART_JUMP: u64 = 1_000_000;
 
 type InterestMap = HashMap<Pid, HashMap<Vec<u8>, HashMap<NodeId, Instant>>>;
 
+/// Warn (once per stall) after a peer's window has been full this long.
+const STALL_WARN: Duration = Duration::from_secs(5);
+
+/// Per-peer unacked send window (bytes). Design/05 defaults table: 4 MiB.
+fn repl_window_bytes() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MAREKVS_REPL_WINDOW_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(4 * 1024 * 1024)
+    })
+}
+
+/// Per-peer replication flow state. The ring is the retransmit buffer:
+/// `sent` advances only on a send that actually entered the writer queue,
+/// and a full unacked window stalls THIS peer's lane only — the entries
+/// stay in the ring and are re-read once acks drain the window. A peer
+/// that outruns the ring entirely hits the existing gap→anti-entropy path.
+#[derive(Debug)]
+struct PeerFlow {
+    /// Ring cursor: highest seq shipped to this peer.
+    sent: u64,
+    /// Highest seq the peer has acked (AckSeq carries ReplBatch.last_seq).
+    acked: u64,
+    /// (batch last_seq, batch bytes) awaiting ack, oldest first.
+    inflight: VecDeque<(u64, usize)>,
+    inflight_bytes: usize,
+    stalled_since: Option<Instant>,
+    stall_warned: bool,
+}
+
+impl PeerFlow {
+    fn at(seq: u64) -> PeerFlow {
+        PeerFlow {
+            sent: seq,
+            acked: seq,
+            inflight: VecDeque::new(),
+            inflight_bytes: 0,
+            stalled_since: None,
+            stall_warned: false,
+        }
+    }
+
+    fn window_full(&self, window: usize) -> bool {
+        self.inflight_bytes >= window
+    }
+
+    fn on_send(&mut self, last_seq: u64, bytes: usize) {
+        self.sent = last_seq;
+        self.inflight.push_back((last_seq, bytes));
+        self.inflight_bytes += bytes;
+    }
+
+    fn on_ack(&mut self, seq: u64) {
+        // A stale ack from before a ResumeFrom rewind must not run ahead of
+        // the rewound cursor.
+        let seq = seq.min(self.sent);
+        if seq > self.acked {
+            self.acked = seq;
+        }
+        while let Some(&(s, b)) = self.inflight.front() {
+            if s <= self.acked {
+                self.inflight_bytes -= b;
+                self.inflight.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.stalled_since = None;
+        self.stall_warned = false;
+    }
+
+    /// Connection died: nothing previously queued can be acked anymore. The
+    /// cursor stays — the peer's ResumeFrom on reconnect is authoritative.
+    fn clear_inflight(&mut self) {
+        self.inflight.clear();
+        self.inflight_bytes = 0;
+        self.stalled_since = None;
+        self.stall_warned = false;
+    }
+}
+
 pub struct ReplEngine {
     pub store: Arc<Store>,
     pub engine: Arc<Engine>,
@@ -49,8 +133,9 @@ pub struct ReplEngine {
     /// In-flight fetch/check requests.
     pending: Mutex<HashMap<u64, oneshot::Sender<PeerMsg>>>,
     next_req: AtomicU64,
-    /// Per-peer cursor into OUR ring (advances on send; reset by ResumeFrom).
-    cursors: Mutex<HashMap<NodeId, u64>>,
+    /// Per-peer flow state into OUR ring (cursor + unacked send window;
+    /// reset by ResumeFrom).
+    flows: Mutex<HashMap<NodeId, PeerFlow>>,
 }
 
 impl ReplEngine {
@@ -101,7 +186,7 @@ impl ReplEngine {
             leases: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             next_req: AtomicU64::new(1),
-            cursors: Mutex::new(HashMap::new()),
+            flows: Mutex::new(HashMap::new()),
         });
 
         // 1. Commit hook: every committed batch enters the ring (skip the
@@ -187,6 +272,14 @@ impl ReplEngine {
                 m.ring_ops.set(ops as i64);
                 m.ring_bytes.set(bytes as i64);
                 m.mesh_peers.set(self.mesh.connected_peers().len() as i64);
+                m.repl_inflight_bytes.set(
+                    self.flows
+                        .lock()
+                        .values()
+                        .map(|f| f.inflight_bytes)
+                        .max()
+                        .unwrap_or(0) as i64,
+                );
                 let stats = self.cluster.cluster_stats();
                 m.cluster_members.set(stats.members as i64);
                 m.cluster_underreplicated_partitions
@@ -289,6 +382,11 @@ impl ReplEngine {
                             subs.remove(&peer);
                         });
                     });
+                    // Nothing queued on the dead connection can be acked; a
+                    // vanished peer must not hold its window full forever.
+                    if let Some(flow) = self.flows.lock().get_mut(&peer) {
+                        flow.clear_inflight();
+                    }
                 }
             }
         });
@@ -341,8 +439,33 @@ impl ReplEngine {
         let view = self.cluster.view();
         let n = self.cluster.replicas_n;
         let last = self.ring.last_seq();
+        let window = repl_window_bytes();
         for peer in peers {
-            let cursor = *self.cursors.lock().entry(peer).or_insert(last);
+            // Window gate + cursor snapshot. A full window = unacked bytes in
+            // flight to a slow peer: stall THIS lane only, others unaffected.
+            let cursor = {
+                let mut flows = self.flows.lock();
+                let flow = flows.entry(peer).or_insert_with(|| PeerFlow::at(last));
+                if flow.window_full(window) {
+                    match flow.stalled_since {
+                        None => flow.stalled_since = Some(Instant::now()),
+                        Some(t) if !flow.stall_warned && t.elapsed() >= STALL_WARN => {
+                            flow.stall_warned = true;
+                            self.engine.metrics.repl_window_stalls_total.inc();
+                            tracing::warn!(
+                                peer,
+                                inflight_bytes = flow.inflight_bytes,
+                                acked = flow.acked,
+                                sent = flow.sent,
+                                "replication window full for >{STALL_WARN:?}: peer slow or not acking"
+                            );
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                flow.sent
+            };
             if cursor >= last {
                 continue;
             }
@@ -400,18 +523,23 @@ impl ReplEngine {
                 }
             }
             drop(interest);
-            self.cursors.lock().insert(peer, new_cursor);
             if ops.is_empty() {
+                // Nothing for this peer in the covered stretch: advance the
+                // cursor freely — nothing is in flight, the window is
+                // untouched, so filtered-only streams never stall.
+                let mut flows = self.flows.lock();
+                if let Some(flow) = flows.get_mut(&peer) {
+                    if flow.sent == cursor {
+                        flow.sent = new_cursor;
+                    }
+                }
                 tracing::debug!(peer, cursor, new_cursor, "pump: entries filtered to zero");
                 continue;
             }
             tracing::debug!(peer, n = ops.len(), "pump: sending ReplBatch");
-            self.engine.metrics.repl_batches_sent_total.inc();
-            self.engine
-                .metrics
-                .repl_ops_sent_total
-                .inc_by(ops.len() as u64);
-            if !self.mesh.send_ctl(
+            let op_count = ops.len() as u64;
+            let batch_bytes: usize = ops.iter().map(|o| o.ikey.len() + o.value.len()).sum();
+            let sent_ok = self.mesh.send_ctl(
                 peer,
                 PeerMsg::Repl(ReplBatch {
                     origin: self.store.node_id,
@@ -420,25 +548,44 @@ impl ReplEngine {
                     ops,
                     implicit_sub: false,
                 }),
-            ) {
-                // Cursor already advanced: this batch is silently demoted to
-                // anti-entropy latency. Counted here as fails-before evidence
-                // for the flow-control fix that removes this branch.
+            );
+            let mut flows = self.flows.lock();
+            let Some(flow) = flows.get_mut(&peer) else {
+                continue;
+            };
+            if sent_ok {
+                // Advance only if no ResumeFrom rewound the cursor while we
+                // were sending — a rewind is authoritative and the ring will
+                // re-serve (merges are idempotent, double delivery is safe).
+                if flow.sent == cursor {
+                    flow.on_send(new_cursor, batch_bytes);
+                }
+                self.engine.metrics.repl_batches_sent_total.inc();
+                self.engine.metrics.repl_ops_sent_total.inc_by(op_count);
+            } else {
+                // Writer queue full or peer gone: the cursor did NOT move, so
+                // the ring re-serves this stretch on the next pump. This was
+                // previously a silent drop demoted to anti-entropy latency.
                 self.engine.metrics.repl_send_failures_total.inc();
             }
         }
     }
 
-    /// Max unshipped ring backlog across connected peers (0 = fully drained).
-    /// The SIGTERM drain polls this so a leaving node does not exit with
-    /// acked-but-unshipped writes only it holds.
+    /// Max unshipped-or-unacked ring backlog across connected peers
+    /// (0 = fully drained). The SIGTERM drain polls this so a leaving node
+    /// does not exit with acked-but-unshipped writes only it holds; counting
+    /// in-flight batches makes "drained" mean the peer APPLIED them, not
+    /// merely that they entered a writer queue.
     pub fn pending_backlog(&self) -> u64 {
         let last = self.ring.last_seq();
-        let cursors = self.cursors.lock();
+        let flows = self.flows.lock();
         self.mesh
             .connected_peers()
             .iter()
-            .map(|p| last.saturating_sub(*cursors.get(p).unwrap_or(&last)))
+            .map(|p| match flows.get(p) {
+                Some(f) => last.saturating_sub(f.sent) + u64::from(!f.inflight.is_empty()),
+                None => 0,
+            })
             .max()
             .unwrap_or(0)
     }
@@ -551,9 +698,15 @@ impl ReplEngine {
                     },
                 );
             }
-            PeerMsg::AckSeq { .. } => {}
+            PeerMsg::AckSeq { seq, .. } => {
+                if let Some(flow) = self.flows.lock().get_mut(&peer) {
+                    flow.on_ack(seq);
+                }
+            }
             PeerMsg::ResumeFrom { seq, .. } => {
-                self.cursors.lock().insert(peer, seq);
+                // Reconnect: the peer's persisted applied-seq is authoritative;
+                // in-flight accounting from the dead connection is void.
+                self.flows.lock().insert(peer, PeerFlow::at(seq));
             }
             PeerMsg::Fetch { id, ikey } => {
                 let k = ikey.clone();
@@ -954,5 +1107,84 @@ impl ReadThrough for ReplEngine {
             }
             false
         })
+    }
+}
+
+#[cfg(test)]
+mod flow_tests {
+    use super::PeerFlow;
+
+    #[test]
+    fn send_then_ack_drains_window() {
+        let mut f = PeerFlow::at(10);
+        f.on_send(20, 1000);
+        f.on_send(30, 500);
+        assert_eq!(f.sent, 30);
+        assert_eq!(f.inflight_bytes, 1500);
+        f.on_ack(20);
+        assert_eq!(f.acked, 20);
+        assert_eq!(f.inflight_bytes, 500);
+        f.on_ack(30);
+        assert_eq!(f.inflight_bytes, 0);
+        assert!(f.inflight.is_empty());
+    }
+
+    #[test]
+    fn window_full_blocks_until_ack() {
+        let mut f = PeerFlow::at(0);
+        f.on_send(5, 4096);
+        assert!(f.window_full(4096));
+        assert!(!f.window_full(8192));
+        f.on_ack(5);
+        assert!(!f.window_full(4096));
+    }
+
+    #[test]
+    fn stale_ack_clamped_to_sent_after_rewind() {
+        let mut f = PeerFlow::at(100);
+        f.on_send(200, 64);
+        // ResumeFrom rewind to 150 (fresh state), then a stale ack for 200
+        // from the old connection arrives.
+        let mut f2 = PeerFlow::at(150);
+        f2.on_ack(200);
+        assert_eq!(f2.acked, 150, "stale ack must not run ahead of the cursor");
+        // On the original flow an ack beyond sent is also clamped.
+        f.on_ack(999);
+        assert_eq!(f.acked, 200);
+        assert_eq!(f.inflight_bytes, 0);
+    }
+
+    #[test]
+    fn out_of_order_ack_drains_all_covered_batches() {
+        let mut f = PeerFlow::at(0);
+        f.on_send(10, 100);
+        f.on_send(20, 100);
+        f.on_send(30, 100);
+        f.on_ack(30); // cumulative ack covers everything at once
+        assert_eq!(f.inflight_bytes, 0);
+        assert!(f.inflight.is_empty());
+    }
+
+    #[test]
+    fn clear_inflight_keeps_cursor() {
+        let mut f = PeerFlow::at(0);
+        f.on_send(10, 100);
+        f.clear_inflight();
+        assert_eq!(
+            f.sent, 10,
+            "cursor survives disconnect; ResumeFrom resets it"
+        );
+        assert_eq!(f.inflight_bytes, 0);
+        assert!(f.stalled_since.is_none());
+    }
+
+    #[test]
+    fn duplicate_ack_is_harmless() {
+        let mut f = PeerFlow::at(0);
+        f.on_send(10, 100);
+        f.on_ack(10);
+        f.on_ack(10);
+        assert_eq!(f.acked, 10);
+        assert_eq!(f.inflight_bytes, 0);
     }
 }

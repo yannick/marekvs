@@ -43,6 +43,8 @@ pub struct Metrics {
     pub repl_batches_sent_total: IntCounter,
     pub repl_ops_sent_total: IntCounter,
     pub repl_send_failures_total: IntCounter,
+    pub repl_window_stalls_total: IntCounter,
+    pub repl_inflight_bytes: IntGauge,
     pub repl_batches_received_total: IntCounter,
     pub repl_ops_applied_total: IntCounter,
     pub fetches_served_total: IntCounter,
@@ -190,6 +192,16 @@ impl Metrics {
                 registry,
                 "marekvs_repl_send_failures_total",
                 "Replication batches dropped because the peer's writer queue was full or the peer was absent"
+            ),
+            repl_window_stalls_total: counter!(
+                registry,
+                "marekvs_repl_window_stalls_total",
+                "Times a peer's unacked replication window stayed full past the warn threshold"
+            ),
+            repl_inflight_bytes: gauge!(
+                registry,
+                "marekvs_repl_inflight_bytes",
+                "Largest per-peer unacked replication window (bytes)"
             ),
             repl_batches_received_total: counter!(
                 registry,
