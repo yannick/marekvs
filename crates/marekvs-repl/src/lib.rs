@@ -219,6 +219,24 @@ fn disk_water_marks() -> (u8, u8) {
     })
 }
 
+/// Absolute-headroom gate for the write stop: percent alone misfires on a
+/// SHARED filesystem (a dev Docker VM disk routinely runs >90% used while
+/// tens of GB remain). ENOSPC is about absolute bytes, so the stop engages
+/// only when the percent threshold is crossed AND available space is below
+/// this floor. Dedicated volumes (k8s PVCs, the chaos tmpfs) are small
+/// enough that the floor is naturally breached at high-water.
+fn disk_min_avail_bytes() -> u64 {
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MAREKVS_DISK_MIN_AVAIL_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1024)
+            * 1024
+            * 1024
+    })
+}
+
 /// Per-peer unacked send window (bytes). Design/05 defaults table: 4 MiB.
 fn repl_window_bytes() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
@@ -541,7 +559,7 @@ impl ReplEngine {
             .write_stopped
             .load(std::sync::atomic::Ordering::Relaxed);
         let (high, low) = disk_water_marks();
-        if !stopped && used_pct >= high {
+        if !stopped && used_pct >= high && avail < disk_min_avail_bytes() {
             self.engine
                 .write_stopped
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -551,7 +569,7 @@ impl ReplEngine {
                 high,
                 "disk above high-water mark: refusing client write commands"
             );
-        } else if stopped && used_pct <= low {
+        } else if stopped && (used_pct <= low || avail >= 2 * disk_min_avail_bytes()) {
             self.engine
                 .write_stopped
                 .store(false, std::sync::atomic::Ordering::Relaxed);
