@@ -182,8 +182,12 @@ struct RejoinState {
 /// that let scale-ups serve empty reads cluster-wide.
 #[derive(Default)]
 struct JoinGate {
-    /// pid → last BootstrapReq send time.
-    bootstrap_pending: HashMap<Pid, Instant>,
+    /// pid → (last BootstrapReq send time, re-request attempts). Attempts
+    /// drive exponential backoff: a donor streams its request queue
+    /// SEQUENTIALLY, so "no chunk yet" usually means "still queued", not
+    /// "lost" — naive fixed-interval retries were measured re-streaming
+    /// every partition ~6x during a 100k-key join.
+    bootstrap_pending: HashMap<Pid, (Instant, u32)>,
     bootstrap_done: HashSet<Pid>,
     /// pid → last BootstrapChunk arrival (progress signal for retries).
     last_chunk_at: HashMap<Pid, Instant>,
@@ -779,23 +783,36 @@ impl ReplEngine {
         let n = self.cluster.replicas_n;
         let self_id = self.store.node_id;
         let mut changed = false;
+        let mut re_requests = 0usize;
         for pid in self.cluster.future_owned_pids() {
-            let (skip, resume) = {
+            let (skip, resume, attempts) = {
                 let now = Instant::now();
                 let g = self.gate.lock();
-                let recent = |t: Option<&Instant>| {
-                    t.is_some_and(|t| now.duration_since(*t) < BOOTSTRAP_RETRY)
-                };
                 // Done pids are never re-requested: nothing empties a
                 // partition today (no cold purge), so done-and-empty cannot
                 // occur; revisit when cold_purge lands.
-                let skip = g.bootstrap_done.contains(&pid)
-                    || recent(g.bootstrap_pending.get(&pid))
-                    || recent(g.last_chunk_at.get(&pid));
-                (skip, g.resume_pids.contains(&pid))
+                let entry = g.bootstrap_pending.get(&pid);
+                let attempts = entry.map(|(_, a)| *a).unwrap_or(0);
+                let backoff = BOOTSTRAP_RETRY * 2u32.saturating_pow(attempts.min(6));
+                let awaiting_req = entry.is_some_and(|(t, _)| now.duration_since(*t) < backoff);
+                let progressing = g
+                    .last_chunk_at
+                    .get(&pid)
+                    .is_some_and(|t| now.duration_since(*t) < BOOTSTRAP_RETRY);
+                let skip = g.bootstrap_done.contains(&pid) || awaiting_req || progressing;
+                let next_attempts = if entry.is_some() { attempts + 1 } else { 0 };
+                (skip, g.resume_pids.contains(&pid), next_attempts)
             };
             if skip {
                 continue;
+            }
+            // Cap re-requests per sweep: the donor's stream queue is
+            // sequential — flooding it with duplicates only slows the join.
+            if attempts > 0 {
+                re_requests += 1;
+                if re_requests > 64 {
+                    continue;
+                }
             }
             let owners = view.owners(pid, n);
             let Some(source) = owners.iter().find(|o| **o != self_id).copied() else {
@@ -816,7 +833,7 @@ impl ReplEngine {
                 self.gate
                     .lock()
                     .bootstrap_pending
-                    .insert(pid, Instant::now());
+                    .insert(pid, (Instant::now(), attempts));
                 changed = true;
                 self.mesh
                     .send_bulk(source, PeerMsg::BootstrapReq { pid })
