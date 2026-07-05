@@ -194,6 +194,12 @@ struct JoinGate {
     /// Unfinished bootstraps from a previous incarnation (JOIN_PENDING_KEY):
     /// re-requested even though locally non-empty.
     resume_pids: HashSet<Pid>,
+    /// Monotonic count of BootstrapChunks applied; retry sweeps compare it
+    /// to `last_sweep_applied` — ANY forward progress defers re-requests.
+    /// (Wall-clock staleness checks failed here: duplicate streams flooded
+    /// the apply queue, made progress LOOK stale, and re-requested more.)
+    chunks_applied: u64,
+    last_sweep_applied: u64,
     /// Partitions the gc_grace rejoin still has to full-sync (item #3);
     /// holds the gate exactly like pending bootstraps.
     rejoin_pending: HashSet<Pid>,
@@ -399,6 +405,11 @@ pub struct ReplEngine {
     gate: Mutex<JoinGate>,
     /// gc_grace pull-only rejoin state (Tier-1 #3).
     rejoin: Mutex<RejoinState>,
+    /// Donor-side bootstrap dedup: (peer, pid) → last stream start. A
+    /// duplicate BootstrapReq within the window is dropped — retry-happy
+    /// joiners cannot amplify streams at the source (measured 9x
+    /// re-streaming feedback loops before this existed).
+    streams_served: Mutex<HashMap<(NodeId, Pid), Instant>>,
     /// AE root cache: pid → (root, computed_at). Entries are invalidated by
     /// the commit hook's dirty set; quiescent partitions cost NO scan per
     /// round (previously the whole keyspace was re-hashed every ~5 s —
@@ -520,6 +531,7 @@ impl ReplEngine {
                 unsynced: HashSet::new(),
                 cutoff_wall_ms: alive_last,
             }),
+            streams_served: Mutex::new(HashMap::new()),
             ae_roots: Mutex::new(HashMap::new()),
             ae_dirty: ae_dirty.clone(),
             started: Instant::now(),
@@ -789,18 +801,17 @@ impl ReplEngine {
         let self_id = self.store.node_id;
         let mut changed = false;
         let mut re_requests = 0usize;
-        // Global progress signal: while ANY bootstrap chunk arrived within
-        // the retry window, the donor pipeline is alive and merely working
-        // through its SEQUENTIAL queue — re-requesting queued pids only
-        // duplicates streams (measured 6-7x amplification). Re-requests fire
-        // only once the pipe has gone quiet.
+        // Global progress signal: if ANY chunk was applied since the last
+        // sweep, the donor pipeline is alive and merely working through its
+        // SEQUENTIAL queue — re-requesting queued pids only duplicates
+        // streams (measured up to 9x amplification, a runaway feedback
+        // loop). Monotonic counter compare, deliberately NOT wall-clock:
+        // a flooded apply queue makes wall-clock progress look stale.
         let pipe_active = {
-            let g = self.gate.lock();
-            let now = Instant::now();
-            !g.bootstrap_pending.is_empty()
-                && g.last_chunk_at
-                    .values()
-                    .any(|t| now.duration_since(*t) < BOOTSTRAP_RETRY)
+            let mut g = self.gate.lock();
+            let advanced = g.chunks_applied != g.last_sweep_applied;
+            g.last_sweep_applied = g.chunks_applied;
+            advanced
         };
         for pid in self.cluster.future_owned_pids() {
             let (skip, resume, attempts) = {
@@ -1675,17 +1686,39 @@ impl ReplEngine {
                 // served empty home reads). No reply = the joiner's pending
                 // entry holds its join gate and its backoff re-requests
                 // from the right owner once views converge.
-                if self.cluster.owned_pids().contains(&pid) {
-                    self.stream_partition(peer, pid).await;
-                } else {
+                if !self.cluster.owned_pids().contains(&pid) {
                     tracing::info!(pid, peer, "refusing bootstrap request: not an owner");
+                } else {
+                    // Dedup: a joiner may re-request a pid that is merely
+                    // queued behind our other streams — serving duplicates
+                    // amplifies (up to 9x measured) and floods its apply
+                    // path. One stream per (peer, pid) per window.
+                    let dup = {
+                        let now = Instant::now();
+                        let mut served = self.streams_served.lock();
+                        served.retain(|_, t| now.duration_since(*t) < 4 * BOOTSTRAP_RETRY);
+                        if served.contains_key(&(peer, pid)) {
+                            true // do NOT re-stamp: a lost stream must
+                                 // become re-servable when the window ends
+                        } else {
+                            served.insert((peer, pid), now);
+                            false
+                        }
+                    };
+                    if dup {
+                        tracing::debug!(pid, peer, "duplicate bootstrap request ignored");
+                    } else {
+                        self.stream_partition(peer, pid).await;
+                    }
                 }
             }
             PeerMsg::BootstrapChunk { pid, ops } => {
                 for op in ops {
                     self.apply_op_from(op, Some(peer)).await;
                 }
-                self.gate.lock().last_chunk_at.insert(pid, Instant::now());
+                let mut g = self.gate.lock();
+                g.last_chunk_at.insert(pid, Instant::now());
+                g.chunks_applied += 1;
             }
             PeerMsg::BootstrapDone { pid, .. } => {
                 tracing::info!(pid, peer, "partition bootstrap complete");
