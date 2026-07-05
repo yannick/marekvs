@@ -415,6 +415,9 @@ pub struct ReplEngine {
     /// Pids written since their root was last computed (set by the commit
     /// hook on every committed op, including AE repairs and rejoin drops).
     ae_dirty: Arc<Mutex<HashSet<Pid>>>,
+    /// This process is a healthy member returning within gc_grace: skip
+    /// bootstrapping locally-empty partitions (see ReplEngine::start).
+    returning_member: bool,
     started: Instant,
 }
 
@@ -497,6 +500,16 @@ impl ReplEngine {
         let down_ms = store::now_ms().saturating_sub(alive_last);
         let rejoin_needed =
             !standalone_cfg && alive_last > 0 && down_ms > store::gc_grace().as_millis() as u64;
+        // Returning member: was Active (has alive:last) and back within
+        // gc_grace. Its data is durable and it was caught up when it left,
+        // so its locally-EMPTY partitions are legitimately empty — it must
+        // NOT re-bootstrap them (that walks the whole keyspace one empty
+        // round-trip at a time; a near-empty cluster made a graceful
+        // restart take ~30 s+ and blow the readiness window). Any drift
+        // during the brief absence is healed by the ring resume + AE. A
+        // fresh/wiped node (no alive:last) still bootstraps, since ITS
+        // empty partitions may hold data on donors.
+        let returning_member = !standalone_cfg && alive_last > 0 && !rejoin_needed;
         if rejoin_needed {
             tracing::warn!(
                 down_secs = down_ms / 1000,
@@ -505,6 +518,12 @@ impl ReplEngine {
                  partitions sync (and shed stale extras) before serving"
             );
             engine.metrics.rejoin_active.set(1);
+        } else if returning_member {
+            tracing::info!(
+                down_secs = down_ms / 1000,
+                "returning member within gc_grace: fast rejoin (data present, \
+                 empty partitions not re-bootstrapped; drift healed by AE)"
+            );
         }
 
         let repl = Arc::new(ReplEngine {
@@ -530,6 +549,7 @@ impl ReplEngine {
             streams_served: Mutex::new(HashMap::new()),
             ae_roots: Mutex::new(HashMap::new()),
             ae_dirty: ae_dirty.clone(),
+            returning_member,
             started: Instant::now(),
         });
 
@@ -889,7 +909,10 @@ impl ReplEngine {
                     !any
                 })
                 .await;
-            if empty || resume {
+            // A returning member does NOT bootstrap its empty partitions
+            // (they were empty when it left; AE heals any drift). Only fresh
+            // nodes pull empty partitions, and only interrupted joins resume.
+            if (empty && !self.returning_member) || resume {
                 self.gate
                     .lock()
                     .bootstrap_pending
