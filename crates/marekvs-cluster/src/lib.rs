@@ -337,6 +337,22 @@ impl Cluster {
             .collect()
     }
 
+    /// Owners of `pid` under the placement that INCLUDES this node as an
+    /// Active candidate (the post-join world), excluding self. For a
+    /// rejoiner these are its pre-outage co-owners — the peers that held
+    /// the partition's data alongside it.
+    pub fn future_co_owners(&self, pid: Pid) -> Vec<NodeId> {
+        let view = self.view();
+        let mut candidates = view.owner_candidates();
+        if !candidates.iter().any(|(id, _)| *id == self.self_id) {
+            candidates.push((self.self_id, true));
+        }
+        owners_for(&candidates, pid, self.replicas_n)
+            .into_iter()
+            .filter(|o| *o != self.self_id)
+            .collect()
+    }
+
     pub fn cluster_stats(&self) -> ClusterStats {
         let view = self.view();
         let candidates = view.owner_candidates();

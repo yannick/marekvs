@@ -1048,23 +1048,32 @@ impl ReplEngine {
                     }
                 }
                 let pids: Vec<Pid> = self.rejoin.lock().unsynced.iter().copied().collect();
-                let n = self.cluster.replicas_n;
                 for pid in pids {
-                    let owners: Vec<NodeId> = view
-                        .owners(pid, n)
+                    // Sync against the pid's CO-OWNER (self-included
+                    // placement): the peer that held the data alongside us
+                    // before the outage. Syncing against a current-view
+                    // owner is WRONG — with us excluded, that set includes
+                    // a node that became owner at our crash and may still
+                    // be empty (re-replication in progress); its Merkle
+                    // want-set is "everything" and the extras-drop would
+                    // destroy our valid copy.
+                    let co: Vec<NodeId> = self
+                        .cluster
+                        .future_co_owners(pid)
                         .into_iter()
                         .filter(|o| {
-                            *o != self_id
-                                && view
-                                    .members
-                                    .iter()
-                                    .any(|m| m.node == *o && m.phase == NodePhase::Active)
+                            view.members
+                                .iter()
+                                .any(|m| m.node == *o && m.phase == NodePhase::Active)
                         })
                         .collect();
-                    if owners.is_empty() {
+                    if co.is_empty() {
+                        // Co-owner down: hold this pid; the driver retries
+                        // every round, and the sole-survivor/timeout paths
+                        // bound the overall wait.
                         continue;
                     }
-                    let peer = owners[(self.pseudo_rand() % owners.len() as u64) as usize];
+                    let peer = co[(self.pseudo_rand() % co.len() as u64) as usize];
                     let root = self.partition_root_cached(pid).await;
                     if root == 0 {
                         // Drained empty (all extras dropped, nothing pulled
@@ -1649,14 +1658,21 @@ impl ReplEngine {
                     let r = self.rejoin.lock();
                     (r.active, r.unsynced.contains(&pid), r.cutoff_wall_ms)
                 };
-                if rejoin_active && rejoin_home {
-                    // gc_grace rejoin: records the sync source requests from
-                    // an unsynced home partition are, by construction,
-                    // records ONLY WE hold — written before we died, so
-                    // their delete-tombstones may already be purged
-                    // cluster-wide. Serving them would resurrect deletes;
-                    // drop them instead (Cassandra's down-past-gc_grace
-                    // rule, scoped to exactly what healthy owners lack).
+                if rejoin_active
+                    && rejoin_home
+                    && self.cluster.future_co_owners(pid).contains(&peer)
+                {
+                    // gc_grace rejoin: records our CO-OWNER requests from an
+                    // unsynced home partition are, by construction, records
+                    // ONLY WE hold — written before we died, so their
+                    // delete-tombstones may already be purged cluster-wide.
+                    // Serving them would resurrect deletes; drop them
+                    // instead (Cassandra's down-past-gc_grace rule). The
+                    // co-owner restriction is load-bearing: any OTHER
+                    // requester (e.g. a crash-era owner still being
+                    // re-replicated) legitimately lacks most of the
+                    // partition, and honoring its want-set would destroy
+                    // our valid copy.
                     let mut dropped = 0u64;
                     for op in ops {
                         let stale = Envelope::decode(&op.value)
@@ -1679,11 +1695,17 @@ impl ReplEngine {
                             .inc_by(dropped);
                         tracing::info!(pid, dropped, "rejoin: dropped stale extra records");
                     }
-                } else if rejoin_active && !self.cluster.future_owned_pids().contains(&pid) {
-                    // Non-home stranded data on a >gc_grace rejoiner: refuse
-                    // to serve while rejoining, but do NOT delete — it may
-                    // be the last copy of validly-unshipped writes. (After
-                    // Active, stranded-AE resumes; documented residual.)
+                } else if rejoin_active {
+                    // While rejoining, NEVER serve records to anyone else:
+                    // - home pids to a non-co-owner (e.g. a crash-era owner
+                    //   being re-replicated): our records may be stale
+                    //   post-gc_grace state — serving them is the
+                    //   resurrection vector via a third party. Refuse, but
+                    //   do NOT delete (only the co-owner's want-set is
+                    //   proof of "extras only we hold").
+                    // - non-home stranded data: refuse but keep — it may be
+                    //   the last copy of validly-unshipped writes. (After
+                    //   Active, stranded-AE resumes; documented residual.)
                 } else if !ops.is_empty() {
                     self.mesh.send_ctl(peer, PeerMsg::RepairOps { pid, ops });
                 }
