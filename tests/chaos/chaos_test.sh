@@ -352,6 +352,47 @@ lossy_writes() {
   check_replication_healed 120
 }
 
+# ── scenario: blackhole_conn (debug, docker) ─────────────────────────────
+# Wedged-but-open TCP: drop mesh TCP between nodes 0↔1 while gossip UDP
+# stays up, so membership keeps BOTH nodes Active while their replication
+# link is silently dead (the conntrack-blackhole failure). The mesh
+# heartbeat (1 s ping / 3 s idle timeout) must close the dead connections —
+# mesh_peers drops — and reconnect + ResumeFrom must recover after heal.
+blackhole_conn() {
+  require_debug "conntrack blackhole"
+  [ "$BACKEND" = docker ] || { echo "  (skipped: blackhole needs the docker backend)"; return 0; }
+  fresh_cluster
+  counter_workload chaos:cnt 45 & local W1=$!
+  set_workload chaos:set 45 & local W2=$!
+  sleep 5
+  blackhole 0 1
+  # Heartbeat must detect the dead connections within ~2× idle timeout.
+  local deadline=$((SECONDS + 12)) ok=0 p0 p1
+  while [ $SECONDS -lt "$deadline" ]; do
+    p0=$(metric_value 0 marekvs_mesh_peers); p1=$(metric_value 1 marekvs_mesh_peers)
+    if [ "${p0:-9}" -le 1 ] && [ "${p1:-9}" -le 1 ]; then ok=1; break; fi
+    sleep 1
+  done
+  chk $((1 - ok)) "heartbeat closed wedged connections (mesh_peers dropped)" \
+    "mesh_peers node0=${p0:-?} node1=${p1:-?} after 12s (ghost handles?)"
+  sleep 8
+  blackhole_heal
+  deadline=$((SECONDS + 20)); ok=0
+  while [ $SECONDS -lt "$deadline" ]; do
+    p0=$(metric_value 0 marekvs_mesh_peers); p1=$(metric_value 1 marekvs_mesh_peers)
+    if [ "${p0:-0}" -ge 2 ] && [ "${p1:-0}" -ge 2 ]; then ok=1; break; fi
+    sleep 1
+  done
+  chk $((1 - ok)) "mesh reconnected after heal" \
+    "mesh_peers node0=${p0:-?} node1=${p1:-?} after 20s"
+  wait $W1 $W2
+  sleep 3
+  check_counter chaos:cnt 90
+  check_set chaos:set 90
+  check_converged "counter" 90 get chaos:cnt
+  check_replication_healed 120
+}
+
 # ── scenario: clock_bump_skew (debug, apple) ─────────────────────────────
 # Per-VM clocks (apple) let us skew ONE node's wall clock while it takes
 # writes. The HLC receive rule must absorb it: a node bumped +N seconds must

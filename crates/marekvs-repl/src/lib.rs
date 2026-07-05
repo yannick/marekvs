@@ -73,6 +73,7 @@ impl ReplEngine {
                 engine.metrics.mesh_input_bytes_total.clone(),
                 engine.metrics.mesh_output_bytes_total.clone(),
             )),
+            Some(engine.metrics.mesh_conn_timeouts_total.clone()),
         );
         // Resume the ring seq space ABOVE anything consumers may have seen
         // from a previous incarnation (see Ring::new_starting_at). The jump

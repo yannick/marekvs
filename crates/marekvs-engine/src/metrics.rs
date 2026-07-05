@@ -37,6 +37,7 @@ pub struct Metrics {
     pub mesh_input_bytes_total: IntCounter,
     pub mesh_output_bytes_total: IntCounter,
     pub mesh_peers: IntGauge,
+    pub mesh_conn_timeouts_total: IntCounter,
 
     // --- replication (repl) ---
     pub repl_batches_sent_total: IntCounter,
@@ -167,6 +168,11 @@ impl Metrics {
                 registry,
                 "marekvs_mesh_peers",
                 "Peer nodes with at least one live mesh connection"
+            ),
+            mesh_conn_timeouts_total: counter!(
+                registry,
+                "marekvs_mesh_conn_timeouts_total",
+                "Mesh connections closed by heartbeat idle timeout"
             ),
 
             repl_batches_sent_total: counter!(

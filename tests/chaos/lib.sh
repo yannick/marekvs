@@ -276,6 +276,30 @@ grudge_heal() { # flush all grudge rules on every node
   done
 }
 
+# ── conntrack blackhole (debug image, iptables) ──────────────────────────
+# Wedge the ESTABLISHED mesh TCP connections between two nodes without
+# closing them: drop mesh-port TCP in both directions on both nodes, but
+# leave gossip UDP (7946) untouched. Membership keeps both nodes Active
+# while their replication link is silently dead — the exact failure the
+# mesh heartbeat exists to detect (phi-accrual can't see it).
+
+blackhole() { # <a> <b>
+  require_debug "conntrack blackhole"
+  echo "  nemesis: blackhole mesh TCP between node $1 and node $2"
+  local a b
+  for pair in "$1 $2" "$2 $1"; do
+    read -r a b <<<"$pair"
+    nexec "$a" iptables -A INPUT  -p tcp -s "$(mesh_ip "$b")" --dport 7373 -j DROP 2>/dev/null || true
+    nexec "$a" iptables -A INPUT  -p tcp -s "$(mesh_ip "$b")" --sport 7373 -j DROP 2>/dev/null || true
+    nexec "$a" iptables -A OUTPUT -p tcp -d "$(mesh_ip "$b")" --dport 7373 -j DROP 2>/dev/null || true
+    nexec "$a" iptables -A OUTPUT -p tcp -d "$(mesh_ip "$b")" --sport 7373 -j DROP 2>/dev/null || true
+  done
+}
+
+blackhole_heal() { # flush on every node (same rules table as grudge)
+  grudge_heal
+}
+
 # ── tc-netem packet faults (debug image) ─────────────────────────────────
 # Shape the mesh nic of one node. root qdisc, so a second call replaces the
 # first; net_clear removes it.
@@ -580,6 +604,11 @@ capture_logs() { # <label>
     crt logs "chaos-$i" > "$CHAOS_DIR/logs.$1.node$i" 2>&1 || true
   done
   echo "  (node logs captured to $CHAOS_DIR/logs.$1.*)"
+}
+
+# One unlabeled prometheus metric from node i ("" when absent/unreachable).
+metric_value() { # <i> <metric_name>
+  metrics "$1" | awk -v m="$2" '$1 == m {print $2; exit}'
 }
 
 # Every node's underreplicated gauge must return to 0 after faults — this
