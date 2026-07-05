@@ -1,0 +1,25 @@
+# docsgen — the marekvs documentation site generator.
+#
+# Deliberately its OWN workspace (note the empty [workspace] table below) so a
+# docs build never has to resolve the marekvs↔ondadb dependency graph: it is a
+# self-contained, build-time-only dev tool and is never linked into any shipped
+# binary. Build it with `cargo run --manifest-path crates/docsgen/Cargo.toml`
+# (or `just docs`).
+[package]
+name = "docsgen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Static-site generator for the marekvs documentation website."
+
+[workspace]
+
+[dependencies]
+pulldown-cmark = "0.12"
+# Pure-Rust highlighting (fancy-regex, no C/oniguruma), default syntaxes+themes.
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = 2

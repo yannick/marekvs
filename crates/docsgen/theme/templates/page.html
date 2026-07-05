@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{title}}</title>
+<meta name="description" content="{{description}}">
+<link rel="icon" type="image/svg+xml" href="{{base}}/assets/brand/favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{base}}/assets/brand/tokens.css">
+<link rel="stylesheet" href="{{base}}/assets/site.css">
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem('mk-theme');
+      if (!t) t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      document.documentElement.dataset.theme = t;
+    } catch (e) { document.documentElement.dataset.theme = 'light'; }
+  })();
+</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="{{base}}/" aria-label="{{site_title}} home">
+      <img src="{{base}}/assets/brand/marekvs-icon.svg" width="42" height="42" alt="">
+      <span class="wordmark"><span class="w1">mare</span><span class="w2">kvs</span></span>
+    </a>
+    <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">
+      <span></span><span></span><span></span>
+    </button>
+    <nav class="topnav">
+      <a href="{{base}}/docs/overview/">Docs</a>
+      <a href="{{base}}/docs/quickstart/">Quickstart</a>
+      <a href="{{base}}/docs/redis-api/">API</a>
+      <a class="ext" href="{{github}}" target="_blank" rel="noopener">GitHub ↗</a>
+      <button class="theme-toggle" aria-label="Toggle theme" title="Toggle theme">
+        <span class="ico-sun">☀</span><span class="ico-moon">☾</span>
+      </button>
+    </nav>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="sidebar" id="sidebar">
+    <nav class="sidenav">{{sidebar}}</nav>
+  </aside>
+
+  <main class="content" id="main">
+    <article class="doc">
+      <div class="doc-head">
+        <h1>{{page_title}}</h1>
+        {{status}}
+      </div>
+      {{content}}
+      <div class="doc-footer">
+        <a class="edit" href="{{github}}" target="_blank" rel="noopener">Edit on GitHub ↗</a>
+      </div>
+    </article>
+  </main>
+
+  <aside class="onthispage">
+    <nav class="toc">{{toc}}</nav>
+  </aside>
+</div>
+
+<footer class="sitefoot">
+  <div class="sitefoot-inner">
+    <div class="foot-brand">
+      <img src="{{base}}/assets/brand/marekvs-icon.svg" width="22" height="22" alt="">
+      <span><span class="w1">mare</span><span class="w2">kvs</span> — distributed, Redis-compatible KV.</span>
+    </div>
+    <div class="foot-links">
+      <a href="{{base}}/docs/overview/">Documentation</a>
+      <a href="{{github}}" target="_blank" rel="noopener">GitHub</a>
+      <span class="foot-sub">© 2026 Yannick Koechlin · All rights reserved</span>
+    </div>
+  </div>
+</footer>
+
+<script src="{{base}}/assets/site.js" defer></script>
+</body>
+</html>

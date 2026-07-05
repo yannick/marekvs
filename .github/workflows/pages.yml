@@ -1,0 +1,63 @@
+# Build the documentation website (docs/*.md → _site) and publish it to
+# GitHub Pages. docsgen is its own isolated cargo workspace with no ondadb
+# dependency, so this needs nothing but a Rust toolchain — no sibling checkout.
+#
+# Enable once under Settings → Pages → "Build and deployment" → Source:
+# "GitHub Actions".
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "crates/docsgen/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One live deployment at a time; let an in-progress run finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/docsgen
+
+      - name: build site
+        # base_path is "/<repo>" for a project site, "" for a user/custom-domain
+        # site — configure-pages figures it out so links resolve either way.
+        env:
+          DOCS_BASE: ${{ steps.pages.outputs.base_path }}
+        run: cargo run --manifest-path crates/docsgen/Cargo.toml --release
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

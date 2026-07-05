@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{title}}</title>
+<meta name="description" content="marekvs — a distributed, Redis-compatible key-value database in Rust. AP by design, disk-native, Kubernetes-native.">
+<link rel="icon" type="image/svg+xml" href="{{base}}/assets/brand/favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{base}}/assets/brand/tokens.css">
+<link rel="stylesheet" href="{{base}}/assets/site.css">
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem('mk-theme');
+      if (!t) t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      document.documentElement.dataset.theme = t;
+    } catch (e) { document.documentElement.dataset.theme = 'light'; }
+  })();
+</script>
+</head>
+<body class="landing">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="{{base}}/" aria-label="{{site_title}} home">
+      <img src="{{base}}/assets/brand/marekvs-icon.svg" width="42" height="42" alt="">
+      <span class="wordmark"><span class="w1">mare</span><span class="w2">kvs</span></span>
+    </a>
+    <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">
+      <span></span><span></span><span></span>
+    </button>
+    <nav class="topnav">
+      <a href="{{base}}/docs/overview/">Docs</a>
+      <a href="{{base}}/docs/quickstart/">Quickstart</a>
+      <a href="{{base}}/docs/redis-api/">API</a>
+      <a class="ext" href="{{github}}" target="_blank" rel="noopener">GitHub ↗</a>
+      <button class="theme-toggle" aria-label="Toggle theme" title="Toggle theme">
+        <span class="ico-sun">☀</span><span class="ico-moon">☾</span>
+      </button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- HERO -->
+  <section class="hero">
+    <div class="hero-inner">
+      <div class="hero-copy">
+        <div class="hero-mark">
+          <img src="{{base}}/assets/brand/marekvs-icon.svg" width="88" height="88" alt="marekvs logo">
+          <span class="hero-wordmark"><span class="w1">mare</span><span class="w2">kvs</span></span>
+        </div>
+        <span class="eyebrow">Distributed · Redis-compatible · Rust</span>
+        <h1>The key-value store that <span class="grad">moves like the tide.</span></h1>
+        <p class="lede">
+          marekvs speaks the Redis protocol, but underneath it's an
+          <strong>AP, coordination-free</strong> database: no leader, no quorum,
+          no in-memory dataset. Writes are fire-and-forget and converge through
+          hybrid logical clocks and CRDT merges. Any node serves any key.
+        </p>
+        <div class="hero-cta">
+          <a class="btn btn-primary" href="{{base}}/docs/quickstart/">Get started</a>
+          <a class="btn btn-ghost" href="{{github}}" target="_blank" rel="noopener">View on GitHub ↗</a>
+        </div>
+        <div class="hero-chips">
+          <span class="chip">RESP2 + RESP3</span>
+          <span class="chip">:6379</span>
+          <span class="chip"><code>FROM scratch</code> image</span>
+          <span class="chip">Kubernetes operator</span>
+        </div>
+      </div>
+      <div class="hero-art">
+        <div class="term">
+          <div class="term-bar"><span></span><span></span><span></span><em>redis-cli</em></div>
+<pre><code><span class="p">$</span> redis-cli -p 6379
+<span class="c">marekvs&gt;</span> SET greeting hello
+<span class="o">OK</span>
+<span class="c">marekvs&gt;</span> SADD tags rust distributed redis
+<span class="o">(integer) 3</span>
+<span class="c">marekvs&gt;</span> INCR visits
+<span class="o">(integer) 1</span>
+<span class="dim"># … and every node already has it.</span></code></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- FEATURES -->
+  <section class="band">
+    <div class="section-head">
+      <span class="sec-num">01</span><h2>Built for movement, not coordination</h2><div class="rule"></div>
+    </div>
+    <div class="feature-grid">
+      <div class="feat card">
+        <div class="feat-ico">◆</div>
+        <h3>Redis protocol</h3>
+        <p>RESP2 &amp; RESP3 over the same <code>:6379</code> your clients already
+        use. Strings, hashes, sets, sorted sets, lists, streams, pub/sub, HyperLogLog.</p>
+      </div>
+      <div class="feat card">
+        <div class="feat-ico">⇄</div>
+        <h3>Convergent replication</h3>
+        <p>Hybrid logical clocks + ORSWOT / PN-counter merges. Concurrent
+        <code>SADD</code>s on different nodes both survive; deletes never resurrect.</p>
+      </div>
+      <div class="feat card">
+        <div class="feat-ico">◎</div>
+        <h3>Dynamic replication</h3>
+        <p>Any node serves any key. Read a remote key and the node caches it and
+        subscribes to its updates — replication follows demand.</p>
+      </div>
+      <div class="feat card">
+        <div class="feat-ico">⏱</div>
+        <h3>Bounded staleness</h3>
+        <p>Sequence-cursor catch-up plus Merkle anti-entropy repair divergence
+        within seconds. Milliseconds typical, 15&nbsp;s worst case.</p>
+      </div>
+      <div class="feat card">
+        <div class="feat-ico">☸</div>
+        <h3>Kubernetes-native</h3>
+        <p>Gossip membership, DNS-seeded discovery, a StatefulSet, and a
+        <code>MarekvsCluster</code> operator with safe scaling and autoscaling.</p>
+      </div>
+      <div class="feat card">
+        <div class="feat-ico">λ</div>
+        <h3>Lua scripting</h3>
+        <p><code>EVAL</code> / <code>EVALSHA</code> with Redis-grade atomicity
+        when keys co-locate via hash tags. Script <em>effects</em> replicate, never the script.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- GUARANTEES -->
+  <section class="band alt">
+    <div class="section-head">
+      <span class="sec-num">02</span><h2>What we promise — and what we don't</h2><div class="rule"></div>
+    </div>
+    <p class="band-lede">marekvs is <strong>AP</strong>: available and partition-tolerant, eventually
+    consistent. These are the guarantees the docs stand behind.</p>
+    <div class="card table-card">
+      <table class="guarantees">
+        <thead><tr><th>Guarantee</th><th>What it means</th></tr></thead>
+        <tbody>
+          <tr><td>Read-your-writes</td><td>A connection always sees its own prior writes.</td></tr>
+          <tr><td>Monotonic reads</td><td>A connection's reads never go backward in time.</td></tr>
+          <tr><td>Convergence</td><td>Given no new writes, all replicas reach the same value.</td></tr>
+          <tr><td>No resurrection</td><td>A deleted key stays deleted; tombstones outlive repair.</td></tr>
+          <tr><td>Exact counters</td><td>Concurrent <code>INCR</code>/<code>DECR</code> across nodes are never lost.</td></tr>
+          <tr><td>Bounded staleness</td><td>Cross-node divergence heals within seconds (15&nbsp;s worst case).</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="fineprint">
+      <strong>Not</strong> linearizable, not CP, no cross-node transactions, no
+      Redis Cluster <code>MOVED</code>/<code>ASK</code> redirects. Two clients on
+      two nodes can briefly read different values. See
+      <a href="{{base}}/docs/consistency/">Consistency</a>.
+    </p>
+  </section>
+
+  <!-- ARCHITECTURE -->
+  <section class="band">
+    <div class="section-head">
+      <span class="sec-num">03</span><h2>System shape at a glance</h2><div class="rule"></div>
+    </div>
+    <div class="card diagram-card">
+<pre class="ascii"><code>          Redis clients (redis-cli, any RESP driver)
+                          │  :6379
+        ┌─────────────────┴─────────────────┐
+        │        Kubernetes Service          │
+        └──┬──────────────┬──────────────┬───┘
+           │              │              │
+      ┌────┴───┐     ┌────┴───┐     ┌────┴───┐
+      │ pod 0  │     │ pod 1  │     │ pod 2  │
+      │ RESP   │     │ RESP   │     │ RESP   │
+      │ engine │     │ engine │     │ engine │
+      │ ondaDB │ ⇄   │ ondaDB │ ⇄   │ ondaDB │   :7373 mesh
+      └────────┘     └────────┘     └────────┘
+           └──────── chitchat gossip ─────────┘  :7946/udp</code></pre>
+    </div>
+    <p class="band-lede">Five subsystems per node — RESP frontend, command engine,
+    disk-native storage (ondaDB LSM), replication engine, and the gossip cluster
+    layer. <a href="{{base}}/docs/architecture/">Read the architecture →</a></p>
+  </section>
+
+  <!-- PERFORMANCE -->
+  <section class="band alt">
+    <div class="section-head">
+      <span class="sec-num">04</span><h2>Honest about performance</h2><div class="rule"></div>
+    </div>
+    <div class="stat-row">
+      <div class="stat card"><div class="stat-num">~100µs</div><div class="stat-lbl">GET p50 target</div></div>
+      <div class="stat card"><div class="stat-num">500k+</div><div class="stat-lbl">ops/s/node target</div></div>
+      <div class="stat card"><div class="stat-num">8–15 MiB</div><div class="stat-lbl">container image</div></div>
+      <div class="stat card"><div class="stat-num">4096</div><div class="stat-lbl">fixed partitions</div></div>
+    </div>
+    <p class="fineprint">
+      marekvs is <strong>disk-native</strong> and pays a convergent-merge tax, so
+      it trades raw throughput for durability and coordination-free scale. In the
+      KeyDB comparison harness it lands around 0.4–0.6× of an in-RAM store —
+      by design, with the full methodology in
+      <a href="{{base}}/docs/performance/">Performance</a>.
+    </p>
+  </section>
+
+  <!-- QUICKSTART -->
+  <section class="band">
+    <div class="section-head">
+      <span class="sec-num">05</span><h2>Up in one command</h2><div class="rule"></div>
+    </div>
+    <div class="quick-grid">
+      <div class="card quick-card">
+        <span class="label">Docker · single node</span>
+<pre class="ascii"><code>docker run -d --name marekvs -p 6379:6379 \
+  -e MAREKVS_NODE_ID=0 -e MAREKVS_REPLICAS_N=1 \
+  ghcr.io/yannick/marekvs:latest
+
+redis-cli -p 6379 ping   # PONG</code></pre>
+      </div>
+      <div class="card quick-card">
+        <span class="label">What you get</span>
+        <ul class="quick-list">
+          <li>A Redis-compatible endpoint on <code>:6379</code></li>
+          <li>Health + Prometheus metrics on <code>:9121</code></li>
+          <li>Scale to 3 nodes with one env var — <a href="{{base}}/docs/quickstart/">see the guide</a></li>
+        </ul>
+        <a class="btn btn-primary" href="{{base}}/docs/quickstart/">Full quickstart →</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="cta">
+    <div class="cta-inner card">
+      <h2>Ready to dive in?</h2>
+      <p>Start with the overview, or jump straight to the API reference.</p>
+      <div class="hero-cta">
+        <a class="btn btn-primary" href="{{base}}/docs/overview/">Read the docs</a>
+        <a class="btn btn-ghost" href="{{github}}" target="_blank" rel="noopener">Star on GitHub ↗</a>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="sitefoot">
+  <div class="sitefoot-inner">
+    <div class="foot-brand">
+      <img src="{{base}}/assets/brand/marekvs-icon.svg" width="22" height="22" alt="">
+      <span><span class="w1">mare</span><span class="w2">kvs</span> — distributed, Redis-compatible KV.</span>
+    </div>
+    <div class="foot-links">
+      <a href="{{base}}/docs/overview/">Documentation</a>
+      <a href="{{github}}" target="_blank" rel="noopener">GitHub</a>
+      <span class="foot-sub">© 2026 Yannick Koechlin · All rights reserved</span>
+    </div>
+  </div>
+</footer>
+
+<script src="{{base}}/assets/site.js" defer></script>
+</body>
+</html>

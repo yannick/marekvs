@@ -5,3 +5,6 @@
 /.cargo/config.toml
 /bench/results.csv
 /bench/report.md
+# docs site: generator build output + the isolated docsgen target dir
+/_site
+/crates/docsgen/target

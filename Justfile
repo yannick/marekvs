@@ -385,6 +385,21 @@ bench-report:
 bench-clean:
     rm -f bench/results.csv bench/report.md
 
+# ══ docs site ════════════════════════════════════════════════════════════
+
+# build the documentation website from docs/*.md → _site/
+[group('docs')]
+docs:
+    @printf '{{bold}}{{cyan}}▸ building docs site → _site{{reset}}\n'
+    cargo run --manifest-path crates/docsgen/Cargo.toml --release
+    @printf '{{bold}}{{green}}✓ open _site/index.html (or `just docs-serve`){{reset}}\n'
+
+# build the docs site and serve it at http://localhost:8791
+[group('docs')]
+docs-serve: docs
+    @printf '{{bold}}{{blue}}▸ serving _site on http://localhost:8791{{reset}}\n'
+    python3 -m http.server 8791 --directory _site --bind 127.0.0.1
+
 # ══ housekeeping ═════════════════════════════════════════════════════════
 
 # remove build artifacts and local run data

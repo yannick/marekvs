@@ -1,0 +1,172 @@
+/* ============================================================
+   MareKVS — Design Tokens
+   Single source of truth for the website & documentation.
+   Import once at the root:  @import "tokens/tokens.css";
+   ============================================================ */
+
+:root {
+  /* ---------- Brand: Marine scale (primary) ---------- */
+  --mk-marine-50:  #EFF5FE;
+  --mk-marine-100: #DBE8FD;
+  --mk-marine-200: #BBD3FB;
+  --mk-marine-300: #8FB6F8;
+  --mk-marine-400: #5B93F3;
+  --mk-marine-500: #1F6FEB;  /* primary brand */
+  --mk-marine-600: #1857D0;
+  --mk-marine-700: #1544A6;
+  --mk-marine-800: #163A82;
+  --mk-marine-900: #12245E;  /* deep navy */
+
+  /* ---------- Brand: named ---------- */
+  --mk-sky:    #4C9AF5;
+  --mk-marine: #1F6FEB;
+  --mk-cobalt: #1D4FD8;
+  --mk-navy:   #12245E;
+  --mk-gold:   #F7B500;
+  --mk-gold-soft: #FEF6E0;
+
+  /* ---------- Neutrals (cool) ---------- */
+  --mk-ink:      #0E1526;
+  --mk-graphite: #33415C;
+  --mk-steel:    #5B6B87;
+  --mk-silver:   #97A3BC;
+  --mk-mist:     #E4E9F2;
+  --mk-fog:      #F2F5FA;
+  --mk-white:    #FFFFFF;
+
+  /* ---------- Semantic states ---------- */
+  --mk-success:    #1E9E6A;
+  --mk-success-bg: #E7F6EF;
+  --mk-warning:    #F7B500;
+  --mk-warning-bg: #FEF6E0;
+  --mk-error:      #E4483B;
+  --mk-error-bg:   #FCEBE9;
+  --mk-info:       #1F6FEB;
+  --mk-info-bg:    #EFF5FE;
+
+  /* ---------- Semantic roles (light theme) ---------- */
+  --mk-bg:            var(--mk-fog);
+  --mk-surface:       var(--mk-white);
+  --mk-surface-alt:   var(--mk-marine-50);
+  --mk-border:        var(--mk-mist);
+  --mk-border-strong: var(--mk-silver);
+
+  --mk-text:          var(--mk-navy);
+  --mk-text-muted:    var(--mk-graphite);
+  --mk-text-subtle:   var(--mk-steel);
+  --mk-text-invert:   var(--mk-white);
+
+  --mk-primary:        var(--mk-marine-500);
+  --mk-primary-hover:  var(--mk-marine-600);
+  --mk-primary-active: var(--mk-marine-700);
+  --mk-on-primary:     var(--mk-white);
+  --mk-focus-ring:     var(--mk-marine-400);
+  --mk-link:           var(--mk-marine-500);
+  --mk-accent:         var(--mk-gold);
+
+  /* ---------- Typography ---------- */
+  --mk-font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mk-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --mk-text-xs:   0.75rem;   /* 12 */
+  --mk-text-sm:   0.875rem;  /* 14 */
+  --mk-text-base: 1rem;      /* 16 */
+  --mk-text-lg:   1.125rem;  /* 18 */
+  --mk-text-xl:   1.375rem;  /* 22 */
+  --mk-text-2xl:  1.75rem;   /* 28 */
+  --mk-text-3xl:  2.25rem;   /* 36 */
+  --mk-text-4xl:  3rem;      /* 48 */
+  --mk-text-5xl:  4.125rem;  /* 66 */
+
+  --mk-weight-normal:   400;
+  --mk-weight-medium:   500;
+  --mk-weight-semibold: 600;
+  --mk-weight-bold:     700;
+  --mk-weight-extra:    800;
+
+  --mk-leading-tight:  1.1;
+  --mk-leading-snug:   1.35;
+  --mk-leading-normal: 1.6;
+  --mk-tracking-tight: -0.03em;
+  --mk-tracking-snug:  -0.02em;
+  --mk-tracking-wide:   0.08em;
+
+  /* ---------- Spacing (4px base) ---------- */
+  --mk-space-1:  0.25rem;  /* 4 */
+  --mk-space-2:  0.5rem;   /* 8 */
+  --mk-space-3:  0.75rem;  /* 12 */
+  --mk-space-4:  1rem;     /* 16 */
+  --mk-space-5:  1.25rem;  /* 20 */
+  --mk-space-6:  1.5rem;   /* 24 */
+  --mk-space-8:  2rem;     /* 32 */
+  --mk-space-10: 2.5rem;   /* 40 */
+  --mk-space-12: 3rem;     /* 48 */
+  --mk-space-16: 4rem;     /* 64 */
+  --mk-space-20: 5rem;     /* 80 */
+
+  /* ---------- Radius ---------- */
+  --mk-radius-sm:   6px;
+  --mk-radius-md:   10px;
+  --mk-radius-lg:   16px;
+  --mk-radius-xl:   20px;
+  --mk-radius-2xl:  24px;
+  --mk-radius-pill: 999px;
+
+  /* ---------- Shadows ---------- */
+  --mk-shadow-xs: 0 1px 2px rgba(18,36,94,0.06);
+  --mk-shadow-sm: 0 1px 3px rgba(18,36,94,0.08);
+  --mk-shadow-md: 0 6px 16px rgba(18,36,94,0.10);
+  --mk-shadow-lg: 0 14px 40px rgba(18,36,94,0.16);
+  --mk-shadow-focus: 0 0 0 3px rgba(31,111,235,0.35);
+
+  /* ---------- Layout ---------- */
+  --mk-container:   1120px;
+  --mk-container-narrow: 760px;
+  --mk-gutter:      var(--mk-space-6);
+
+  /* ---------- Motion ---------- */
+  --mk-ease:       cubic-bezier(0.22, 0.61, 0.36, 1);
+  --mk-dur-fast:   120ms;
+  --mk-dur-base:   200ms;
+  --mk-dur-slow:   360ms;
+
+  /* ---------- Z-index ---------- */
+  --mk-z-base:    0;
+  --mk-z-sticky:  100;
+  --mk-z-overlay: 500;
+  --mk-z-modal:   1000;
+  --mk-z-toast:   1500;
+}
+
+/* ============================================================
+   Dark theme — set data-theme="dark" on <html> or a container.
+   Only role tokens are remapped; the primitive scales are stable.
+   ============================================================ */
+:root[data-theme="dark"],
+[data-theme="dark"] {
+  --mk-bg:            #0B1120;
+  --mk-surface:       #121A2E;
+  --mk-surface-alt:   #182338;
+  --mk-border:        #24304A;
+  --mk-border-strong: #33415C;
+
+  --mk-text:          #EAF0FB;
+  --mk-text-muted:    #B7C2D8;
+  --mk-text-subtle:   #8593B0;
+  --mk-text-invert:   #0E1526;
+
+  --mk-primary:        var(--mk-marine-400);
+  --mk-primary-hover:  var(--mk-marine-300);
+  --mk-primary-active: var(--mk-marine-200);
+  --mk-on-primary:     #0B1120;
+  --mk-link:           var(--mk-marine-300);
+
+  --mk-info-bg:    #12233F;
+  --mk-success-bg: #0F2A20;
+  --mk-warning-bg: #2E2410;
+  --mk-error-bg:   #31191A;
+
+  --mk-shadow-sm: 0 1px 3px rgba(0,0,0,0.4);
+  --mk-shadow-md: 0 6px 16px rgba(0,0,0,0.45);
+  --mk-shadow-lg: 0 14px 40px rgba(0,0,0,0.55);
+}

@@ -1,0 +1,30 @@
+# Site metadata + ordered sidebar for docsgen.
+# Page titles/descriptions come from each `<slug>.md` frontmatter.
+
+[site]
+title = "marekvs"
+tagline = "Data that moves like the tide."
+github = "https://github.com/yannick/marekvs"
+# Base path for a GitHub Pages *project* site (e.g. "/marekvs"). Leave empty for
+# a user/org or custom-domain site; override at build time with DOCS_BASE.
+base = ""
+
+[[section]]
+title = "Introduction"
+pages = ["overview", "quickstart"]
+
+[[section]]
+title = "Core"
+pages = ["architecture", "data-model", "redis-api"]
+
+[[section]]
+title = "Distributed system"
+pages = ["replication", "consistency", "membership"]
+
+[[section]]
+title = "Operations"
+pages = ["kubernetes", "operator", "build-deploy"]
+
+[[section]]
+title = "Reference"
+pages = ["performance", "testing", "lua-scripting"]

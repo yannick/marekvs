@@ -15,7 +15,7 @@ members = [
 version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
-license = "MPL-2.0"
+# Proprietary — all rights reserved. Not open-source licensed; no `license` field.
 
 [workspace.dependencies]
 # Canonical source; a sibling checkout at ../ondadb overrides it via the
