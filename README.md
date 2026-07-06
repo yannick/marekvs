@@ -1,4 +1,35 @@
-# marekvs
+<p align="center">
+  <a href="https://marekvs.com">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="crates/docsgen/theme/brand/marekvs-logo-dark.svg">
+      <img src="crates/docsgen/theme/brand/marekvs-logo.svg" alt="marekvs" width="420">
+    </picture>
+  </a>
+</p>
+
+<p align="center">
+  <b>A distributed, Redis-compatible key-value database.</b><br>
+  AP by design · coordination-free · disk-native · Kubernetes-native
+</p>
+
+<p align="center">
+  <a href="https://github.com/yannick/marekvs/actions/workflows/docker.yml"><img src="https://github.com/yannick/marekvs/actions/workflows/docker.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/yannick/marekvs/actions/workflows/pages.yml"><img src="https://github.com/yannick/marekvs/actions/workflows/pages.yml/badge.svg" alt="Docs"></a>
+  <img src="https://img.shields.io/badge/rust-1.85%2B-CE422B?logo=rust&logoColor=white" alt="Rust 1.85+">
+  <img src="https://img.shields.io/badge/API-Redis%20RESP2%2F3-DC382D?logo=redis&logoColor=white" alt="Redis RESP2/3">
+  <img src="https://img.shields.io/badge/Kubernetes-operator-326CE5?logo=kubernetes&logoColor=white" alt="Kubernetes operator">
+  <img src="https://img.shields.io/badge/license-proprietary-lightgrey" alt="License: proprietary">
+</p>
+
+<p align="center">
+  <a href="https://marekvs.com"><b>Website</b></a> ·
+  <a href="docs/quickstart.md">Quickstart</a> ·
+  <a href="design/03-redis-api.md">Redis API</a> ·
+  <a href="design/README.md">Design docs</a> ·
+  <a href="#run-from-published-images-ghcrio">Docker / k8s</a>
+</p>
+
+---
 
 A distributed key-value database server with a Redis-compatible API, written
 in Rust. AP by design (eventually consistent, coordination-free), disk-native
@@ -24,8 +55,8 @@ via the [ondaDB](../ondadb) LSM engine — no in-memory dataset.
   scale-down and ops/s-based autoscaling ([operator](design/12-operator.md))
 - **OS-less images**: static binary in a `FROM scratch` container
 
-📖 **Documentation** is written in [`docs/`](docs/) and published as a website
-to GitHub Pages (built by `crates/docsgen`; see `.github/workflows/pages.yml`).
+📖 **Documentation** lives at **[marekvs.com](https://marekvs.com)** (source in
+[`docs/`](docs/), built by `crates/docsgen` and published to GitHub Pages).
 Lower-level design internals live in [`design/`](design/README.md).
 
 ## Quickstart
