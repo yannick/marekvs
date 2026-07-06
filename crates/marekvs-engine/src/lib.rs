@@ -79,9 +79,10 @@ pub trait BudgetPeer: Send + Sync {
         ttl_ms: u64,
         reqid: u64,
     ) -> Pin<Box<dyn Future<Output = Result<BudgetGrant, BudgetErr>> + Send + 'a>>;
-    /// Forward COMMIT/RELEASE/DRAW to the token's issuer. `spent` None =
-    /// RELEASE; `draw` Some(n) = incremental draw. Returns the credited (or
-    /// remaining, for draws) amount.
+    /// Forward COMMIT/RELEASE/DRAW to the token's issuer. `draw` Some(n) =
+    /// incremental draw; `release` = RELEASE; else COMMIT with `spent`
+    /// (None = accept whatever was drawn). Returns the credited (or, for
+    /// draws, remaining) amount.
     fn close_remote<'a>(
         &'a self,
         node: u16,
@@ -89,11 +90,15 @@ pub trait BudgetPeer: Send + Sync {
         token: &'a [u8],
         spent: Option<u64>,
         draw: Option<u64>,
+        release: bool,
     ) -> Pin<Box<dyn Future<Output = Result<u64, BudgetErr>> + Send + 'a>>;
     /// Fetch the budget collection from a reachable home replica (boot
     /// grant-fence). Returns true when a fetch succeeded.
     fn fetch_budget<'a>(&'a self, key: &'a [u8])
         -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+    /// Current home owners of the key's partition (BG.CREATE's default
+    /// escrow split). Empty = caller falls back to self only.
+    fn owners_for(&self, key: &[u8]) -> Vec<u16>;
 }
 
 /// Ring-publish hook for the durable-before-publish budget write pipeline

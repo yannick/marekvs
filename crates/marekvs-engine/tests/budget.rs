@@ -401,6 +401,7 @@ async fn boot_fence_fails_closed_without_reachable_home() {
             _token: &'a [u8],
             _spent: Option<u64>,
             _draw: Option<u64>,
+            _release: bool,
         ) -> Pin<Box<dyn Future<Output = Result<u64, BudgetErr>> + Send + 'a>> {
             Box::pin(async { Err(BudgetErr::TryAgain("unreachable")) })
         }
@@ -409,6 +410,9 @@ async fn boot_fence_fails_closed_without_reachable_home() {
             _key: &'a [u8],
         ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
             Box::pin(async { false })
+        }
+        fn owners_for(&self, _key: &[u8]) -> Vec<u16> {
+            Vec::new()
         }
     }
 

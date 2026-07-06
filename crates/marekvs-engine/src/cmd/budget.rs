@@ -804,7 +804,17 @@ pub async fn create(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         }
     }
     if nodes.is_empty() {
-        nodes = vec![engine.store.node_id];
+        // Default escrow split: the partition's current home owners (the
+        // nodes clients' grants replicate to anyway); self when standalone.
+        nodes = engine
+            .budget_peer
+            .read()
+            .as_ref()
+            .map(|p| p.owners_for(&key))
+            .unwrap_or_default();
+        if nodes.is_empty() {
+            nodes = vec![engine.store.node_id];
+        }
     }
     nodes.sort_unstable();
     nodes.dedup();
@@ -1140,13 +1150,13 @@ async fn close_cmd(
             return BudgetErr::TryAgain("issuer unreachable (token was granted by another node)")
                 .reply();
         };
-        let (spent, draw) = match op {
-            CloseOpSpec::Commit(s) => (s, None),
-            CloseOpSpec::Release => (None, None),
-            CloseOpSpec::Draw(n) => (None, Some(n)),
+        let (spent, draw, release) = match op {
+            CloseOpSpec::Commit(s) => (s, None, false),
+            CloseOpSpec::Release => (None, None, true),
+            CloseOpSpec::Draw(n) => (None, Some(n), false),
         };
         return match peer
-            .close_remote(tid.node, &key, &args[2], spent, draw)
+            .close_remote(tid.node, &key, &args[2], spent, draw, release)
             .await
         {
             Ok(v) => Reply::Int(v as i64),
@@ -1177,6 +1187,79 @@ pub(crate) enum CloseOpSpec {
     Commit(Option<u64>),
     Release,
     Draw(u64),
+}
+
+// ---------------------------------------------------------------------------
+// Mesh serve entries (called by the repl layer for forwarded operations)
+// ---------------------------------------------------------------------------
+
+/// Serve a forwarded BG.RESERVE: grant from THIS node's own escrow slot,
+/// full durable-before-publish pipeline before the response leaves.
+/// `ttl_ms = 0` = apply this node's defaults. Never forwards further.
+pub async fn serve_remote_reserve(
+    engine: &Arc<Engine>,
+    key: &[u8],
+    amount: u64,
+    ttl_ms: u64,
+    reqid: u64,
+) -> Result<BudgetGrant, BudgetErr> {
+    if reqid != 0 {
+        if let Some(prev) = engine.budget_reqids.lock().get(key, reqid) {
+            return Ok(prev);
+        }
+    }
+    ensure_grant_ready(engine, key).await?;
+    let cfg = GrantCfg {
+        default_ttl_ms: engine
+            .budget_default_ttl_ms
+            .load(std::sync::atomic::Ordering::Relaxed),
+        max_ttl_ms: engine
+            .budget_max_ttl_ms
+            .load(std::sync::atomic::Ordering::Relaxed),
+        grace_ms: engine
+            .budget_reclaim_grace_ms
+            .load(std::sync::atomic::Ordering::Relaxed),
+    };
+    let ttl = if ttl_ms == 0 { None } else { Some(ttl_ms) };
+    let k = key.to_vec();
+    let grant = budget_write(engine, key, move |ctx| {
+        grant_local(ctx, &cfg, &k, amount, ttl, reqid)
+    })
+    .await?;
+    if reqid != 0 {
+        engine
+            .budget_reqids
+            .lock()
+            .put(key.to_vec(), reqid, grant.clone());
+    }
+    Ok(grant)
+}
+
+/// Serve a forwarded BG.COMMIT / BG.RELEASE / BG.DRAW: this node must be the
+/// token's issuer (the caller routed by the token id).
+pub async fn serve_remote_close(
+    engine: &Arc<Engine>,
+    key: &[u8],
+    tid: TokenId,
+    spent: Option<u64>,
+    draw: Option<u64>,
+    release: bool,
+) -> Result<u64, BudgetErr> {
+    if tid.node != engine.store.node_id {
+        return Err(BudgetErr::TryAgain("not the token's issuer"));
+    }
+    let grace = engine
+        .budget_reclaim_grace_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let op = if let Some(n) = draw {
+        CloseOp::Draw(n)
+    } else if release {
+        CloseOp::Release
+    } else {
+        CloseOp::Commit(spent)
+    };
+    let k = key.to_vec();
+    budget_write(engine, key, move |ctx| close_local(ctx, grace, &k, tid, op)).await?
 }
 
 /// BG.COMMIT key token [spent]

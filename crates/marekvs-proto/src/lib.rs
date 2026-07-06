@@ -165,6 +165,66 @@ pub enum PeerMsg {
     Pong {
         nonce: u64,
     },
+
+    // --- budgets (ctl, design/13) ---
+    // NOTE: postcard discriminants are positional — this enum is APPEND-ONLY.
+    /// Ask the receiver to grant from ITS OWN escrow slot (forwarded
+    /// BG.RESERVE). `ttl_ms = 0` = receiver applies its defaults.
+    BudgetReserve {
+        id: u64,
+        key: Vec<u8>,
+        amount: u64,
+        ttl_ms: u64,
+        reqid: u64,
+    },
+    BudgetReserveResp {
+        id: u64,
+        result: Result<BudgetGrantWire, BudgetErrKind>,
+    },
+    /// Forwarded BG.COMMIT / BG.RELEASE / BG.DRAW — the receiver must be the
+    /// token's issuer. `draw` Some(n) = incremental draw; `release` =
+    /// RELEASE; else COMMIT with `spent` (None = accept the drawn total).
+    BudgetClose {
+        id: u64,
+        key: Vec<u8>,
+        token: BudgetTokenId,
+        spent: Option<u64>,
+        draw: Option<u64>,
+        release: bool,
+    },
+    /// Ok = credited amount (COMMIT/RELEASE) or remaining (DRAW).
+    BudgetCloseResp {
+        id: u64,
+        result: Result<u64, BudgetErrKind>,
+    },
+}
+
+/// Token identity on the wire (client form is `gen-hlc-node-epoch` hex).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BudgetTokenId {
+    pub gen: u64,
+    pub hlc: u64,
+    pub node: NodeId,
+    pub epoch: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BudgetGrantWire {
+    /// Client-facing token id string bytes.
+    pub token: Vec<u8>,
+    pub amount: u64,
+    /// Absolute deadline stamped by the ISSUER's clock.
+    pub deadline_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum BudgetErrKind {
+    Exhausted,
+    NoBudget,
+    TryAgain,
+    TokenExpired,
+    TokenUsed,
+    Other(String),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -221,6 +281,53 @@ mod tests {
         let (decoded, consumed) = decode(&frame).unwrap().unwrap();
         assert_eq!(consumed, frame.len());
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn budget_roundtrips() {
+        for msg in [
+            PeerMsg::BudgetReserve {
+                id: 9,
+                key: b"budget".to_vec(),
+                amount: 100,
+                ttl_ms: 30_000,
+                reqid: 7,
+            },
+            PeerMsg::BudgetReserveResp {
+                id: 9,
+                result: Ok(BudgetGrantWire {
+                    token: b"1-2-3-4".to_vec(),
+                    amount: 100,
+                    deadline_ms: 123,
+                }),
+            },
+            PeerMsg::BudgetReserveResp {
+                id: 9,
+                result: Err(BudgetErrKind::Exhausted),
+            },
+            PeerMsg::BudgetClose {
+                id: 10,
+                key: b"budget".to_vec(),
+                token: BudgetTokenId {
+                    gen: 1,
+                    hlc: 2,
+                    node: 3,
+                    epoch: 4,
+                },
+                spent: Some(50),
+                draw: None,
+                release: false,
+            },
+            PeerMsg::BudgetCloseResp {
+                id: 10,
+                result: Err(BudgetErrKind::Other("boom".into())),
+            },
+        ] {
+            let frame = encode(&msg).unwrap();
+            let (decoded, consumed) = decode(&frame).unwrap().unwrap();
+            assert_eq!(consumed, frame.len());
+            assert_eq!(decoded, msg);
+        }
     }
 
     #[test]

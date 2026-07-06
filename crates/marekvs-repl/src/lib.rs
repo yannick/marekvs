@@ -18,8 +18,8 @@ use marekvs_core::envelope::Envelope;
 use marekvs_core::ikey::{self, Pid};
 use marekvs_core::NodeId;
 use marekvs_engine::store::{self, Store};
-use marekvs_engine::{Engine, ReadThrough};
-use marekvs_proto::{PeerMsg, ReplBatch, ReplOp};
+use marekvs_engine::{BudgetErr, BudgetGrant, BudgetPeer, Engine, ReadThrough};
+use marekvs_proto::{BudgetErrKind, BudgetGrantWire, BudgetTokenId, PeerMsg, ReplBatch, ReplOp};
 use mesh::Mesh;
 use parking_lot::Mutex;
 use ring::Ring;
@@ -649,6 +649,30 @@ impl ReplEngine {
 
         // 8. Read-through hook for the engine.
         engine.set_read_through(repl.clone());
+
+        // 8b. Budget hooks (design/13): peer surface for forwarded grants /
+        //     issuer-routed closes, and the manual ring-publish half of the
+        //     durable-before-publish pipeline. Manual pushes allocate local
+        //     seqs (Ring::push with None) — safe because ondaDB commit seqs
+        //     always run at or ahead of ring-local seqs, so ordering never
+        //     inverts for resuming cursors.
+        engine.set_budget_peer(repl.clone());
+        {
+            let ring = ring.clone();
+            let self_node = store.node_id;
+            engine.set_budget_publish(Arc::new(move |ops: Vec<(Vec<u8>, Vec<u8>)>| {
+                if !ring.buffering_needed() {
+                    return;
+                }
+                let repl_ops: Vec<ReplOp> = ops
+                    .into_iter()
+                    .map(|(ikey, value)| ReplOp { ikey, value })
+                    .collect();
+                if !repl_ops.is_empty() {
+                    ring.push(self_node, None, repl_ops);
+                }
+            }));
+        }
 
         // 9. Metrics stats task: ring/cluster/mesh gauges every 2 s.
         repl.clone().spawn_stats();
@@ -1616,10 +1640,66 @@ impl ReplEngine {
             }
             PeerMsg::FetchResp { id, .. }
             | PeerMsg::FetchCollectionResp { id, .. }
-            | PeerMsg::CheckResp { id, .. } => {
+            | PeerMsg::CheckResp { id, .. }
+            | PeerMsg::BudgetReserveResp { id, .. }
+            | PeerMsg::BudgetCloseResp { id, .. } => {
                 if let Some(tx) = self.pending.lock().remove(&id) {
                     let _ = tx.send(msg);
                 }
+            }
+            PeerMsg::BudgetReserve {
+                id,
+                key,
+                amount,
+                ttl_ms,
+                reqid,
+            } => {
+                // Forwarded grant: this node grants from ITS OWN escrow slot,
+                // completing the durable-before-publish pipeline before the
+                // response leaves (design/13).
+                let result = marekvs_engine::cmd::budget::serve_remote_reserve(
+                    &self.engine,
+                    &key,
+                    amount,
+                    ttl_ms,
+                    reqid,
+                )
+                .await
+                .map(|g| BudgetGrantWire {
+                    token: g.token.into_bytes(),
+                    amount: g.amount,
+                    deadline_ms: g.deadline_ms,
+                })
+                .map_err(budget_err_to_wire);
+                self.mesh
+                    .send_ctl(peer, PeerMsg::BudgetReserveResp { id, result });
+            }
+            PeerMsg::BudgetClose {
+                id,
+                key,
+                token,
+                spent,
+                draw,
+                release,
+            } => {
+                let tid = marekvs_core::budget::TokenId {
+                    gen: token.gen,
+                    hlc: token.hlc,
+                    node: token.node,
+                    epoch: token.epoch,
+                };
+                let result = marekvs_engine::cmd::budget::serve_remote_close(
+                    &self.engine,
+                    &key,
+                    tid,
+                    spent,
+                    draw,
+                    release,
+                )
+                .await
+                .map_err(budget_err_to_wire);
+                self.mesh
+                    .send_ctl(peer, PeerMsg::BudgetCloseResp { id, result });
             }
             PeerMsg::InterestRenew { keys, .. } => {
                 for k in keys {
@@ -1966,6 +2046,7 @@ impl ReplEngine {
                     ikey::Tag::ListElem,
                     ikey::Tag::StreamEntry,
                     ikey::Tag::HllRegister,
+                    ikey::Tag::Budget,
                 ] {
                     store::scan_prefix(ctx, &ikey::collection_prefix(tag, &uk), |k, v| {
                         ops.push(ReplOp {
@@ -2110,6 +2191,141 @@ impl ReplEngine {
                 None
             }
         }
+    }
+}
+
+fn budget_err_to_wire(e: BudgetErr) -> BudgetErrKind {
+    match e {
+        BudgetErr::Exhausted => BudgetErrKind::Exhausted,
+        BudgetErr::NoBudget => BudgetErrKind::NoBudget,
+        BudgetErr::TryAgain(_) => BudgetErrKind::TryAgain,
+        BudgetErr::TokenExpired => BudgetErrKind::TokenExpired,
+        BudgetErr::TokenUsed => BudgetErrKind::TokenUsed,
+        BudgetErr::Other(msg) => BudgetErrKind::Other(msg),
+    }
+}
+
+fn budget_err_from_wire(e: BudgetErrKind) -> BudgetErr {
+    match e {
+        BudgetErrKind::Exhausted => BudgetErr::Exhausted,
+        BudgetErrKind::NoBudget => BudgetErr::NoBudget,
+        BudgetErrKind::TryAgain => BudgetErr::TryAgain("remote node asked to retry"),
+        BudgetErrKind::TokenExpired => BudgetErr::TokenExpired,
+        BudgetErrKind::TokenUsed => BudgetErr::TokenUsed,
+        BudgetErrKind::Other(msg) => BudgetErr::Other(msg),
+    }
+}
+
+impl BudgetPeer for ReplEngine {
+    fn reserve_remote<'a>(
+        &'a self,
+        node: u16,
+        key: &'a [u8],
+        amount: u64,
+        ttl_ms: u64,
+        reqid: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<BudgetGrant, BudgetErr>> + Send + 'a>> {
+        Box::pin(async move {
+            let id = self.req_id();
+            let msg = PeerMsg::BudgetReserve {
+                id,
+                key: key.to_vec(),
+                amount,
+                ttl_ms,
+                reqid,
+            };
+            match self.request(node, id, msg).await {
+                Some(PeerMsg::BudgetReserveResp { result, .. }) => match result {
+                    Ok(g) => Ok(BudgetGrant {
+                        token: String::from_utf8_lossy(&g.token).into_owned(),
+                        amount: g.amount,
+                        deadline_ms: g.deadline_ms,
+                    }),
+                    Err(e) => Err(budget_err_from_wire(e)),
+                },
+                _ => Err(BudgetErr::TryAgain("peer unreachable")),
+            }
+        })
+    }
+
+    fn close_remote<'a>(
+        &'a self,
+        node: u16,
+        key: &'a [u8],
+        token: &'a [u8],
+        spent: Option<u64>,
+        draw: Option<u64>,
+        release: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, BudgetErr>> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(tid) = marekvs_core::budget::TokenId::parse(token) else {
+                return Err(BudgetErr::Other("ERR invalid token id".into()));
+            };
+            let id = self.req_id();
+            let msg = PeerMsg::BudgetClose {
+                id,
+                key: key.to_vec(),
+                token: BudgetTokenId {
+                    gen: tid.gen,
+                    hlc: tid.hlc,
+                    node: tid.node,
+                    epoch: tid.epoch,
+                },
+                spent,
+                draw,
+                release,
+            };
+            match self.request(node, id, msg).await {
+                Some(PeerMsg::BudgetCloseResp { result, .. }) => {
+                    result.map_err(budget_err_from_wire)
+                }
+                _ => Err(BudgetErr::TryAgain(
+                    "issuer unreachable; retry before the token deadline",
+                )),
+            }
+        })
+    }
+
+    /// Boot grant-fence fetch (design/13 fix 4): pull the budget collection
+    /// from a reachable owner and MERGE it locally, even when this node is
+    /// itself a home for the partition — a fresh-epoch home holds nothing.
+    fn fetch_budget<'a>(
+        &'a self,
+        key: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            let pid = marekvs_core::pid_of(key);
+            let view = self.cluster.view();
+            let n = self.cluster.replicas_n;
+            let mut targets = view.owners(pid, n);
+            targets.retain(|t| *t != self.store.node_id);
+            if targets.is_empty() {
+                // No other owner exists (standalone / N=1): local state is
+                // all there is.
+                return true;
+            }
+            for target in targets {
+                let id = self.req_id();
+                let msg = PeerMsg::FetchCollection {
+                    id,
+                    userkey: key.to_vec(),
+                };
+                if let Some(PeerMsg::FetchCollectionResp { ops, .. }) =
+                    self.request(target, id, msg).await
+                {
+                    for op in &ops {
+                        self.apply_op_from(op.clone(), Some(target)).await;
+                    }
+                    return true;
+                }
+            }
+            false
+        })
+    }
+
+    fn owners_for(&self, key: &[u8]) -> Vec<u16> {
+        let pid = marekvs_core::pid_of(key);
+        self.cluster.view().owners(pid, self.cluster.replicas_n)
     }
 }
 
