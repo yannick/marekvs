@@ -4,6 +4,7 @@
 //! Byte layouts are specified in design/02-data-model.md. Everything here is
 //! I/O-free and deterministic so the merge laws can be property-tested.
 
+pub mod budget;
 pub mod counter;
 pub mod envelope;
 pub mod hlc;

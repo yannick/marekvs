@@ -161,6 +161,9 @@ pub mod head {
     /// Lists are head-gated collections of position-keyed LWW elements
     /// (design/02 §Lists). The head carries the collection TTL + delete clock.
     pub const CTYPE_LIST: u8 = 5;
+    /// Budget collection (design/13): head tail carries the admin config
+    /// (`crate::budget::HeadState`); elements are escrow slots and tokens.
+    pub const CTYPE_BUDGET: u8 = 7;
 
     pub fn encode(ctype: u8, del_hlc: u64) -> Vec<u8> {
         let mut v = Vec::with_capacity(9);

@@ -23,6 +23,84 @@ pub trait ReadThrough: Send + Sync {
     fn fetch<'a>(&'a self, userkey: &'a [u8]) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 }
 
+/// A successful budget grant (design/13): what BG.RESERVE returns and what
+/// forwarded grants carry back over the mesh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetGrant {
+    /// Client-facing token id (`gen-hlc-node-epoch`, hex).
+    pub token: String,
+    pub amount: u64,
+    /// Absolute wall-clock deadline stamped by the ISSUER's clock.
+    pub deadline_ms: u64,
+}
+
+/// Error surface shared by local and forwarded budget operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BudgetErr {
+    /// No reachable escrow can cover the reservation (fail closed).
+    Exhausted,
+    NoBudget,
+    /// Transient: boot fence unsatisfied / issuer unreachable — retry.
+    TryAgain(&'static str),
+    TokenExpired,
+    TokenUsed,
+    Other(String),
+}
+
+impl BudgetErr {
+    pub fn reply(&self) -> crate::reply::Reply {
+        use crate::reply::Reply;
+        match self {
+            BudgetErr::Exhausted => {
+                Reply::err("BUDGETEXHAUSTED insufficient reservable funds; retry later")
+            }
+            BudgetErr::NoBudget => Reply::err("NOBUDGET no such budget"),
+            BudgetErr::TryAgain(why) => Reply::err(format!("TRYAGAIN {why}")),
+            BudgetErr::TokenExpired => {
+                Reply::err("TOKENEXPIRED token past its deadline or from an old generation")
+            }
+            BudgetErr::TokenUsed => Reply::err("TOKENUSED token already committed or released"),
+            BudgetErr::Other(msg) => Reply::err(msg.clone()),
+        }
+    }
+}
+
+/// Budget peer surface installed by the replication layer (design/13):
+/// forward grants/closes to the node that can safely execute them, and
+/// fetch a budget's records for the boot grant-fence. Absent in embedded /
+/// single-node use — handlers then act purely locally.
+pub trait BudgetPeer: Send + Sync {
+    /// Ask `node` to grant from ITS OWN escrow slot.
+    fn reserve_remote<'a>(
+        &'a self,
+        node: u16,
+        key: &'a [u8],
+        amount: u64,
+        ttl_ms: u64,
+        reqid: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<BudgetGrant, BudgetErr>> + Send + 'a>>;
+    /// Forward COMMIT/RELEASE/DRAW to the token's issuer. `spent` None =
+    /// RELEASE; `draw` Some(n) = incremental draw. Returns the credited (or
+    /// remaining, for draws) amount.
+    fn close_remote<'a>(
+        &'a self,
+        node: u16,
+        key: &'a [u8],
+        token: &'a [u8],
+        spent: Option<u64>,
+        draw: Option<u64>,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, BudgetErr>> + Send + 'a>>;
+    /// Fetch the budget collection from a reachable home replica (boot
+    /// grant-fence). Returns true when a fetch succeeded.
+    fn fetch_budget<'a>(&'a self, key: &'a [u8])
+        -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+}
+
+/// Ring-publish hook for the durable-before-publish budget write pipeline
+/// (design/13): the repl layer pushes these (ikey, value) pairs into the
+/// replication ring AFTER the WAL sync. Installed next to the commit hook.
+pub type BudgetPublishFn = Arc<dyn Fn(Vec<(Vec<u8>, Vec<u8>)>) + Send + Sync>;
+
 /// Control surface for following an upstream *Redis* master (the `REPLICAOF`
 /// live-migration path). Installed by the server via
 /// [`Engine::set_replicaof`], kept as a trait so `marekvs-engine` need not
@@ -132,6 +210,29 @@ pub struct Engine {
     /// Lua script cache: sha1 hex → source (design/11; also persisted as
     /// hidden replicated system records for cross-node EVALSHA).
     pub scripts: parking_lot::RwLock<std::collections::HashMap<String, String>>,
+    /// Budget ring-publish hook (durable-before-publish pipeline, design/13).
+    pub budget_publish: parking_lot::RwLock<Option<BudgetPublishFn>>,
+    /// Budget peer surface (grant forwarding / issuer routing / boot fence).
+    pub budget_peer: parking_lot::RwLock<Option<Arc<dyn BudgetPeer>>>,
+    /// BG.RESERVE default TTL when the client passes none.
+    pub budget_default_ttl_ms: std::sync::atomic::AtomicU64,
+    /// Upper bound on client-requested token TTLs.
+    pub budget_max_ttl_ms: std::sync::atomic::AtomicU64,
+    /// Clock-skew grace added to a token deadline before the issuer
+    /// auto-reclaims it.
+    pub budget_reclaim_grace_ms: std::sync::atomic::AtomicU64,
+    /// BG.RESERVE REQID dedup: (budget key, reqid) → grant, issuer-local,
+    /// in-memory LRU (crash forgets it; orphans bounded by token deadlines).
+    pub budget_reqids: parking_lot::Mutex<cmd::budget::ReqidLru>,
+    /// Budgets this boot has cleared the grant-fence for (design/13 fix 4).
+    pub budget_grant_ready: parking_lot::Mutex<std::collections::HashSet<Vec<u8>>>,
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 impl Engine {
@@ -170,7 +271,35 @@ impl Engine {
             metrics,
             run_id,
             scripts: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            budget_publish: parking_lot::RwLock::new(None),
+            budget_peer: parking_lot::RwLock::new(None),
+            budget_default_ttl_ms: std::sync::atomic::AtomicU64::new(env_u64(
+                "MAREKVS_BUDGET_DEFAULT_TTL_MS",
+                30_000,
+            )),
+            budget_max_ttl_ms: std::sync::atomic::AtomicU64::new(env_u64(
+                "MAREKVS_BUDGET_MAX_TTL_MS",
+                3_600_000,
+            )),
+            budget_reclaim_grace_ms: std::sync::atomic::AtomicU64::new(env_u64(
+                "MAREKVS_BUDGET_RECLAIM_GRACE_MS",
+                marekvs_core::hlc::MAX_CLOCK_DRIFT_MS,
+            )),
+            budget_reqids: parking_lot::Mutex::new(cmd::budget::ReqidLru::new(env_u64(
+                "MAREKVS_BUDGET_REQID_LRU",
+                4096,
+            )
+                as usize)),
+            budget_grant_ready: parking_lot::Mutex::new(std::collections::HashSet::new()),
         })
+    }
+
+    pub fn set_budget_publish(&self, f: BudgetPublishFn) {
+        *self.budget_publish.write() = Some(f);
+    }
+
+    pub fn set_budget_peer(&self, p: Arc<dyn BudgetPeer>) {
+        *self.budget_peer.write() = Some(p);
     }
 
     pub fn set_read_through(&self, rt: Arc<dyn ReadThrough>) {
@@ -315,6 +444,13 @@ impl Engine {
                 | "PFMERGE"
                 | "EVAL"
                 | "EVALSHA"
+                | "BG.CREATE"
+                | "BG.TOPUP"
+                | "BG.RESERVE"
+                | "BG.COMMIT"
+                | "BG.RELEASE"
+                | "BG.DRAW"
+                | "BG.RECLAIM"
         )
     }
 
@@ -471,6 +607,11 @@ impl Engine {
                 | "XTRIM"
                 | "XSETID"
                 | "XINFO"
+                | "BG.RESERVE"
+                | "BG.COMMIT"
+                | "BG.RELEASE"
+                | "BG.DRAW"
+                | "BG.INFO"
                 | "PING"
                 | "ECHO"
         )
@@ -622,6 +763,12 @@ mod write_command_tests {
             "LMPOP",
             "BLMPOP",
             "XSETID",
+            "BG.CREATE",
+            "BG.TOPUP",
+            "BG.RESERVE",
+            "BG.COMMIT",
+            "BG.RELEASE",
+            "BG.DRAW",
         ] {
             assert!(Engine::is_write_command(c), "{c} must be write-gated");
         }
@@ -658,6 +805,7 @@ mod write_command_tests {
             "CLIENT",
             "SHUTDOWN",
             "REPLICAOF",
+            "BG.INFO",
         ] {
             assert!(!Engine::is_write_command(c), "{c} must not be write-gated");
         }

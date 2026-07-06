@@ -1,5 +1,6 @@
 //! Command dispatch: one match arm per command, grouped in family modules
 
+pub mod budget;
 pub mod command_docs;
 pub mod generic;
 pub mod hash;
@@ -66,6 +67,15 @@ pub async fn dispatch(
             std::process::exit(0)
         }
         "DEBUG" => server::debug(engine, &args).await,
+
+        // --- budgets (BG.*, design/13) ---
+        "BG.CREATE" => budget::create(engine, &args).await,
+        "BG.TOPUP" => budget::topup(engine, &args).await,
+        "BG.RESERVE" => budget::reserve(engine, &args).await,
+        "BG.COMMIT" => budget::commit(engine, &args).await,
+        "BG.RELEASE" => budget::release(engine, &args).await,
+        "BG.DRAW" => budget::draw(engine, &args).await,
+        "BG.INFO" => budget::info(engine, &args).await,
 
         // --- generic / keyspace ---
         "DEL" | "UNLINK" => generic::del(engine, &args).await,

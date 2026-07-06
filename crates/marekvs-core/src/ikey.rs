@@ -34,6 +34,9 @@ pub enum Tag {
     /// kept reserved so old parse paths and RENAME plumbing stay total.
     List = b'l',
     StreamEntry = b'x',
+    /// Budget records (design/13): escrow slots, tokens, admin sub-records.
+    /// Element kind is the first suffix byte (`BUDGET_SLOT`/`BUDGET_TOKEN`/…).
+    Budget = b'b',
 }
 
 fn put_varint(out: &mut Vec<u8>, mut v: u64) {
@@ -149,6 +152,62 @@ pub fn collection_prefix(tag: Tag, userkey: &[u8]) -> Vec<u8> {
     prefixed(tag, userkey, &[])
 }
 
+/// Budget element kinds — first byte of a `Tag::Budget` suffix. Memcmp order
+/// groups all slots before all tokens within one budget's key range.
+pub const BUDGET_SLOT: u8 = b'L';
+pub const BUDGET_WINDOW_SLOT: u8 = b'W';
+pub const BUDGET_TOKEN: u8 = b'T';
+
+/// Pool-mode escrow slot: `[pid][b'b'][klen][userkey][b'L'][gen][node][epoch]`.
+pub fn budget_slot_key(userkey: &[u8], gen: u64, node: u16, epoch: u64) -> Vec<u8> {
+    let mut suffix = Vec::with_capacity(1 + 8 + 2 + 8);
+    suffix.push(BUDGET_SLOT);
+    suffix.extend_from_slice(&gen.to_be_bytes());
+    suffix.extend_from_slice(&node.to_be_bytes());
+    suffix.extend_from_slice(&epoch.to_be_bytes());
+    prefixed(Tag::Budget, userkey, &suffix)
+}
+
+/// Window-mode escrow slot:
+/// `[pid][b'b'][klen][userkey][b'W'][gen][window][node][epoch]`.
+pub fn budget_window_slot_key(
+    userkey: &[u8],
+    gen: u64,
+    window: u64,
+    node: u16,
+    epoch: u64,
+) -> Vec<u8> {
+    let mut suffix = Vec::with_capacity(1 + 8 + 8 + 2 + 8);
+    suffix.push(BUDGET_WINDOW_SLOT);
+    suffix.extend_from_slice(&gen.to_be_bytes());
+    suffix.extend_from_slice(&window.to_be_bytes());
+    suffix.extend_from_slice(&node.to_be_bytes());
+    suffix.extend_from_slice(&epoch.to_be_bytes());
+    prefixed(Tag::Budget, userkey, &suffix)
+}
+
+/// Token record: `[pid][b'b'][klen][userkey][b'T'][gen][hlc][node][epoch]` —
+/// sorts by generation then issue time; `(hlc, node, epoch)` is cluster-unique
+/// (HLC is per-process monotone; epoch disambiguates NodeId reuse).
+pub fn budget_token_key(userkey: &[u8], gen: u64, hlc: u64, node: u16, epoch: u64) -> Vec<u8> {
+    let mut suffix = Vec::with_capacity(1 + 8 + 8 + 2 + 8);
+    suffix.push(BUDGET_TOKEN);
+    suffix.extend_from_slice(&gen.to_be_bytes());
+    suffix.extend_from_slice(&hlc.to_be_bytes());
+    suffix.extend_from_slice(&node.to_be_bytes());
+    suffix.extend_from_slice(&epoch.to_be_bytes());
+    prefixed(Tag::Budget, userkey, &suffix)
+}
+
+/// Scan prefix covering one budget's records of `kind` within `gen`
+/// (kind = BUDGET_SLOT / BUDGET_WINDOW_SLOT / BUDGET_TOKEN).
+pub fn budget_kind_prefix(userkey: &[u8], kind: u8, gen: u64) -> Vec<u8> {
+    let mut suffix = Vec::with_capacity(1 + 8);
+    suffix.push(kind);
+    suffix.extend_from_slice(&gen.to_be_bytes());
+    prefixed(Tag::Budget, userkey, &suffix)
+}
+
 /// Scan prefix covering an entire partition (bootstrap, Merkle, purge).
 pub fn partition_prefix(pid: Pid) -> Vec<u8> {
     pid.to_be_bytes().to_vec()
@@ -179,7 +238,7 @@ pub fn parse(ikey: &[u8]) -> Option<ParsedKey<'_>> {
             userkey: rest,
             suffix: &[],
         }),
-        b'M' | b'h' | b'S' | b'z' | b'Z' | b'q' | b'x' | b'H' => {
+        b'M' | b'h' | b'S' | b'z' | b'Z' | b'q' | b'x' | b'H' | b'b' => {
             let (klen, n) = get_varint(rest)?;
             let klen = klen as usize;
             if rest.len() < n + klen {

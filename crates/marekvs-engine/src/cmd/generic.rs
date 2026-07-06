@@ -108,6 +108,7 @@ pub async fn type_cmd(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         Some(head::CTYPE_ZSET) => "zset",
         Some(head::CTYPE_STREAM) => "stream",
         Some(head::CTYPE_HLL) => "string", // Redis compat: PF keys report as strings
+        Some(head::CTYPE_BUDGET) => "budget",
         Some(_) => "none",
     })
 }
@@ -346,6 +347,11 @@ pub async fn expire(engine: &Arc<Engine>, args: &[Vec<u8>], mult: u64, absolute:
     engine
         .store
         .run_key(&args[1], move |ctx| {
+            // Budget keys must not expire: escrow ledgers and open tokens
+            // are foldable only by their issuers (design/13). DEL works.
+            if key_type(ctx, &key) == Some(head::CTYPE_BUDGET) {
+                return Reply::err("ERR EXPIRE is not supported for budget keys (use DEL)");
+            }
             if deadline <= now_ms() {
                 return Reply::Int(if del_key(ctx, &key) { 1 } else { 0 });
             }
@@ -501,11 +507,41 @@ pub async fn randomkey(engine: &Arc<Engine>) -> Reply {
         .await
 }
 
+/// Budget keys cannot be moved or cloned: escrow slots and token ids embed
+/// the budget generation and issuer identity — a copied ledger would be an
+/// unfoldable orphan that double-counts escrow (design/13). Returns the
+/// error reply when `src` or `dst` is a live budget.
+async fn budget_move_fence(
+    engine: &Arc<Engine>,
+    what: &'static str,
+    src: &[u8],
+    dst: &[u8],
+) -> Option<Reply> {
+    for key in [src, dst] {
+        let k = key.to_vec();
+        let is_budget = engine
+            .store
+            .run_key(key, move |ctx| {
+                key_type(ctx, &k) == Some(head::CTYPE_BUDGET)
+            })
+            .await;
+        if is_budget {
+            return Some(Reply::err(format!(
+                "ERR {what} is not supported for budget keys"
+            )));
+        }
+    }
+    None
+}
+
 pub async fn rename(engine: &Arc<Engine>, args: &[Vec<u8>], nx: bool) -> Reply {
     if args.len() != 3 {
         return Reply::wrong_args("rename");
     }
     let (src, dst) = (args[1].clone(), args[2].clone());
+    if let Some(fence) = budget_move_fence(engine, "RENAME", &src, &dst).await {
+        return fence;
+    }
     if nx {
         let d = dst.clone();
         let exists = engine
@@ -572,6 +608,9 @@ pub async fn copy(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         } else {
             return Reply::syntax();
         }
+    }
+    if let Some(fence) = budget_move_fence(engine, "COPY", &src, &dst).await {
+        return fence;
     }
 
     if !replace {

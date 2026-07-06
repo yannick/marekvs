@@ -178,3 +178,43 @@ async fn unknown_keys_stay_accepted() {
         Reply::Err(_)
     ));
 }
+
+#[tokio::test]
+async fn budget_knobs_apply_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(&dir);
+
+    assert_eq!(
+        get_one(&engine, "budget-default-ttl-ms").as_deref(),
+        Some("30000")
+    );
+    assert!(matches!(
+        server::config(
+            &engine,
+            &args(&["CONFIG", "SET", "budget-default-ttl-ms", "1234"])
+        ),
+        Reply::Simple("OK")
+    ));
+    assert_eq!(
+        get_one(&engine, "budget-default-ttl-ms").as_deref(),
+        Some("1234")
+    );
+    assert_eq!(
+        engine
+            .budget_default_ttl_ms
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1234
+    );
+    // Zero / non-integer values fail closed.
+    assert!(matches!(
+        server::config(&engine, &args(&["CONFIG", "SET", "budget-max-ttl-ms", "0"])),
+        Reply::Err(_)
+    ));
+    assert!(matches!(
+        server::config(
+            &engine,
+            &args(&["CONFIG", "SET", "budget-reclaim-grace-ms", "soon"])
+        ),
+        Reply::Err(_)
+    ));
+}

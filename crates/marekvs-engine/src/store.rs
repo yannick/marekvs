@@ -68,6 +68,10 @@ pub struct ShardCtx {
     pub meta: Arc<ColumnFamily>,
     pub hlc: Arc<Hlc>,
     pub node_id: NodeId,
+    /// Store epoch (design/13): minted once per empty data directory. Budget
+    /// slot keys and token ids embed it so a NodeId reused with a fresh PVC
+    /// can never collide with the dead incarnation's escrow records.
+    pub epoch: u64,
     pub shard: usize,
     /// Pop-front cursors: collection scan prefix → internal key of the last
     /// popped element. Pops (SPOP/ZPOPMIN) leave element tombstones at the
@@ -156,6 +160,12 @@ pub struct Store {
     pub meta: Arc<ColumnFamily>,
     pub hlc: Arc<Hlc>,
     pub node_id: NodeId,
+    /// Store epoch (see [`ShardCtx::epoch`]).
+    pub epoch: u64,
+    /// True when this boot minted the epoch on an EMPTY data directory —
+    /// i.e. any earlier incarnation's budget records exist only on replicas.
+    /// The budget boot grant-fence keys off this (design/13).
+    pub epoch_fresh: bool,
     /// Data directory, kept for filesystem usage stats (disk-full guard).
     pub data_dir: std::path::PathBuf,
     shards: Vec<Sender<Job>>,
@@ -220,6 +230,26 @@ impl Store {
         let hlc = Arc::new(Hlc::new());
         SHARD_TOTAL.store(cfg.shard_threads, std::sync::atomic::Ordering::Relaxed);
 
+        // Store epoch: minted only when absent; persisted in the meta CF so
+        // it is stable across restarts of the same data directory.
+        const EPOCH_KEY: &[u8] = b"store:epoch";
+        let (epoch, epoch_fresh) = match db.get(&meta, EPOCH_KEY) {
+            Ok(v) if v.len() >= 8 => (u64::from_be_bytes(v[..8].try_into().unwrap()), false),
+            _ => {
+                // Fresh only if the data CF is empty too — a pre-epoch data
+                // dir upgrading in place keeps everything it ever granted.
+                let empty = {
+                    let txn = db.begin();
+                    let mut it = txn.new_iterator(&data);
+                    it.seek_to_first();
+                    !it.valid()
+                };
+                let epoch = now_ms();
+                db.put(&meta, EPOCH_KEY, &epoch.to_be_bytes(), Duration::ZERO)?;
+                (epoch, empty)
+            }
+        };
+
         let mut shards = Vec::with_capacity(cfg.shard_threads);
         let mut shard_handles = Vec::with_capacity(cfg.shard_threads);
         for shard in 0..cfg.shard_threads {
@@ -230,6 +260,7 @@ impl Store {
                 meta: meta.clone(),
                 hlc: hlc.clone(),
                 node_id: cfg.node_id,
+                epoch,
                 shard,
                 pop_hints: std::cell::RefCell::new(std::collections::HashMap::new()),
             };
@@ -246,6 +277,8 @@ impl Store {
             meta,
             hlc,
             node_id: cfg.node_id,
+            epoch,
+            epoch_fresh,
             data_dir: std::path::PathBuf::from(&cfg.data_dir),
             shards,
             shard_handles,
@@ -364,7 +397,15 @@ fn sweep_expired(ctx: &ShardCtx, cursor: &mut Vec<u8>, budget: usize) {
         while it.valid() && n < budget {
             // Shard ownership check: this thread only touches its own pids.
             if let Some(parsed) = ikey::parse(it.key()) {
-                if parsed.pid as usize % shard_total(ctx) == ctx.shard {
+                // Budget records (tag 'b') NEVER expire generically: token
+                // deadlines live in the payload and only the issuing node
+                // may fold them — a replica-sweeper tombstone here would
+                // destroy pre-fold state the issuer's escrow credit needs
+                // (design/13). They carry no envelope TTL today; the skip is
+                // explicit so a future TTL use can't reintroduce the trace.
+                if parsed.tag != ikey::Tag::Budget as u8
+                    && parsed.pid as usize % shard_total(ctx) == ctx.shard
+                {
                     if let Some((env, pay)) = Envelope::decode(it.value()) {
                         if !env.is_tombstone() && env.is_expired(now) {
                             expired.push((it.key().to_vec(), expiry_tombstone(&env, pay)));
@@ -498,7 +539,7 @@ pub fn del_raw(ctx: &ShardCtx, ikey: &[u8]) {
     }
 }
 
-fn onda_ttl_for(value: &[u8]) -> Duration {
+pub(crate) fn onda_ttl_for(value: &[u8]) -> Duration {
     match Envelope::decode(value) {
         Some((env, _)) if env.is_tombstone() => gc_grace(),
         Some((env, _)) if env.ttl_deadline_ms != 0 => {
@@ -540,7 +581,16 @@ pub fn write_merged(ctx: &ShardCtx, ikey: &[u8], incoming: &[u8]) -> bool {
             true
         }
         Some(local) => {
-            let outcome = merge_values(&local, incoming);
+            // Budget elements (tag 'b') have their own merges — slot
+            // pointwise-max, token rank lattice — routed by the element kind
+            // byte; heads (which carry no element suffix) stay on the
+            // ordinary LWW path in merge_values (design/13).
+            let outcome = match ikey::parse(ikey) {
+                Some(p) if p.tag == Tag::Budget as u8 && !p.suffix.is_empty() => {
+                    marekvs_core::budget::merge_budget(p.suffix[0], &local, incoming)
+                }
+                _ => merge_values(&local, incoming),
+            };
             match &outcome {
                 MergeOutcome::KeepLocal => false,
                 _ => {
@@ -655,6 +705,9 @@ fn collection_nonempty(ctx: &ShardCtx, ctype: u8, userkey: &[u8], del_hlc: u64) 
         head::CTYPE_STREAM => Tag::StreamEntry,
         head::CTYPE_HLL => Tag::HllRegister,
         head::CTYPE_LIST => Tag::ListElem,
+        // A budget exists as long as its head is live — escrow slots and
+        // tokens are ledger records, not membership (design/13).
+        head::CTYPE_BUDGET => return true,
         _ => return false,
     };
     let now = now_ms();

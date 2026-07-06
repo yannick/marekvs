@@ -350,3 +350,201 @@ mod hll_registers {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Budget record laws (design/13): slot pointwise-max + token rank lattice
+// ---------------------------------------------------------------------------
+
+mod budget_records {
+    use super::*;
+    use marekvs_core::budget::{
+        encode_slot_record, encode_token_record, merge_budget, SlotState, TokenState, RANK_FOLDED,
+        RANK_OPEN, STATE_EXPIRED, STATE_OPEN,
+    };
+    use marekvs_core::envelope::Envelope;
+    use marekvs_core::ikey::{BUDGET_SLOT, BUDGET_TOKEN};
+    use marekvs_core::merge::resolve;
+
+    fn merge2b(kind: u8, a: &[u8], b: &[u8]) -> Vec<u8> {
+        resolve(a, b, &merge_budget(kind, a, b)).to_vec()
+    }
+
+    /// Token payload as a pure function of (rank, version): in production a
+    /// version uniquely identifies one write, so equal versions always carry
+    /// identical bytes (same rule as the element strategy above).
+    fn token(rank: u8, hlc: u64, origin: u16) -> Vec<u8> {
+        let st = TokenState {
+            rank,
+            state: if rank == RANK_FOLDED {
+                STATE_EXPIRED
+            } else {
+                STATE_OPEN
+            },
+            amount: 100 + hlc,
+            spent: hlc % 7,
+            credited: if rank == RANK_FOLDED {
+                100 + hlc - (hlc % 7)
+            } else {
+                0
+            },
+            deadline_ms: 1_000 + hlc,
+            window: 0,
+            reqid: hlc ^ (origin as u64),
+        };
+        encode_token_record((hlc, origin), 0, st)
+    }
+
+    /// Cumulative slot snapshots from ONE writer (single-writer rule):
+    /// monotone version, grow-only fields.
+    fn slot_snapshots(deltas: &[(u8, u8)]) -> Vec<Vec<u8>> {
+        let mut granted = 0u64;
+        let mut returned = 0u64;
+        let mut out = Vec::with_capacity(deltas.len());
+        for (i, (g, r)) in deltas.iter().enumerate() {
+            granted += *g as u64;
+            returned += *r as u64;
+            out.push(encode_slot_record(
+                (100 + i as u64, 1),
+                0,
+                false,
+                SlotState { granted, returned },
+            ));
+        }
+        out
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Token rank-lattice merge: commutative, associative, idempotent,
+        /// and canonical (the result is always one input verbatim).
+        #[test]
+        fn token_merge_laws(
+            specs in prop::collection::vec((0u8..3, 1u64..100, 0u16..4), 2..5),
+        ) {
+            let recs: Vec<Vec<u8>> =
+                specs.iter().map(|(r, h, o)| token(*r, *h, *o)).collect();
+            let (a, b) = (&recs[0], &recs[1]);
+            prop_assert_eq!(merge2b(BUDGET_TOKEN, a, b), merge2b(BUDGET_TOKEN, b, a));
+            if recs.len() >= 3 {
+                let c = &recs[2];
+                prop_assert_eq!(
+                    merge2b(BUDGET_TOKEN, &merge2b(BUDGET_TOKEN, a, b), c),
+                    merge2b(BUDGET_TOKEN, a, &merge2b(BUDGET_TOKEN, b, c))
+                );
+            }
+            let m = merge2b(BUDGET_TOKEN, a, b);
+            prop_assert!(&m == a || &m == b, "token merge must be canonical");
+            prop_assert_eq!(merge2b(BUDGET_TOKEN, &m, a), m.clone());
+            prop_assert_eq!(merge2b(BUDGET_TOKEN, &m, &m), m);
+        }
+
+        /// A folded token absorbs open/closing rewrites with arbitrarily
+        /// higher HLCs, in every merge order, and its tombstone flag plus
+        /// fold outcome survive verbatim (the double-credit trace).
+        #[test]
+        fn folded_token_is_absorbing(
+            others in prop::collection::vec((0u8..2, 1u64..1_000_000, 0u16..4), 1..6),
+            fold_hlc in 1u64..50,
+        ) {
+            let folded = token(RANK_FOLDED, fold_hlc, 1);
+            let mut acc = folded.clone();
+            for (r, h, o) in &others {
+                acc = merge2b(BUDGET_TOKEN, &acc, &token(*r, *h, *o));
+            }
+            prop_assert_eq!(&acc, &folded, "folded token must absorb lower ranks");
+            // and merging the other direction (folded arrives last):
+            let mut acc2 = token(others[0].0, others[0].1, others[0].2);
+            for (r, h, o) in &others[1..] {
+                acc2 = merge2b(BUDGET_TOKEN, &acc2, &token(*r, *h, *o));
+            }
+            acc2 = merge2b(BUDGET_TOKEN, &acc2, &folded);
+            prop_assert_eq!(&acc2, &folded);
+            let (env, _) = Envelope::decode(&acc2).unwrap();
+            prop_assert!(env.is_tombstone(), "fold tombstone flag must survive");
+        }
+
+        /// Slot merge: pointwise-max laws + no acked grant/credit is ever
+        /// lost — any permutation of a single writer's cumulative snapshots
+        /// converges to its final ledger.
+        #[test]
+        fn slot_no_lost_grants(
+            deltas in prop::collection::vec((0u8..50, 0u8..50), 1..8),
+        ) {
+            let snaps = slot_snapshots(&deltas);
+            let expected: (u64, u64) = deltas.iter().fold((0, 0), |(g, r), (dg, dr)| {
+                (g + *dg as u64, r + *dr as u64)
+            });
+            let n = snaps.len();
+            let base: Vec<usize> = (0..n).collect();
+            for rot in 0..n {
+                let mut order = base.clone();
+                order.rotate_left(rot);
+                for rev in [false, true] {
+                    if rev {
+                        order.reverse();
+                    }
+                    let mut acc = snaps[order[0]].clone();
+                    for &i in &order[1..] {
+                        acc = merge2b(BUDGET_SLOT, &acc, &snaps[i]);
+                    }
+                    let (_, pay) = Envelope::decode(&acc).unwrap();
+                    let st = SlotState::decode(pay).unwrap();
+                    prop_assert_eq!((st.granted, st.returned), expected);
+                }
+            }
+        }
+
+        /// Slot merge laws over snapshot pairs/triples (canonical fixed point).
+        #[test]
+        fn slot_merge_laws(
+            deltas in prop::collection::vec((0u8..50, 0u8..50), 3..6),
+        ) {
+            let snaps = slot_snapshots(&deltas);
+            let (a, b, c) = (&snaps[0], &snaps[1], &snaps[2]);
+            prop_assert_eq!(merge2b(BUDGET_SLOT, a, b), merge2b(BUDGET_SLOT, b, a));
+            prop_assert_eq!(
+                merge2b(BUDGET_SLOT, &merge2b(BUDGET_SLOT, a, b), c),
+                merge2b(BUDGET_SLOT, a, &merge2b(BUDGET_SLOT, b, c))
+            );
+            let m = merge2b(BUDGET_SLOT, a, b);
+            prop_assert_eq!(merge2b(BUDGET_SLOT, &m, a), m.clone());
+            prop_assert_eq!(merge2b(BUDGET_SLOT, &m, &m), m);
+        }
+
+        /// A slot GC tombstone is only ever the owner's FINAL write (highest
+        /// version); it must win against every stale live copy in any order.
+        #[test]
+        fn slot_tombstone_finality(
+            deltas in prop::collection::vec((0u8..50, 0u8..50), 1..6),
+        ) {
+            let snaps = slot_snapshots(&deltas);
+            let tomb = encode_slot_record(
+                (100 + snaps.len() as u64, 1),
+                0,
+                true,
+                SlotState::default(),
+            );
+            for s in &snaps {
+                prop_assert_eq!(merge2b(BUDGET_SLOT, s, &tomb), tomb.clone());
+                prop_assert_eq!(merge2b(BUDGET_SLOT, &tomb, s), tomb.clone());
+            }
+            let mut acc = snaps[0].clone();
+            for s in &snaps[1..] {
+                acc = merge2b(BUDGET_SLOT, &acc, s);
+            }
+            prop_assert_eq!(merge2b(BUDGET_SLOT, &acc, &tomb), tomb);
+        }
+    }
+
+    #[test]
+    fn open_token_never_carries_envelope_ttl() {
+        // The deadline lives in the payload; an open token's envelope TTL is
+        // zero so replica sweepers can never destroy pre-fold state.
+        let rec = token(RANK_OPEN, 42, 1);
+        let (env, pay) = Envelope::decode(&rec).unwrap();
+        assert_eq!(env.ttl_deadline_ms, 0);
+        assert!(TokenState::decode(pay).unwrap().deadline_ms > 0);
+        assert!(!env.is_tombstone());
+    }
+}

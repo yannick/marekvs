@@ -266,6 +266,27 @@ pub fn config(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
                 ("lua-time-limit", limit.clone()),
                 ("busy-reply-threshold", limit),
                 ("loglevel", engine.log_filter.read().clone()),
+                (
+                    "budget-default-ttl-ms",
+                    engine
+                        .budget_default_ttl_ms
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string(),
+                ),
+                (
+                    "budget-max-ttl-ms",
+                    engine
+                        .budget_max_ttl_ms
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string(),
+                ),
+                (
+                    "budget-reclaim-grace-ms",
+                    engine
+                        .budget_reclaim_grace_ms
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string(),
+                ),
             ];
             let mut pairs = Vec::new();
             for pat in &args[2..] {
@@ -302,6 +323,23 @@ pub fn config(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
                             ))
                         }
                     },
+                    "budget-default-ttl-ms" | "budget-max-ttl-ms" | "budget-reclaim-grace-ms" => {
+                        match val.parse::<u64>() {
+                            Ok(ms) if ms > 0 => {
+                                let slot = match key.as_str() {
+                                    "budget-default-ttl-ms" => &engine.budget_default_ttl_ms,
+                                    "budget-max-ttl-ms" => &engine.budget_max_ttl_ms,
+                                    _ => &engine.budget_reclaim_grace_ms,
+                                };
+                                slot.store(ms, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            _ => {
+                                return Reply::err(format!(
+                                    "ERR CONFIG SET failed - argument couldn't be parsed into a positive integer for '{key}'"
+                                ))
+                            }
+                        }
+                    }
                     "loglevel" => {
                         let spec = loglevel_to_filter(&val);
                         let hook = engine.log_reload.read().clone();
