@@ -380,6 +380,67 @@ fn fold_expired_own(
     }
 }
 
+/// Window-mode ledger GC (design/13 fix 9): THIS node tombstones ITS OWN
+/// window slots once they are out of grant reach — never younger than the
+/// longest possible token life plus twice the reclaim grace (the skew
+/// allowance), and never by replica sweepers. The tombstone-class record
+/// wins LWW everywhere (owner writes are version-monotone) and ondaDB's
+/// gc_grace backstop drops it physically. A pathologically late fold can
+/// resurrect a partial slot for a dead window — harmless: headroom only
+/// consults the current window.
+fn gc_old_windows(
+    ctx: &ShardCtx,
+    key: &[u8],
+    bhead: &BudgetHead,
+    max_ttl_ms: u64,
+    grace_ms: u64,
+    current: u64,
+    limit: usize,
+    pending: &mut PendingOps,
+) {
+    let hs = &bhead.state;
+    if hs.mode != MODE_WINDOW || hs.period_ms == 0 {
+        return;
+    }
+    let retention = (max_ttl_ms.saturating_add(grace_ms.saturating_mul(2))) / hs.period_ms + 2;
+    let Some(cutoff) = current.checked_sub(retention) else {
+        return;
+    };
+    let prefix = {
+        let mut suffix = Vec::with_capacity(9);
+        suffix.push(ikey::BUDGET_WINDOW_SLOT);
+        suffix.extend_from_slice(&hs.gen.to_be_bytes());
+        ikey::prefixed(ikey::Tag::Budget, key, &suffix)
+    };
+    let mut victims: Vec<Vec<u8>> = Vec::new();
+    scan_prefix(ctx, &prefix, |k, v| {
+        let Some(p) = ikey::parse(k) else { return true };
+        // suffix: [W][gen u64][window u64][node u16][epoch u64] — memcmp
+        // order sorts by window first, so the scan stops at the cutoff.
+        if p.suffix.len() < 27 {
+            return true;
+        }
+        let window = u64::from_be_bytes(p.suffix[9..17].try_into().unwrap());
+        if window >= cutoff {
+            return false;
+        }
+        let node = u16::from_be_bytes(p.suffix[17..19].try_into().unwrap());
+        if node != ctx.node_id {
+            return true;
+        }
+        if Envelope::decode(v).is_some_and(|(e, _)| !e.is_tombstone()) {
+            victims.push(k.to_vec());
+        }
+        victims.len() < limit
+    });
+    for k in victims {
+        pending.other.push((
+            k,
+            encode_slot_record((ctx.hlc.now(), ctx.node_id), 0, true, SlotState::default()),
+        ));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Grant (BG.RESERVE)
 // ---------------------------------------------------------------------------
@@ -506,6 +567,16 @@ pub(crate) fn grant_local(
     fold_expired_own(ctx, key, &bhead, cfg.grace_ms, FOLD_BATCH, &mut pending);
 
     let window = current_window(ctx, hs);
+    gc_old_windows(
+        ctx,
+        key,
+        &bhead,
+        max_ttl,
+        cfg.grace_ms,
+        window,
+        FOLD_BATCH,
+        &mut pending,
+    );
     let alloc = hs.alloc_for(ctx.node_id) as u128;
     let outstanding = own_outstanding(ctx, key, hs, window, &pending);
     if outstanding + amount as u128 > alloc {

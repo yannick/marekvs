@@ -483,3 +483,132 @@ async fn published_ops_converge_in_any_order() {
     // 40 granted, 15 spent, 25 returned; 25 still open: available = 100-15-25.
     assert_eq!(forward, (60, 40));
 }
+
+// ---------------------------------------------------------------------------
+// Window mode (MODE WINDOW, design/13 fix 9)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn window_mode_refills_each_period() {
+    let (_d, e) = engine();
+    ok(budget::create(
+        &e,
+        &a(&[
+            b"BG.CREATE",
+            b"w",
+            b"100",
+            b"MODE",
+            b"WINDOW",
+            b"400",
+            b"MAXTTL",
+            b"300",
+        ]),
+    )
+    .await);
+    // Fill this window completely.
+    let g = reserve(&e, b"w", "100", &[b"TTL", b"200"]).await;
+    assert_eq!(int(map_get(&g, "amount")), 100);
+    assert_err_contains(
+        reserve(&e, b"w", "1", &[b"TTL", b"200"]).await,
+        "BUDGETEXHAUSTED",
+    );
+    // Next window: the full allowance is available again — the previous
+    // window's grants never count against it.
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    let g2 = reserve(&e, b"w", "100", &[b"TTL", b"200"]).await;
+    assert_eq!(int(map_get(&g2, "amount")), 100);
+}
+
+#[tokio::test]
+async fn window_fold_credits_the_grant_window() {
+    let (_d, e) = engine();
+    ok(budget::create(
+        &e,
+        &a(&[
+            b"BG.CREATE",
+            b"w",
+            b"100",
+            b"MODE",
+            b"WINDOW",
+            b"2000",
+            b"MAXTTL",
+            b"10000",
+        ]),
+    )
+    .await);
+    let g = reserve(&e, b"w", "60", &[b"TTL", b"8000"]).await;
+    let tok = token_of(&g);
+    // Roll into the next window, grant its full allowance, THEN commit the
+    // old-window token: the credit lands in the OLD window's ledger and must
+    // not free headroom in the current one. (Wide window: the remaining
+    // assertions run well inside it even on a loaded machine.)
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let g2 = reserve(&e, b"w", "100", &[b"TTL", b"200"]).await;
+    assert_eq!(int(map_get(&g2, "amount")), 100);
+    assert_eq!(
+        int(budget::commit(&e, &a(&[b"BG.COMMIT", b"w", &tok, b"10"])).await),
+        50
+    );
+    assert_err_contains(
+        reserve(&e, b"w", "1", &[b"TTL", b"200"]).await,
+        "BUDGETEXHAUSTED",
+    );
+}
+
+#[tokio::test]
+async fn old_window_slots_are_garbage_collected() {
+    let (_d, e) = engine();
+    e.budget_reclaim_grace_ms
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    ok(budget::create(
+        &e,
+        &a(&[
+            b"BG.CREATE",
+            b"w",
+            b"100",
+            b"MODE",
+            b"WINDOW",
+            b"100",
+            b"MAXTTL",
+            b"50",
+            b"TTL",
+            b"50",
+        ]),
+    )
+    .await);
+    // Leave a slot record in several early windows.
+    for _ in 0..3 {
+        let _ = reserve(&e, b"w", "5", &[]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    }
+    // retention = (50 + 2*1)/100 + 2 = 2 windows; run far past it, then a
+    // grant sweeps GC.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let _ = reserve(&e, b"w", "5", &[]).await;
+    let live = e
+        .store
+        .run_key(b"w", |ctx| {
+            let prefix = {
+                let mut s = vec![marekvs_core::ikey::BUDGET_WINDOW_SLOT];
+                // count LIVE window slots across all windows of any gen: scan
+                // the whole budget kind space for this key
+                s.clear();
+                s.push(marekvs_core::ikey::BUDGET_WINDOW_SLOT);
+                marekvs_core::ikey::prefixed(marekvs_core::ikey::Tag::Budget, b"w", &s)
+            };
+            let mut live = 0;
+            marekvs_engine::store::scan_prefix(ctx, &prefix, |_k, v| {
+                if marekvs_core::Envelope::decode(v).is_some_and(|(e, _)| !e.is_tombstone()) {
+                    live += 1;
+                }
+                true
+            });
+            live
+        })
+        .await;
+    // The early windows' slots must be tombstoned; only recent ones remain.
+    assert!(
+        live <= 3,
+        "expected old window slots GC'd, {live} still live"
+    );
+}
