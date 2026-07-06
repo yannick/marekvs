@@ -17,7 +17,7 @@ source tests/chaos/lib.sh
 
 SCENARIOS=("$@")
 [ ${#SCENARIOS[@]} -gt 0 ] || {
-  SCENARIOS=(crash_restart freeze_thaw rolling_churn wipe_replace membership_churn join_empty_reads interest_flood bank)
+  SCENARIOS=(crash_restart freeze_thaw rolling_churn wipe_replace membership_churn join_empty_reads interest_flood bank budget_no_overspend)
   [ "$BACKEND" = docker ] && SCENARIOS+=(disk_guard gc_grace_rejoin)
   [ "$BACKEND" = docker ] && SCENARIOS+=(partition_divergence partition_no_resurrect)
 }
@@ -478,6 +478,84 @@ return 1"
       chk 1 "bank total on node $i" "$a + $b = $sum, expected $TOTAL — $((sum - TOTAL)) CREATED/DESTROYED"
     fi
   done
+}
+
+# ── scenario: budget_no_overspend (design/13) ────────────────────────────
+# Workers hammer BG.RESERVE/COMMIT/RELEASE across all nodes (commits land on
+# non-issuers to exercise forwarding) while the nemesis SIGKILLs nodes in
+# rounds. Oracle after heal + max-TTL + folds: every node's view of the
+# ledger stays within capacity, and no accepted spend is ever lost.
+budget_no_overspend() {
+  fresh_cluster
+  local CAP=1000 TTL=3000
+  rcli 0 bg.create '{bgt}:pool' $CAP TTL $TTL MAXAMOUNT 50 >/dev/null
+  local J; J=$(mktemp)
+  local dur=40 t0=$SECONDS
+  (
+    n=0
+    while [ $((SECONDS - t0)) -lt $dur ]; do
+      wi=$((n % N)); ci=$(((n + 1) % N)); amt=$(( (n % 40) + 1 ))
+      # `|| true` covers the whole pipeline: a SIGKILLed node makes
+      # redis-cli exit nonzero and pipefail would kill the worker.
+      tok=$(rcli "$wi" -t 2 bg.reserve '{bgt}:pool' "$amt" 2>/dev/null | sed -n 2p || true)
+      if [ -n "$tok" ] && [[ "$tok" == *-*-*-* ]]; then
+        case $((n % 4)) in
+          0|1) # commit a partial spend via a DIFFERENT node (issuer forward)
+            spent=$(( (amt + 1) / 2 ))
+            out=$(rcli "$ci" -t 2 bg.commit '{bgt}:pool' "$tok" "$spent" 2>/dev/null || true)
+            case "$out" in
+              ''|*[!0-9]*) : ;; # not accepted — nothing journaled
+              *) echo "$spent" >>"$J" ;;
+            esac ;;
+          2) rcli "$ci" -t 2 bg.release '{bgt}:pool' "$tok" >/dev/null 2>&1 || true ;;
+          3) : ;; # abandon: reclaimed at the deadline
+        esac
+      fi
+      n=$((n + 1))
+    done
+  ) & local W=$!
+  local round
+  for round in 0 1 2; do
+    sleep 6
+    crash $(( (round + 1) % N ))
+    sleep 6
+    revive $(( (round + 1) % N ))
+  done
+  wait $W || true
+  # Heal + let every open token expire (TTL + reclaim grace 5s + AE margin),
+  # then poke each node so issuers fold their own expired tokens.
+  sleep $(( (TTL / 1000) + 8 ))
+  local i tok2
+  for i in $(seq 0 $((N - 1))); do
+    tok2=$(rcli "$i" -t 5 bg.reserve '{bgt}:pool' 1 2>/dev/null | sed -n 2p || true)
+    if [ -n "$tok2" ]; then
+      rcli "$i" -t 5 bg.release '{bgt}:pool' "$tok2" >/dev/null 2>&1 || true
+    fi
+  done
+  sleep 3 # replicate the folds
+  local spent_total=0 v
+  while read -r v; do spent_total=$((spent_total + v)); done <"$J"
+  rm -f "$J"
+  for i in $(seq 0 $((N - 1))); do
+    local out
+    out=$(rcli "$i" -t 5 bg.info '{bgt}:pool' | awk '/^outstanding$/{getline; print; exit}' || true)
+    if [ -z "$out" ]; then
+      chk 1 "budget INFO on node $i" "no outstanding field"
+      continue
+    fi
+    if [ "$out" -le "$CAP" ] && [ "$out" -ge "$spent_total" ]; then
+      chk 0 "node $i ledger within capacity ($spent_total accepted <= $out outstanding <= $CAP)"
+    else
+      chk 1 "node $i ledger" "accepted=$spent_total outstanding=$out cap=$CAP — INVARIANT VIOLATED"
+    fi
+  done
+  # Fail closed, promptly: an impossible reservation errors instead of hanging.
+  local big
+  big=$(rcli 0 -t 5 bg.reserve '{bgt}:pool' 2000 2>&1 || true)
+  case "$big" in
+    *BUDGETEXHAUSTED*|*"exceeds budget maximum"*) chk 0 "oversized reserve fails closed" ;;
+    *) chk 1 "oversized reserve" "unexpected: $big" ;;
+  esac
 }
 
 # ── scenario: bridge_partition (debug, docker) ───────────────────────────

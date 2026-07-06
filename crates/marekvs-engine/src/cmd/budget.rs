@@ -388,6 +388,7 @@ fn fold_expired_own(
 /// gc_grace backstop drops it physically. A pathologically late fold can
 /// resurrect a partial slot for a dead window — harmless: headroom only
 /// consults the current window.
+#[allow(clippy::too_many_arguments)] // one GC pass = one fully-specified sweep
 fn gc_old_windows(
     ctx: &ShardCtx,
     key: &[u8],
@@ -1331,6 +1332,173 @@ pub async fn serve_remote_close(
     };
     let k = key.to_vec();
     budget_write(engine, key, move |ctx| close_local(ctx, grace, &k, tid, op)).await?
+}
+
+// ---------------------------------------------------------------------------
+// BG.RECLAIM — admin recovery of a permanently dead node's escrow
+// ---------------------------------------------------------------------------
+
+/// BG.RECLAIM key node-id [SEQ n]
+///
+/// Preconditions are the OPERATOR's (AP: downtime is unverifiable here): the
+/// target is permanently gone and every token it could have issued is past
+/// deadline + grace + the anti-entropy margin. The target's remaining escrow
+/// is fenced and redistributed; its consumed portion is derived from BOTH
+/// its token records (Σ rank-2 spent + Σ open amounts — a token is one
+/// record and can never be torn by per-record AE repair) and its replicated
+/// slot ledgers (which cover folded tokens already past gc_grace GC), taking
+/// the MAX — conservative in every tear/GC direction. Residual risk if the
+/// target is actually alive in a partition: it keeps granting against its
+/// stale allocation until the fence replicates; documented in design/13.
+pub async fn reclaim(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 3 {
+        return Reply::wrong_args("bg.reclaim");
+    }
+    let key = args[1].clone();
+    let target = match parse_u64(&args[2]) {
+        Some(n) if n <= u16::MAX as u64 => n as u16,
+        _ => return Reply::not_int(),
+    };
+    if target == engine.store.node_id {
+        return Reply::err("ERR cannot reclaim this node (it is alive and serving this command)");
+    }
+    let mut seq: Option<u64> = None;
+    if args.len() > 3 {
+        if args.len() == 5 && eq_ignore_case(&args[3], "SEQ") {
+            match parse_u64(&args[4]) {
+                Some(v) => seq = Some(v),
+                None => return Reply::not_int(),
+            }
+        } else {
+            return Reply::syntax();
+        }
+    }
+    let res = budget_write(engine, &key.clone(), move |ctx| {
+        let bhead = head_or_err(ctx, &key)?;
+        let mut hs = bhead.state;
+        if let Some(seq) = seq {
+            if seq <= hs.op_seq {
+                return Ok((Vec::new(), 0i64));
+            }
+        }
+        let alloc_target = hs.alloc_for(target);
+        if alloc_target == 0 && hs.is_fenced(target) {
+            return Ok((Vec::new(), 0i64)); // already reclaimed
+        }
+        // Token-derived consumption: open amounts count as fully spent
+        // (stranded-open, conservative — nobody can fold them again).
+        let mut token_consumed: u128 = 0;
+        let tprefix = ikey::budget_kind_prefix(&key, ikey::BUDGET_TOKEN, hs.gen);
+        scan_prefix(ctx, &tprefix, |k, v| {
+            let Some(p) = ikey::parse(k) else { return true };
+            let Some((_gen, _hlc, node, _epoch)) = token_suffix_fields(p.suffix) else {
+                return true;
+            };
+            if node != target {
+                return true;
+            }
+            if let Some((_env, pay)) = Envelope::decode(v) {
+                if let Some(st) = TokenState::decode(pay) {
+                    token_consumed += if st.rank >= RANK_FOLDED {
+                        st.spent as u128
+                    } else {
+                        st.amount as u128
+                    };
+                }
+            }
+            true
+        });
+        // Slot-derived consumption (granted − returned across the target's
+        // epochs; replicated copies only ever lag LOW on both grow-only
+        // fields, and every acked grant was published before its ack).
+        let mut slot_consumed: u128 = 0;
+        let sprefix = ikey::budget_kind_prefix(
+            &key,
+            if hs.mode == MODE_WINDOW {
+                ikey::BUDGET_WINDOW_SLOT
+            } else {
+                ikey::BUDGET_SLOT
+            },
+            hs.gen,
+        );
+        let node_off = if hs.mode == MODE_WINDOW { 17 } else { 9 };
+        scan_prefix(ctx, &sprefix, |k, v| {
+            let Some(p) = ikey::parse(k) else { return true };
+            if p.suffix.len() < node_off + 10 {
+                return true;
+            }
+            let node = u16::from_be_bytes(p.suffix[node_off..node_off + 2].try_into().unwrap());
+            if node != target {
+                return true;
+            }
+            if let Some((env, pay)) = Envelope::decode(v) {
+                if !env.is_tombstone() {
+                    if let Some(st) = SlotState::decode(pay) {
+                        slot_consumed += st.outstanding();
+                    }
+                }
+            }
+            true
+        });
+        let consumed = token_consumed.max(slot_consumed);
+        let consumed_u64 = consumed.min(alloc_target as u128) as u64;
+        let freed = alloc_target - consumed_u64;
+        // Shrink the target to exactly what it consumed, fence it, and
+        // spread the freed escrow across the remaining unfenced nodes.
+        for (n, a) in hs.alloc.iter_mut() {
+            if *n == target {
+                *a = consumed_u64;
+            }
+        }
+        if !hs.is_fenced(target) {
+            if hs.fence.len() >= 255 {
+                return Err(BudgetErr::Other("ERR too many fenced nodes".into()));
+            }
+            hs.fence.push((target, now_ms()));
+            hs.fence.sort_unstable_by_key(|(n, _)| *n);
+        }
+        let recipients: Vec<u16> = hs
+            .alloc
+            .iter()
+            .map(|(n, _)| *n)
+            .filter(|n| *n != target && !hs.is_fenced(*n))
+            .collect();
+        if freed > 0 {
+            if recipients.is_empty() {
+                return Err(BudgetErr::Other(
+                    "ERR no unfenced nodes left to receive the reclaimed escrow".into(),
+                ));
+            }
+            let n = recipients.len() as u64;
+            let base = freed / n;
+            let rem = (freed % n) as usize;
+            for (i, r) in recipients.iter().enumerate() {
+                if let Some((_, a)) = hs.alloc.iter_mut().find(|(id, _)| id == r) {
+                    *a = a.saturating_add(base + u64::from(i < rem));
+                }
+            }
+        }
+        debug_assert!(hs.alloc_total() <= hs.capacity as u128);
+        hs.op_seq = seq.unwrap_or(hs.op_seq + 1);
+        let hlc = bhead.env.hlc.wrapping_add(1).max(ctx.hlc.now());
+        let env = Envelope {
+            flags: COLLECTION_HEAD,
+            hlc,
+            origin: ctx.node_id,
+            ttl_deadline_ms: 0,
+        };
+        let mut payload = head::encode(head::CTYPE_BUDGET, bhead.del_hlc);
+        payload.extend_from_slice(&hs.encode());
+        Ok((
+            vec![(ikey::head_key(&key), env.encode_with(&payload))],
+            freed as i64,
+        ))
+    })
+    .await;
+    match res {
+        Ok(freed) => Reply::Int(freed),
+        Err(e) => e.reply(),
+    }
 }
 
 /// BG.COMMIT key token [spent]

@@ -174,3 +174,10 @@ possible later as string overlay, not v1), OBJECT tiering commands.
 | Expiry | active sweeper + lazy check; `expired` notifications fire on the sweeping node only. |
 | Limits | 256 MiB max value; 512 MB max bulk in protocol; TTL ≤ 8 years; GETRANGE/SETRANGE indices are signed 32-bit. |
 | Blocking commands | v1.1; implemented via local wakeup + interest subscription on the key (a remote push wakes local blockers). Cross-node BLPOP is racy-by-design (two nodes may both pop under partition; documented — AP). |
+
+## marekvs extensions
+
+| Family | Commands | Notes |
+|---|---|---|
+| Budgets (`BG.*`) | `BG.CREATE`, `BG.TOPUP`, `BG.RESERVE`, `BG.COMMIT`, `BG.RELEASE`, `BG.DRAW`, `BG.INFO`, `BG.RECLAIM` | escrow-based distributed budgets with a hard never-overspend invariant; fail-closed under partition. Not a Redis command family — see [13-budget.md](13-budget.md) for the protocol, reply shapes, and AP caveats. `TYPE` reports `budget`; EXPIRE/RENAME/COPY are rejected on budget keys. |
+| Member TTL | `EXPIREMEMBER`, `EXPIREMEMBERAT`, `PEXPIREMEMBERAT`, 3-arg `TTL`/`PTTL` | KeyDB-compatible per-member expiry (pre-existing). |

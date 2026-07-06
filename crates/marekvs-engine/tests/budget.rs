@@ -499,23 +499,24 @@ async fn window_mode_refills_each_period() {
             b"100",
             b"MODE",
             b"WINDOW",
-            b"400",
+            b"2000",
             b"MAXTTL",
-            b"300",
+            b"1500",
         ]),
     )
     .await);
-    // Fill this window completely.
-    let g = reserve(&e, b"w", "100", &[b"TTL", b"200"]).await;
+    // Fill this window completely. (Wide window: the exhaustion assert runs
+    // well inside it even when parallel-test fsyncs slow things down.)
+    let g = reserve(&e, b"w", "100", &[b"TTL", b"500"]).await;
     assert_eq!(int(map_get(&g, "amount")), 100);
     assert_err_contains(
-        reserve(&e, b"w", "1", &[b"TTL", b"200"]).await,
+        reserve(&e, b"w", "1", &[b"TTL", b"500"]).await,
         "BUDGETEXHAUSTED",
     );
     // Next window: the full allowance is available again — the previous
     // window's grants never count against it.
-    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
-    let g2 = reserve(&e, b"w", "100", &[b"TTL", b"200"]).await;
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let g2 = reserve(&e, b"w", "100", &[b"TTL", b"500"]).await;
     assert_eq!(int(map_get(&g2, "amount")), 100);
 }
 
@@ -611,4 +612,134 @@ async fn old_window_slots_are_garbage_collected() {
         live <= 3,
         "expected old window slots GC'd, {live} still live"
     );
+}
+
+// ---------------------------------------------------------------------------
+// BG.RECLAIM (admin recovery of a dead node's escrow)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn reclaim_redistributes_a_dead_nodes_escrow() {
+    let (_d, e) = engine(); // node 7
+                            // Escrow split across this node and a node 9 that never comes up.
+    ok(budget::create(&e, &a(&[b"BG.CREATE", b"b", b"100", b"NODES", b"7", b"9"])).await);
+    // Only node 7's 50 is grantable.
+    assert_err_contains(reserve(&e, b"b", "51", &[]).await, "BUDGETEXHAUSTED");
+    assert_eq!(
+        int(map_get(&reserve(&e, b"b", "50", &[]).await, "amount")),
+        50
+    );
+    // Self-reclaim is refused.
+    assert_err_contains(
+        budget::reclaim(&e, &a(&[b"BG.RECLAIM", b"b", b"7"])).await,
+        "cannot reclaim this node",
+    );
+    // Reclaim the dead node: its full 50 is freed (it never granted).
+    assert_eq!(
+        int(budget::reclaim(&e, &a(&[b"BG.RECLAIM", b"b", b"9"])).await),
+        50
+    );
+    // Idempotent: a second reclaim frees nothing more.
+    assert_eq!(
+        int(budget::reclaim(&e, &a(&[b"BG.RECLAIM", b"b", b"9"])).await),
+        0
+    );
+    // The freed escrow is grantable from this node now.
+    assert_eq!(
+        int(map_get(&reserve(&e, b"b", "50", &[]).await, "amount")),
+        50
+    );
+    assert_err_contains(reserve(&e, b"b", "1", &[]).await, "BUDGETEXHAUSTED");
+}
+
+#[tokio::test]
+async fn reclaim_counts_the_dead_nodes_consumption_conservatively() {
+    use marekvs_core::budget::{
+        encode_slot_record, encode_token_record, SlotState, TokenState, RANK_FOLDED, RANK_OPEN,
+        STATE_COMMITTED, STATE_OPEN,
+    };
+
+    let (_d, e) = engine(); // node 7
+    ok(budget::create(&e, &a(&[b"BG.CREATE", b"b", b"100", b"NODES", b"7", b"9"])).await);
+    let gen = u64::from_str_radix(
+        &match map_get(
+            &budget::info(&e, &a(&[b"BG.INFO", b"b"])).await,
+            "generation",
+        ) {
+            Reply::Bulk(g) => String::from_utf8(g).unwrap(),
+            other => panic!("unexpected {other:?}"),
+        },
+        16,
+    )
+    .unwrap();
+    // Replicated state of dead node 9: it granted 30 (an open, now-stranded
+    // token of 20 with 5 drawn, and a committed token that spent 10).
+    let pid = marekvs_core::pid_of(b"b");
+    let ops: Vec<(Vec<u8>, Vec<u8>)> = vec![
+        (
+            marekvs_core::ikey::budget_slot_key(b"b", gen, 9, 1),
+            encode_slot_record(
+                (gen + 50, 9),
+                0,
+                false,
+                SlotState {
+                    granted: 30,
+                    returned: 10, // committed token: spent 10 of 20 → hm, returned = 20-10
+                },
+            ),
+        ),
+        (
+            marekvs_core::ikey::budget_token_key(b"b", gen, gen + 10, 9, 1),
+            encode_token_record(
+                (gen + 10, 9),
+                0,
+                TokenState {
+                    rank: RANK_OPEN,
+                    state: STATE_OPEN,
+                    amount: 20,
+                    spent: 5,
+                    credited: 0,
+                    deadline_ms: 1, // long expired
+                    window: 0,
+                    reqid: 0,
+                },
+            ),
+        ),
+        (
+            marekvs_core::ikey::budget_token_key(b"b", gen, gen + 20, 9, 1),
+            encode_token_record(
+                (gen + 20, 9),
+                0,
+                TokenState {
+                    rank: RANK_FOLDED,
+                    state: STATE_COMMITTED,
+                    amount: 10,
+                    spent: 10,
+                    credited: 0,
+                    deadline_ms: 1,
+                    window: 0,
+                    reqid: 0,
+                },
+            ),
+        ),
+    ];
+    e.store
+        .run(pid, move |ctx| {
+            for (k, v) in ops {
+                marekvs_engine::store::write_merged(ctx, &k, &v);
+            }
+        })
+        .await;
+    // token-derived: open 20 (counts in full) + folded spent 10 = 30.
+    // slot-derived: granted 30 − returned 10 = 20. max = 30.
+    // freed = alloc 50 − 30 = 20 → node 7 now holds 50 + 20 = 70.
+    assert_eq!(
+        int(budget::reclaim(&e, &a(&[b"BG.RECLAIM", b"b", b"9"])).await),
+        20
+    );
+    assert_eq!(
+        int(map_get(&reserve(&e, b"b", "70", &[]).await, "amount")),
+        70
+    );
+    assert_err_contains(reserve(&e, b"b", "1", &[]).await, "BUDGETEXHAUSTED");
 }

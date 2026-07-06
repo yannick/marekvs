@@ -961,6 +961,9 @@ static TABLE: &[CommandDoc] = &[
         &[A_KEY, arg("token", "string"), arg("amount", "integer")]),
     with_args(cmd("bg.info", 2, CRO, 1, 1, 1, "Returns a node-local view of a budget's configuration and escrow ledgers.", "1.2.0", "budget"),
         ARGS_KEY),
+    with_args(cmd("bg.reclaim", -3, &["write", "admin"], 1, 1, 1, "Fences a permanently dead node and redistributes its unconsumed escrow (admin; see design/13 preconditions).", "1.2.0", "budget"),
+        &[A_KEY, arg("node", "integer"),
+          Arg { token: Some("SEQ"), optional: true, ..arg("op-seq", "integer") }]),
 ];
 
 /// The full command catalog.
@@ -1173,6 +1176,7 @@ mod tests {
             "bg.release",
             "bg.draw",
             "bg.info",
+            "bg.reclaim",
         ] {
             let doc = find(name).unwrap_or_else(|| panic!("missing COMMAND DOCS entry for {name}"));
             assert!(!doc.args.is_empty(), "{name} should document its arguments");

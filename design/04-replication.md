@@ -285,8 +285,13 @@ Fetch          FetchResp        FetchCollection   FetchCollectionResp
 Check          CheckResp        InterestRenew     MerkleRoot
 MerkleRootMatch  MerkleBuckets  BucketKeys        RepairOps
 RequestKeys    BootstrapReq     BootstrapChunk    BootstrapDone
-Publish        Ping             Pong
+Publish        Ping             Pong              BudgetReserve
+BudgetReserveResp  BudgetClose  BudgetCloseResp
 ```
+
+The `Budget*` messages are the forwarded-grant / issuer-routed-close RPCs of
+the `BG.*` escrow protocol ([13-budget.md](13-budget.md)); the enum is
+append-only (postcard discriminants are positional).
 
 `HandoffAck` is **removed** — planned-leave completion is drain-based
 ([06](06-cluster-membership.md)). `ReplBatch.last_seq` and

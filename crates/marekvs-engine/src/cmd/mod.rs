@@ -76,6 +76,7 @@ pub async fn dispatch(
         "BG.RELEASE" => budget::release(engine, &args).await,
         "BG.DRAW" => budget::draw(engine, &args).await,
         "BG.INFO" => budget::info(engine, &args).await,
+        "BG.RECLAIM" => budget::reclaim(engine, &args).await,
 
         // --- generic / keyspace ---
         "DEL" | "UNLINK" => generic::del(engine, &args).await,

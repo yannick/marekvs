@@ -35,7 +35,13 @@ list element    [pid:u16] [b'q'] [klen] [userkey] [pos:u64]
 list blob       [pid:u16] [b'l'] [userkey]              (RETIRED — see §Lists)
 stream entry    [pid:u16] [b'x'] [klen] [userkey] [id_ms:u64] [id_seq:u64]
 stream head     [pid:u16] [b'M'] [klen] [userkey]              (type in envelope)
+budget records  [pid:u16] [b'b'] [klen] [userkey] [kind u8] [...]  (design/13)
 ```
+
+Budget records (`kind` = `'L'` slot / `'W'` window slot / `'T'` token) carry
+their own merges — slot pointwise-max, token rank lattice — routed by the
+tag; the budget head is ctype 7 with the admin state in the head tail
+([13-budget.md](13-budget.md)).
 
 Rationale for **per-element keys** (hash fields, set/zset members, stream
 entries):
