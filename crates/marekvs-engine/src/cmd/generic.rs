@@ -59,6 +59,9 @@ pub async fn del(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     }
     let mut n = 0;
     for keyarg in &args[1..] {
+        // Deleting needs the key observable locally: a cluster-remote key
+        // would otherwise be a silent no-op (no tombstone written).
+        engine.ensure_local(keyarg).await;
         let key = keyarg.clone();
         if engine
             .store
@@ -77,6 +80,7 @@ pub async fn exists(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     }
     let mut n = 0;
     for keyarg in &args[1..] {
+        engine.ensure_local(keyarg).await;
         let key = keyarg.clone();
         if engine
             .store
@@ -211,6 +215,7 @@ pub async fn expiremember(
         now_ms() + n as u64 * mult
     };
     let (key, member) = (args[1].clone(), args[2].clone());
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -222,6 +227,7 @@ pub async fn expiremember(
 /// TTL/PTTL with the KeyDB member extension: `TTL key member`.
 pub async fn member_ttl(engine: &Arc<Engine>, args: &[Vec<u8>], millis: bool) -> Reply {
     let (key, member) = (args[1].clone(), args[2].clone());
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -257,6 +263,7 @@ pub async fn ttl(engine: &Arc<Engine>, args: &[Vec<u8>], millis: bool) -> Reply 
         return Reply::wrong_args("ttl");
     }
     let key = args[1].clone();
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| match ttl_envelope(ctx, &key) {
@@ -279,6 +286,7 @@ pub async fn expiretime(engine: &Arc<Engine>, args: &[Vec<u8>], millis: bool) ->
         return Reply::wrong_args("expiretime");
     }
     let key = args[1].clone();
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| match ttl_envelope(ctx, &key) {
@@ -344,6 +352,9 @@ pub async fn expire(engine: &Arc<Engine>, args: &[Vec<u8>], mult: u64, absolute:
     } else {
         now_ms() + n as u64 * mult
     };
+    // Re-stamping the TTL needs the current record; fetch cluster-remote
+    // keys or EXPIRE would report 0 and change nothing.
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -369,6 +380,7 @@ pub async fn persist(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         return Reply::wrong_args("persist");
     }
     let key = args[1].clone();
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| match ttl_envelope(ctx, &key) {
@@ -539,10 +551,14 @@ pub async fn rename(engine: &Arc<Engine>, args: &[Vec<u8>], nx: bool) -> Reply {
         return Reply::wrong_args("rename");
     }
     let (src, dst) = (args[1].clone(), args[2].clone());
+    // Source records are read locally; the NX guard checks dst existence.
+    // Both need cluster-remote keys fetched first.
+    engine.ensure_local(&src).await;
     if let Some(fence) = budget_move_fence(engine, "RENAME", &src, &dst).await {
         return fence;
     }
     if nx {
+        engine.ensure_local(&dst).await;
         let d = dst.clone();
         let exists = engine
             .store
@@ -609,11 +625,13 @@ pub async fn copy(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             return Reply::syntax();
         }
     }
+    engine.ensure_local(&src).await;
     if let Some(fence) = budget_move_fence(engine, "COPY", &src, &dst).await {
         return fence;
     }
 
     if !replace {
+        engine.ensure_local(&dst).await;
         let d = dst.clone();
         let exists = engine
             .store

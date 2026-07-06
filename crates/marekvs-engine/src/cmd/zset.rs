@@ -360,6 +360,11 @@ pub async fn zadd(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         pairs.push((score, c[1].clone()));
     }
 
+    // Plain ZADD is a blind write; the conditional/relative flags compare
+    // against the current score, so cluster-remote keys must be fetched.
+    if nx || xx || gt || lt || ch || incr {
+        engine.ensure_local(&key).await;
+    }
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -486,6 +491,7 @@ pub async fn zincrby(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         return Reply::not_float();
     };
     let (key, member) = (args[1].clone(), args[3].clone());
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -510,6 +516,9 @@ pub async fn zrem(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     }
     let key = args[1].clone();
     let members: Vec<Vec<u8>> = args[2..].to_vec();
+    // Observed-remove: the member's dots must be local or ZREM is a no-op
+    // for cluster-remote zsets.
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -571,6 +580,7 @@ pub async fn zrange(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX",
         );
     }
+    engine.ensure_local(&key).await;
 
     if bylex {
         let (min_arg, max_arg) = if rev { (a3, a2) } else { (a2, a3) };
@@ -703,6 +713,7 @@ pub async fn zrangebyscore(engine: &Arc<Engine>, args: &[Vec<u8>], rev: bool) ->
             return Reply::syntax();
         }
     }
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -737,6 +748,7 @@ pub async fn zrevrange(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             return Reply::syntax();
         }
     }
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -827,6 +839,7 @@ pub async fn zpop(engine: &Arc<Engine>, args: &[Vec<u8>], max: bool) -> Reply {
             _ => return Reply::not_int(),
         },
     };
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -868,6 +881,7 @@ pub async fn zremrangebyscore(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     let (Some(min), Some(max)) = (parse_score_bound(&args[2]), parse_score_bound(&args[3])) else {
         return Reply::err("ERR min or max is not a float");
     };
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -953,6 +967,7 @@ pub async fn zremrangebyrank(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     let (Some(start), Some(stop)) = (parse_i64(&args[2]), parse_i64(&args[3])) else {
         return Reply::not_int();
     };
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -1030,6 +1045,7 @@ pub async fn zremrangebylex(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     ) else {
         return Reply::syntax();
     };
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -1067,6 +1083,9 @@ pub async fn zrangestore(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     };
     let out = selected.clone();
     let dst_arg = dst.clone();
+    // The clobber below tombstones dst; fetch it if cluster-remote so
+    // existing remote members don't survive the overwrite.
+    engine.ensure_local(&dst_arg).await;
     engine
         .store
         .run_key(&dst_arg, move |ctx| {
@@ -1431,6 +1450,8 @@ pub async fn zsetop(engine: &Arc<Engine>, args: &[Vec<u8>], op: ZSetOp, store_ds
         let dst = args[1].clone();
         let rows = out.clone();
         let dst_arg = dst.clone();
+        // Clobber semantics need dst observable locally (see zrangestore).
+        engine.ensure_local(&dst_arg).await;
         engine
             .store
             .run_key(&dst_arg, move |ctx| {
@@ -1601,6 +1622,7 @@ pub async fn zscan(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             return Reply::syntax();
         }
     }
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {

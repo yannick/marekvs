@@ -113,6 +113,11 @@ pub async fn set(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         return Reply::syntax();
     }
 
+    // The plain form is a blind write (fire-and-forget path); only the
+    // old-value-dependent flags need the cluster-remote record fetched.
+    if nx || xx || keepttl || get_old {
+        engine.ensure_local(&key).await;
+    }
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -159,6 +164,7 @@ pub async fn setnx(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         return Reply::wrong_args("setnx");
     }
     let (key, value) = (args[1].clone(), args[2].clone());
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -200,6 +206,7 @@ pub async fn getset(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         return Reply::wrong_args("getset");
     }
     let (key, value) = (args[1].clone(), args[2].clone());
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| match read_string(ctx, &key) {
@@ -217,6 +224,7 @@ pub async fn getdel(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         return Reply::wrong_args("getdel");
     }
     let key = args[1].clone();
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| match read_string(ctx, &key) {
@@ -262,6 +270,7 @@ pub async fn getex(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         }
         i += 1;
     }
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| match read_string(ctx, &key) {
@@ -282,6 +291,7 @@ pub async fn append(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         return Reply::wrong_args("append");
     }
     let (key, suffix) = (args[1].clone(), args[2].clone());
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| match read_string(ctx, &key) {
@@ -332,6 +342,9 @@ pub async fn incrby_cmd(
         1
     } * sign;
     let key = args[1].clone();
+    // The fold below needs the current record: without it a cluster-remote
+    // plain string would be re-based at 0 and its value lost on merge.
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -391,6 +404,7 @@ pub async fn incrbyfloat(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         return Reply::not_float();
     };
     let key = args[1].clone();
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| match read_string(ctx, &key) {
@@ -519,6 +533,7 @@ pub async fn msetnx(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     }
     // Check-then-set; atomic per shard only (documented cross-shard caveat).
     for pair in args[1..].chunks(2) {
+        engine.ensure_local(&pair[0]).await;
         let key = pair[0].clone();
         let exists = engine
             .store
@@ -552,6 +567,7 @@ pub async fn setrange(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     }
     let offset = offset as usize;
     let (key, patch) = (args[1].clone(), args[3].clone());
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| match read_string(ctx, &key) {

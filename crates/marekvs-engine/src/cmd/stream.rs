@@ -607,6 +607,7 @@ pub async fn xdel(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     }
     let key = args[1].clone();
     let id_args: Vec<Vec<u8>> = args[2..].to_vec();
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -657,6 +658,7 @@ pub async fn xtrim(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     let Some(maxlen) = args.get(i).and_then(|b| parse_u64(b)) else {
         return Reply::not_int();
     };
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -708,6 +710,7 @@ pub async fn xsetid(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             return Reply::syntax();
         }
     }
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {

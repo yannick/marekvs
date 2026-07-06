@@ -147,6 +147,7 @@ pub async fn hsetnx(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         return Reply::wrong_args("hsetnx");
     }
     let (key, field, value) = (args[1].clone(), args[2].clone(), args[3].clone());
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -233,6 +234,9 @@ pub async fn hdel(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     }
     let key = args[1].clone();
     let fields: Vec<Vec<u8>> = args[2..].to_vec();
+    // Observed-remove: deleting a field requires its dots locally, so a
+    // cluster-remote hash must be fetched or HDEL is a silent no-op.
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -407,6 +411,7 @@ pub async fn hexpire(engine: &Arc<Engine>, args: &[Vec<u8>], mult: u64, absolute
     };
     let key = args[1].clone();
     let deadline = deadline_from(n, mult, absolute);
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -464,6 +469,7 @@ pub async fn hpersist(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         Err(r) => return r,
     };
     let key = args[1].clone();
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -498,6 +504,7 @@ pub async fn hgetdel(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         Err(r) => return r,
     };
     let key = args[1].clone();
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -569,6 +576,7 @@ pub async fn hgetex(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         Err(r) => return r,
     };
     let key = args[1].clone();
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -635,6 +643,10 @@ pub async fn hsetex(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         .chunks(2)
         .map(|c| (c[0].clone(), c[1].clone()))
         .collect();
+    // FNX/FXX and KEEPTTL read current field state; the plain form is blind.
+    if fnx || fxx || matches!(mode, HashExpireMode::KeepTtl) {
+        engine.ensure_local(&key).await;
+    }
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -729,6 +741,7 @@ pub async fn hstrlen(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         return Reply::wrong_args("hstrlen");
     }
     let (key, field) = (args[1].clone(), args[2].clone());
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -748,6 +761,7 @@ pub async fn hincrby(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         return Reply::not_int();
     };
     let (key, field) = (args[1].clone(), args[2].clone());
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -779,6 +793,7 @@ pub async fn hincrbyfloat(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         return Reply::not_float();
     };
     let (key, field) = (args[1].clone(), args[2].clone());
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -814,6 +829,7 @@ pub async fn hrandfield(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         .get(3)
         .map(|a| eq_ignore_case(a, "WITHVALUES"))
         .unwrap_or(false);
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -870,6 +886,7 @@ pub async fn hscan(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             return Reply::syntax();
         }
     }
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {

@@ -212,12 +212,21 @@ uninterested nodes, and blooms can't expire entries. Metadata is bounded by:
 2. **X caches k, lease valid** → serve locally.
 3. **X caches k, lease expired/invalid** → `Check` to H1(p), merge if newer,
    serve, re-arm.
-4. **X lacks k** → `Fetch{ikey}` to H1(p); fallback next-ranked home, then any
-   home (2 retries, 50 ms timeout each; all homes unreachable → error
-   `-UNAVAILABLE partition p unreachable`). Response committed locally **via
-   merge** (a concurrent local write can't be regressed), lease registered,
-   value served. Collection fetch = `FetchCollection` streaming all element
-   keys of that user key.
+4. **X lacks k** → `FetchCollection{userkey}` to H1(p), fallback to each
+   remaining home in rank order (`FETCH_TIMEOUT = 300 ms` per owner).
+   Response committed locally **via merge** (a concurrent local write can't
+   be regressed), lease registered, value served. The collection fetch
+   streams all element keys of that user key, so one RTT hydrates the whole
+   collection.
+
+   **Soft failure, by design:** if every owner is unreachable, the command
+   serves the local (possibly empty) view instead of erroring — a
+   non-owner may transiently report an existing key as absent, bounded by
+   the anti-entropy staleness window ([05](05-consistency-anti-entropy.md)).
+   An earlier revision of this spec returned `-UNAVAILABLE partition p
+   unreachable` here; the implementation deliberately fails soft to keep
+   reads available under partition (AP), at the cost of freshness honesty
+   in exactly this window.
 
 **Freshness honesty:** per-connection read-your-writes and monotonic reads
 hold (local-commit-first + HLC max-wins merges). Nothing across connections.

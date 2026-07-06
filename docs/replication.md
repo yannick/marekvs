@@ -240,11 +240,17 @@ uninterested nodes, and blooms can't expire entries.
 2. **`X` caches `k`, lease valid** → serve locally.
 3. **`X` caches `k`, lease expired/invalid** → `Check` to H1(p), merge if newer,
    serve, re-arm.
-4. **`X` lacks `k`** → `Fetch{ikey}` to H1(p), with a ~300 ms fetch timeout
-   (`FETCH_TIMEOUT`); on miss, serve local/empty and let AE reconcile. The
-   response is committed locally **via merge** (a concurrent local write can't be
-   regressed), the lease is registered, and the value served. A collection fetch
-   is a `FetchCollection` streaming all element keys of that user key.
+4. **`X` lacks `k`** → `FetchCollection` to H1(p), falling back to each
+   remaining home in rank order with a ~300 ms fetch timeout per owner
+   (`FETCH_TIMEOUT`). The response is committed locally **via merge** (a
+   concurrent local write can't be regressed), the lease is registered, and the
+   value served. The collection fetch streams all element keys of that user key.
+
+   **Soft failure:** if every owner is unreachable, the command does not error —
+   it serves the local (possibly empty) view and lets anti-entropy reconcile.
+   During such a partition a non-owner can transiently report an existing key
+   as absent (e.g. `EXISTS` → 0), bounded by the
+   [staleness window](../consistency/).
 
 **Freshness honesty:** per-connection read-your-writes and monotonic reads hold
 (local-commit-first plus HLC max-wins merges). Nothing is promised across

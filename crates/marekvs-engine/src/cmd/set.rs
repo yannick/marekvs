@@ -164,6 +164,9 @@ pub async fn srem(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     }
     let key = args[1].clone();
     let members: Vec<Vec<u8>> = args[2..].to_vec();
+    // Observed-remove: the member's dots must be local or SREM is a no-op
+    // for cluster-remote sets.
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -272,6 +275,7 @@ pub async fn spop(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             None => return Reply::not_int(),
         },
     };
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -309,6 +313,7 @@ pub async fn srandmember(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     }
     let key = args[1].clone();
     let count = args.get(2).and_then(|b| parse_i64(b));
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -361,6 +366,7 @@ pub async fn sscan(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             return Reply::syntax();
         }
     }
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -383,6 +389,7 @@ pub async fn smove(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     }
     let (src, dst, member) = (args[1].clone(), args[2].clone(), args[3].clone());
     // Remove from src on its shard, then add to dst on its shard.
+    engine.ensure_local(&src).await;
     let (s, m) = (src.clone(), member.clone());
     let removed = engine
         .store
@@ -470,6 +477,9 @@ pub async fn setop(engine: &Arc<Engine>, args: &[Vec<u8>], op: SetOp, store_dst:
     if store_dst {
         let dst = args[1].clone();
         let res = result.clone();
+        // Clearing dst removes observed members; fetch it if cluster-remote
+        // so stale remote members don't survive the overwrite.
+        engine.ensure_local(&dst).await;
         engine
             .store
             .run_key(&args[1], move |ctx| {

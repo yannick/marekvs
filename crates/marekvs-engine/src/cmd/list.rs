@@ -410,6 +410,10 @@ pub async fn push(engine: &Arc<Engine>, args: &[Vec<u8>], left: bool, xx: bool) 
     }
     let key = args[1].clone();
     let values: Vec<Vec<u8>> = args[2..].to_vec();
+    // Plain push is a blind write; the XX form checks list existence.
+    if xx {
+        engine.ensure_local(&key).await;
+    }
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -438,6 +442,7 @@ pub async fn pop(engine: &Arc<Engine>, args: &[Vec<u8>], left: bool) -> Reply {
             _ => return Reply::not_int(),
         },
     };
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -667,6 +672,7 @@ pub async fn lset(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     let Some(index) = parse_i64(&args[2]) else {
         return Reply::not_int();
     };
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -698,6 +704,7 @@ pub async fn lrem(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         return Reply::not_int();
     };
     let value = args[3].clone();
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -754,6 +761,7 @@ pub async fn ltrim(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     let (Some(start), Some(stop)) = (parse_i64(&args[2]), parse_i64(&args[3])) else {
         return Reply::not_int();
     };
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -789,6 +797,7 @@ pub async fn linsert(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     };
     let pivot = args[3].clone();
     let value = args[4].clone();
+    engine.ensure_local(&key).await;
     engine
         .store
         .run_key(&args[1], move |ctx| {
@@ -933,6 +942,9 @@ async fn do_move(
     from_left: bool,
     to_left: bool,
 ) -> Reply {
+    // The source pop needs the list observable locally; the destination push
+    // is blind.
+    engine.ensure_local(&src).await;
     if src == dst {
         let sk = src.clone();
         return engine
