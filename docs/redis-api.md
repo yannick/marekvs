@@ -175,6 +175,24 @@ sequentially with no atomicity beyond per-key shard serialization. `WATCH` /
 compare-and-swap.
 ```
 
+## Distributed budgets (marekvs extension)
+
+Not a Redis family — `BG.*` is marekvs-native: escrow-based shared budgets
+with a hard **never-overspend** invariant that holds through partitions,
+crashes, and split-brain (fail-closed). Full guide: [Distributed
+budgets](../budget/).
+
+| Command | Notes |
+|---|---|
+| `BG.CREATE` `BG.TOPUP` | Create / fund a budget (central actor; `SEQ`-idempotent; `MODE WINDOW` = self-refilling rate limit). |
+| `BG.RESERVE` | Reserve an amount → token + deadline; forwards to a peer with escrow headroom; fails closed (`-BUDGETEXHAUSTED`). |
+| `BG.COMMIT` `BG.RELEASE` `BG.DRAW` | Report spend / return / draw incrementally against a token (routed to its issuing node). |
+| `BG.INFO` | Node-local ledger view. |
+| `BG.RECLAIM` | Admin: fence a permanently dead node and redistribute its unconsumed escrow. |
+
+`TYPE` reports `budget`; `EXPIRE`, `RENAME`, and `COPY` are rejected on budget
+keys; `DEL` starts a fresh generation (outstanding tokens die with the old one).
+
 ## Not implemented
 
 These are **not** in the dispatch table, even though some clients or older design
