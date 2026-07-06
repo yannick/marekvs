@@ -51,6 +51,9 @@ via the [ondaDB](../ondadb) LSM engine — no in-memory dataset.
 - **Lua scripting**: EVAL/EVALSHA with Redis-grade atomicity for scripts
   whose keys co-locate (hash tags `{...}`); script *effects* replicate, never
   the script ([scripting](design/11-lua-scripting.md))
+- **Distributed budgets** (`BG.*`): escrow-based reserve/commit tokens with a
+  hard never-overspend invariant — fail-closed under partition, crash, and
+  split-brain ([budgets](design/13-budget.md))
 - **Kubernetes operator**: `MarekvsCluster` CRD with safe one-node-at-a-time
   scale-down and ops/s-based autoscaling ([operator](design/12-operator.md))
 - **OS-less images**: static binary in a `FROM scratch` container

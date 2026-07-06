@@ -935,6 +935,35 @@ static TABLE: &[CommandDoc] = &[
     cmd("discard", 1, &["loading", "stale", "fast"], 0, 0, 0, "Discards a transaction.", "2.0.0", "transactions"),
     with_args(cmd("watch", -2, &["loading", "stale", "fast"], 1, -1, 1, "Monitors changes to keys to determine the execution of a transaction (unsupported in marekvs; AP store has no CAS).", "2.2.0", "transactions"), ARGS_KEYS),
     cmd("unwatch", 1, &["loading", "stale", "fast"], 0, 0, 0, "Forgets about watched keys of a transaction.", "2.2.0", "transactions"),
+
+    // --- budgets (BG.*, marekvs extension, design/13) ---
+    with_args(cmd("bg.create", -3, CW, 1, 1, 1, "Creates (or regenerates) a distributed budget with escrow split across nodes.", "1.2.0", "budget"),
+        &[A_KEY, arg("capacity", "integer"),
+          Arg { token: Some("MODE"), optional: true, ..arg("mode", "string") },
+          Arg { token: Some("TTL"), optional: true, ..arg("default-ttl-ms", "integer") },
+          Arg { token: Some("MAXTTL"), optional: true, ..arg("max-ttl-ms", "integer") },
+          Arg { token: Some("MAXAMOUNT"), optional: true, ..arg("max-amount", "integer") },
+          Arg { token: Some("NODES"), optional: true, multiple: true, ..arg("node", "integer") },
+          Arg { token: Some("SEQ"), optional: true, ..arg("op-seq", "integer") }]),
+    with_args(cmd("bg.topup", -3, CWF, 1, 1, 1, "Adds capacity to a budget (central actor; idempotent with SEQ).", "1.2.0", "budget"),
+        &[A_KEY, arg("amount", "integer"),
+          Arg { token: Some("NODE"), optional: true, ..arg("node", "integer") },
+          Arg { token: Some("SEQ"), optional: true, ..arg("op-seq", "integer") }]),
+    with_args(cmd("bg.reserve", -3, CW, 1, 1, 1, "Reserves an amount from the budget, returning a token with a deadline; never overspends (fails closed).", "1.2.0", "budget"),
+        &[A_KEY, arg("amount", "integer"),
+          Arg { token: Some("TTL"), optional: true, ..arg("ttl-ms", "integer") },
+          Arg { token: Some("REQID"), optional: true, ..arg("reqid", "integer") }]),
+    with_args(cmd("bg.commit", -3, CWF, 1, 1, 1, "Reports a token's final spend and returns the unspent remainder to the budget.", "1.2.0", "budget"),
+        &[A_KEY, arg("token", "string"), Arg { optional: true, ..arg("spent", "integer") }]),
+    with_args(cmd("bg.release", 3, CWF, 1, 1, 1, "Returns a token's undrawn reservation to the budget.", "1.2.0", "budget"),
+        &[A_KEY, arg("token", "string")]),
+    with_args(cmd("bg.draw", 4, CWF, 1, 1, 1, "Draws an incremental, server-tracked amount against a reservation token.", "1.2.0", "budget"),
+        &[A_KEY, arg("token", "string"), arg("amount", "integer")]),
+    with_args(cmd("bg.info", 2, CRO, 1, 1, 1, "Returns a node-local view of a budget's configuration and escrow ledgers.", "1.2.0", "budget"),
+        ARGS_KEY),
+    with_args(cmd("bg.reclaim", -3, &["write", "admin"], 1, 1, 1, "Fences a permanently dead node and redistributes its unconsumed escrow (admin; see design/13 preconditions).", "1.2.0", "budget"),
+        &[A_KEY, arg("node", "integer"),
+          Arg { token: Some("SEQ"), optional: true, ..arg("op-seq", "integer") }]),
 ];
 
 /// The full command catalog.
@@ -1140,6 +1169,14 @@ mod tests {
             "blmpop",
             "xsetid",
             "xinfo",
+            "bg.create",
+            "bg.topup",
+            "bg.reserve",
+            "bg.commit",
+            "bg.release",
+            "bg.draw",
+            "bg.info",
+            "bg.reclaim",
         ] {
             let doc = find(name).unwrap_or_else(|| panic!("missing COMMAND DOCS entry for {name}"));
             assert!(!doc.args.is_empty(), "{name} should document its arguments");

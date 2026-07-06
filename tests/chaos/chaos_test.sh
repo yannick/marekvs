@@ -17,9 +17,9 @@ source tests/chaos/lib.sh
 
 SCENARIOS=("$@")
 [ ${#SCENARIOS[@]} -gt 0 ] || {
-  SCENARIOS=(crash_restart freeze_thaw rolling_churn wipe_replace membership_churn join_empty_reads interest_flood bank)
+  SCENARIOS=(crash_restart freeze_thaw rolling_churn wipe_replace membership_churn join_empty_reads interest_flood bank budget_no_overspend budget_pvc_wipe)
   [ "$BACKEND" = docker ] && SCENARIOS+=(disk_guard gc_grace_rejoin)
-  [ "$BACKEND" = docker ] && SCENARIOS+=(partition_divergence partition_no_resurrect)
+  [ "$BACKEND" = docker ] && SCENARIOS+=(partition_divergence partition_no_resurrect budget_partition)
 }
 
 trap cluster_down EXIT
@@ -478,6 +478,161 @@ return 1"
       chk 1 "bank total on node $i" "$a + $b = $sum, expected $TOTAL — $((sum - TOTAL)) CREATED/DESTROYED"
     fi
   done
+}
+
+# ── budget scenarios (design/13) ─────────────────────────────────────────
+# Shared harness: workers hammer BG.RESERVE/COMMIT/RELEASE across all nodes
+# (commits land on non-issuers to exercise forwarding), journaling every
+# ACCEPTED spend; the nemesis varies per scenario. Oracle after heal +
+# max-TTL + folds: every node's ledger view stays within capacity AND no
+# accepted spend is ever lost.
+BUDGET_KEY='{bgt}:pool'
+BUDGET_CAP=1000
+BUDGET_TTL=3000
+
+budget_setup() {
+  fresh_cluster
+  rcli 0 bg.create "$BUDGET_KEY" "$BUDGET_CAP" TTL "$BUDGET_TTL" MAXAMOUNT 50 >/dev/null
+}
+
+budget_worker() { # <duration_s> <journal> — run with `&` by the caller
+  local dur=$1 J=$2 t0=$SECONDS n=0 wi ci amt tok spent out
+  while [ $((SECONDS - t0)) -lt "$dur" ]; do
+    wi=$((n % N)); ci=$(((n + 1) % N)); amt=$(( (n % 40) + 1 ))
+    # `|| true` covers the whole pipeline: a killed/isolated node makes
+    # redis-cli exit nonzero and pipefail would kill the worker.
+    tok=$(rcli "$wi" -t 2 bg.reserve "$BUDGET_KEY" "$amt" 2>/dev/null | sed -n 2p || true)
+    if [ -n "$tok" ] && [[ "$tok" == *-*-*-* ]]; then
+      case $((n % 4)) in
+        0|1) # commit a partial spend via a DIFFERENT node (issuer forward)
+          spent=$(( (amt + 1) / 2 ))
+          out=$(rcli "$ci" -t 2 bg.commit "$BUDGET_KEY" "$tok" "$spent" 2>/dev/null || true)
+          case "$out" in
+            ''|*[!0-9]*) : ;; # not accepted — nothing journaled
+            *) echo "$spent" >>"$J" ;;
+          esac ;;
+        2) rcli "$ci" -t 2 bg.release "$BUDGET_KEY" "$tok" >/dev/null 2>&1 || true ;;
+        3) : ;; # abandon: reclaimed at the deadline
+      esac
+    fi
+    n=$((n + 1))
+  done
+}
+
+budget_oracle() { # <journal>
+  local J=$1
+  # Let every open token expire (TTL + reclaim grace 5s + AE margin), then
+  # poke each node so issuers fold their own expired tokens.
+  sleep $(( (BUDGET_TTL / 1000) + 8 ))
+  local i tok2
+  for i in $(seq 0 $((N - 1))); do
+    tok2=$(rcli "$i" -t 5 bg.reserve "$BUDGET_KEY" 1 2>/dev/null | sed -n 2p || true)
+    if [ -n "$tok2" ]; then
+      rcli "$i" -t 5 bg.release "$BUDGET_KEY" "$tok2" >/dev/null 2>&1 || true
+    fi
+  done
+  sleep 3 # replicate the folds
+  local spent_total=0 v
+  while read -r v; do spent_total=$((spent_total + v)); done <"$J"
+  rm -f "$J"
+  local out
+  for i in $(seq 0 $((N - 1))); do
+    out=$(rcli "$i" -t 5 bg.info "$BUDGET_KEY" | awk '/^outstanding$/{getline; print; exit}' || true)
+    if [ -z "$out" ]; then
+      chk 1 "budget INFO on node $i" "no outstanding field"
+      continue
+    fi
+    if [ "$out" -le "$BUDGET_CAP" ] && [ "$out" -ge "$spent_total" ]; then
+      chk 0 "node $i ledger within capacity ($spent_total accepted <= $out outstanding <= $BUDGET_CAP)"
+    else
+      chk 1 "node $i ledger" "accepted=$spent_total outstanding=$out cap=$BUDGET_CAP — INVARIANT VIOLATED"
+    fi
+  done
+  # Fail closed, promptly: an impossible reservation errors instead of hanging.
+  local big
+  big=$(rcli 0 -t 5 bg.reserve "$BUDGET_KEY" 2000 2>&1 || true)
+  case "$big" in
+    *BUDGETEXHAUSTED*|*"exceeds budget maximum"*) chk 0 "oversized reserve fails closed" ;;
+    *) chk 1 "oversized reserve" "unexpected: $big" ;;
+  esac
+}
+
+# ── scenario: budget_no_overspend — SIGKILL rounds ───────────────────────
+budget_no_overspend() {
+  budget_setup
+  local J; J=$(mktemp)
+  budget_worker 40 "$J" & local W=$!
+  local round
+  for round in 0 1 2; do
+    sleep 6
+    crash $(( (round + 1) % N ))
+    sleep 6
+    revive $(( (round + 1) % N ))
+  done
+  wait $W || true
+  budget_oracle "$J"
+}
+
+# ── scenario: budget_partition (docker) — true mesh split-brain ──────────
+# Nodes keep serving clients while cut from the mesh: grants on the island
+# come only from ITS escrow share, forwards to unreachable peers fail
+# closed, and commits to an unreachable issuer -TRYAGAIN (later reclaimed).
+budget_partition() {
+  [ "$BACKEND" = docker ] || { echo "  (skipped: partitions need the docker backend)"; return 0; }
+  budget_setup
+  local J; J=$(mktemp)
+  budget_worker 40 "$J" & local W=$!
+  sleep 5
+  partition 1
+  sleep 12
+  heal 1
+  sleep 4
+  partition 2
+  sleep 8
+  heal 2
+  wait $W || true
+  budget_oracle "$J"
+}
+
+# ── scenario: budget_pvc_wipe — fresh-PVC epoch fence ────────────────────
+# Node 1 is destroyed INCLUDING its data dir mid-run and boots a fresh
+# replacement (new store epoch): the boot grant-fence must refuse grants
+# until it re-merges its old incarnation's ledgers from a peer, and none of
+# the old grants/spends may be double-counted or lost. The worker pauses 2s
+# before the wipe so the ring pump ships every acked op — an op acked in
+# the same instant the disk is destroyed is unrecoverable by design (async
+# replication); that loss window is bounded by pump latency, documented.
+budget_pvc_wipe() {
+  budget_setup
+  local J; J=$(mktemp)
+  budget_worker 15 "$J" & local W=$!
+  wait $W || true
+  sleep 2 # drain the ring pump before the disk dies
+  wipe_node 1
+  budget_worker 15 "$J" & W=$!
+  wait $W || true
+  budget_oracle "$J"
+}
+
+# ── scenario: budget_clock_skew (debug, apple) — skew vs deadlines ───────
+# Clock bumps on two nodes while workers reserve/commit: deadlines are
+# issuer-clock-only and folds are absorbing, so skew may shift boundary
+# commits between accepted and -TOKENEXPIRED but never double-credit.
+budget_clock_skew() {
+  require_debug "clock skew"
+  [ "$BACKEND" = apple ] || { echo "  (skipped: clock skew needs the apple backend)"; return 0; }
+  budget_setup
+  local J; J=$(mktemp)
+  budget_worker 40 "$J" & local W=$!
+  sleep 5
+  clock_bump 1 10
+  assert_skewed 1 0
+  sleep 8
+  clock_bump 2 -10
+  sleep 8
+  clock_reset 1; clock_reset 2
+  wait $W || true
+  budget_oracle "$J"
 }
 
 # ── scenario: bridge_partition (debug, docker) ───────────────────────────
