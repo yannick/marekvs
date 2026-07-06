@@ -65,6 +65,34 @@ fn write_field_ttl(ctx: &ShardCtx, key: &[u8], field: &[u8], value: &[u8], ttl: 
     write_merged(ctx, &ikey::hash_field_key(key, field), &rec);
 }
 
+/// Re-stamp an EXISTING field's TTL while PRESERVING its OR-element dots
+/// (the same restamp `set_member_deadline`/EXPIREMEMBER uses). A metadata-
+/// only TTL change (HEXPIRE/HPERSIST/HGETEX EX) must NOT mint a fresh add-dot
+/// like `write_field_ttl`/HSET do: minting a new dot makes the change a
+/// logical re-add, which loses a concurrent cross-node HDEL after merge
+/// (the delete's covered-dot no longer covers the new dot) — resurrecting a
+/// deleted field and diverging from EXPIREMEMBER on the same data. The caller
+/// must have already confirmed the field is visible and `deadline` is in the
+/// future (past deadlines go through `remove_field`).
+fn restamp_field_ttl(ctx: &ShardCtx, key: &[u8], field: &[u8], deadline: u64) -> bool {
+    let ik = ikey::hash_field_key(key, field);
+    let Some(raw) = get_raw(ctx, &ik) else {
+        return false;
+    };
+    let Some((env, payload)) = Envelope::decode(&raw) else {
+        return false;
+    };
+    let restamped = Envelope {
+        flags: env.flags,
+        hlc: ctx.hlc.now(),
+        origin: ctx.node_id,
+        ttl_deadline_ms: deadline,
+    }
+    .encode_with(payload);
+    write_merged(ctx, &ik, &restamped);
+    true
+}
+
 fn remove_field(ctx: &ShardCtx, key: &[u8], field: &[u8], del: u64) -> bool {
     let ik = ikey::hash_field_key(key, field);
     let Some(v) = get_raw(ctx, &ik) else {
@@ -271,7 +299,7 @@ fn set_field_deadline(
     deadline: u64,
     cond: ExpireCond,
 ) -> i64 {
-    let Some((env, value)) = read_field_env(ctx, key, field, del) else {
+    let Some((env, _value)) = read_field_env(ctx, key, field, del) else {
         return -2;
     };
     if !ttl_condition_passes(env.ttl_deadline_ms, deadline, cond) {
@@ -283,7 +311,9 @@ fn set_field_deadline(
         }
         return -2;
     }
-    write_field_ttl(ctx, key, field, &value, deadline);
+    // Dot-preserving restamp: a TTL-only change must not resurrect a
+    // concurrently-deleted field (see restamp_field_ttl).
+    restamp_field_ttl(ctx, key, field, deadline);
     1
 }
 

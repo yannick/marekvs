@@ -137,9 +137,19 @@ async fn zset_new_pop_and_lex_commands() {
     );
     let popped = array(zset::zmpop(&e, &a(&[b"ZMPOP", b"1", b"z", b"MIN", b"COUNT", b"2"])).await);
     assert_eq!(bulk(popped[0].clone()), b"z".to_vec());
-    let members = array(popped[1].clone());
-    assert_eq!(bulk(members[0].clone()), b"a".to_vec());
-    assert_eq!(bulk(members[2].clone()), b"b".to_vec());
+    // ZMPOP's second element is an array of [member, score] PAIRS (nested),
+    // not a flat [member, score, member, score] list.
+    let pairs = array(popped[1].clone());
+    assert_eq!(pairs.len(), 2, "two members popped as two pairs");
+    let p0 = array(pairs[0].clone());
+    assert_eq!(bulk(p0[0].clone()), b"a".to_vec());
+    assert!(
+        matches!(p0[1], Reply::Double(s) if s == 1.0),
+        "pair carries score"
+    );
+    let p1 = array(pairs[1].clone());
+    assert_eq!(bulk(p1[0].clone()), b"b".to_vec());
+    assert!(matches!(p1[1], Reply::Double(s) if s == 2.0));
 }
 
 #[tokio::test]
@@ -281,6 +291,25 @@ async fn zset_rank_store_random_and_set_operations() {
     assert_eq!(
         int(zset::zintercard(&e, &a(&[b"ZINTERCARD", b"2", b"za", b"zb", b"LIMIT", b"1"])).await),
         1
+    );
+    // DISJOINT sets with LIMIT: the intersection is empty, so the answer is 0
+    // regardless of LIMIT. A per-key `>= limit` early-break would wrongly
+    // return 1 after loading the first (non-empty) set.
+    assert_eq!(
+        int(zset::zadd(&e, &a(&[b"ZADD", b"dj1", b"1", b"x", b"2", b"y"])).await),
+        2
+    );
+    assert_eq!(
+        int(zset::zadd(&e, &a(&[b"ZADD", b"dj2", b"1", b"p", b"2", b"q"])).await),
+        2
+    );
+    assert_eq!(
+        int(zset::zintercard(
+            &e,
+            &a(&[b"ZINTERCARD", b"2", b"dj1", b"dj2", b"LIMIT", b"1"])
+        )
+        .await),
+        0
     );
     assert_eq!(
         int(zset::zsetop(
@@ -682,4 +711,156 @@ async fn stream_xsetid_xinfo_errors_and_deletion_metadata() {
         b"10-1".to_vec()
     );
     assert!(matches!(info_value(&info, b"entries-added"), Reply::Int(7)));
+}
+
+// --- regression tests for the review's HIGH-severity bugs ---
+
+/// COPY … REPLACE onto an existing SAME-TYPE collection must produce an exact
+/// copy of the source — the destination's prior members must not survive.
+/// Regression: the clobber wrote a head carrying the SOURCE's del_hlc (0 for
+/// a never-deleted source), leaving the destination's stale element records
+/// visible again ("keep" resurrected).
+#[tokio::test]
+async fn copy_replace_same_type_does_not_resurrect_dest_members() {
+    let (_dir, e) = engine();
+    assert_eq!(
+        int(hash::hset(&e, &a(&[b"HSET", b"dst", b"keep", b"1"]), false).await),
+        1
+    );
+    assert_eq!(
+        int(hash::hset(&e, &a(&[b"HSET", b"src", b"new", b"2"]), false).await),
+        1
+    );
+    assert_eq!(
+        int(generic::copy(&e, &a(&[b"COPY", b"src", b"dst", b"REPLACE"])).await),
+        1
+    );
+    // dst must be exactly {new:2}; "keep" must be gone.
+    assert_eq!(
+        hash::hget(&e, &a(&[b"HGET", b"dst", b"keep"])).await,
+        Reply::Null
+    );
+    assert_eq!(
+        bulk(hash::hget(&e, &a(&[b"HGET", b"dst", b"new"])).await),
+        b"2".to_vec()
+    );
+    match hash::hgetall(&e, &a(&[b"HGETALL", b"dst"])).await {
+        Reply::Map(m) => {
+            assert_eq!(
+                m.len(),
+                1,
+                "dst holds exactly one field after REPLACE, got {m:?}"
+            )
+        }
+        other => panic!("expected Map, got {other:?}"),
+    }
+
+    // Same for RENAME onto an existing same-type collection.
+    assert_eq!(
+        int(hash::hset(&e, &a(&[b"HSET", b"rd", b"old", b"9"]), false).await),
+        1
+    );
+    assert_eq!(
+        int(hash::hset(&e, &a(&[b"HSET", b"rs", b"fresh", b"8"]), false).await),
+        1
+    );
+    generic::rename(&e, &a(&[b"RENAME", b"rs", b"rd"]), false).await;
+    assert_eq!(
+        hash::hget(&e, &a(&[b"HGET", b"rd", b"old"])).await,
+        Reply::Null
+    );
+    assert_eq!(
+        bulk(hash::hget(&e, &a(&[b"HGET", b"rd", b"fresh"])).await),
+        b"8".to_vec()
+    );
+}
+
+/// XINFO STREAM must return "no such key" for an absent (or deleted) stream
+/// and WRONGTYPE for a live key of another type — not WRONGTYPE for both.
+#[tokio::test]
+async fn xinfo_stream_missing_vs_wrongtype() {
+    let (_dir, e) = engine();
+    assert_err_contains(
+        stream::xinfo(&e, &a(&[b"XINFO", b"STREAM", b"absent"])).await,
+        "no such key",
+    );
+    // A live string in that slot → WRONGTYPE.
+    string_cmd::set(&e, &a(&[b"SET", b"str", b"v"])).await;
+    assert_err_contains(
+        stream::xinfo(&e, &a(&[b"XINFO", b"STREAM", b"str"])).await,
+        "WRONGTYPE",
+    );
+    // A stream that is created then deleted → back to "no such key".
+    stream::xadd(&e, &a(&[b"XADD", b"s", b"*", b"f", b"v"])).await;
+    generic::del(&e, &a(&[b"DEL", b"s"])).await;
+    assert_err_contains(
+        stream::xinfo(&e, &a(&[b"XINFO", b"STREAM", b"s"])).await,
+        "no such key",
+    );
+}
+
+/// HEXPIRE/HPERSIST are metadata-only changes: they must NOT resurrect a
+/// concurrently-deleted field. Reproduced single-node by applying the
+/// concurrent HDEL (built from the field's PRE-HEXPIRE dot) AFTER the HEXPIRE:
+/// the delete's observed-dot set is exactly what the ttl-change node saw.
+/// Regression: the old setter minted a fresh add-dot, so the delete no longer
+/// covered the field and it survived. The dot-preserving restamp keeps the
+/// original dot, so the concurrent delete still covers it.
+#[tokio::test]
+async fn hexpire_does_not_resurrect_concurrently_deleted_field() {
+    use marekvs_core::envelope::RecordType;
+    use marekvs_core::ikey;
+    use marekvs_core::merge::{element_dots, element_remove};
+    use marekvs_engine::store::{get_raw, write_merged};
+
+    let (_dir, e) = engine();
+    assert_eq!(
+        int(hash::hset(&e, &a(&[b"HSET", b"k", b"f", b"v"]), false).await),
+        1
+    );
+
+    // Capture the field's current dot (what a concurrent deleter would observe).
+    let fk = ikey::hash_field_key(b"k", b"f");
+    let fk2 = fk.clone();
+    let dots = e
+        .store
+        .run_key(b"k", move |ctx| {
+            let raw = get_raw(ctx, &fk2).expect("field record");
+            let (_, pay) = marekvs_core::envelope::Envelope::decode(&raw).unwrap();
+            element_dots(pay)
+        })
+        .await;
+    assert!(!dots.is_empty());
+
+    // TTL-only change on the still-live field (has not seen the delete).
+    assert_eq!(
+        array(
+            hash::hexpire(
+                &e,
+                &a(&[b"HEXPIRE", b"k", b"100", b"FIELDS", b"1", b"f"]),
+                1000,
+                false
+            )
+            .await
+        )
+        .into_iter()
+        .map(int)
+        .collect::<Vec<_>>(),
+        [1]
+    );
+
+    // Now the concurrent delete (observed the pre-HEXPIRE dot) merges in.
+    let fk3 = fk.clone();
+    e.store
+        .run_key(b"k", move |ctx| {
+            let rm = element_remove(RecordType::HashField, ctx.hlc.now(), 9, &dots);
+            write_merged(ctx, &fk3, &rm);
+        })
+        .await;
+
+    // The field must stay deleted — not resurrected by the TTL change.
+    assert_eq!(
+        hash::hget(&e, &a(&[b"HGET", b"k", b"f"])).await,
+        Reply::Null
+    );
 }

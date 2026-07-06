@@ -7,8 +7,7 @@ use crate::cmd::{eq_ignore_case, parse_i64, parse_u64};
 use crate::pubsub::glob_match;
 use crate::reply::Reply;
 use crate::store::{
-    self, get_head, get_raw, key_type, new_tombstone, now_ms, read_lww, scan_prefix, write_merged,
-    ShardCtx,
+    self, get_head, get_raw, key_type, now_ms, read_lww, scan_prefix, write_merged, ShardCtx,
 };
 use crate::Engine;
 use marekvs_core::envelope::{head, Envelope, RecordType};
@@ -16,12 +15,24 @@ use marekvs_core::ikey;
 
 /// Delete one key whatever its type. Returns true if something was deleted.
 pub fn del_key(ctx: &ShardCtx, key: &[u8]) -> bool {
+    del_key_hlc(ctx, key).is_some()
+}
+
+/// Delete one key whatever its type, returning the delete clock it stamped
+/// (`None` if the key was absent). Callers that immediately re-create the
+/// key on the same shard (COPY/RENAME clobber) need this clock: the fresh
+/// head they write must carry `del_hlc >= clobber clock` so the destination's
+/// stale element records (physically still on disk) stay shadowed. Ignoring
+/// it — writing the source's `del_hlc` instead — resurrects the destination's
+/// old members.
+pub fn del_key_hlc(ctx: &ShardCtx, key: &[u8]) -> Option<u64> {
     match key_type(ctx, key) {
-        None => false,
+        None => None,
         Some(b's') => {
-            let tomb = new_tombstone(ctx, RecordType::String);
+            let hlc = ctx.hlc.now();
+            let tomb = Envelope::tombstone(RecordType::String, hlc, ctx.node_id).encode_with(&[]);
             write_merged(ctx, &ikey::string_key(key), &tomb);
-            true
+            Some(hlc)
         }
         // Lists are head-gated collections (ctype 5); they take the head-
         // tombstone path below, same as hash/set/zset.
@@ -37,7 +48,7 @@ pub fn del_key(ctx: &ShardCtx, key: &[u8]) -> bool {
             };
             let val = env.encode_with(&head::encode(ctype, hlc));
             write_merged(ctx, &ikey::head_key(key), &val);
-            true
+            Some(hlc)
         }
     }
 }
@@ -518,10 +529,10 @@ pub async fn rename(engine: &Arc<Engine>, args: &[Vec<u8>], nx: bool) -> Reply {
     engine
         .store
         .run_key(&dst, move |ctx| {
-            del_key(ctx, &d); // clobber whatever was there
+            let clobber = del_key_hlc(ctx, &d).unwrap_or(0); // clobber whatever was there
             for (tag, suffix, value) in records {
                 let ik = rebuild_ikey(tag, &d, &suffix);
-                if let Some(value) = restamp_record(ctx, &value) {
+                if let Some(value) = restamp_record(ctx, &value, clobber) {
                     write_merged(ctx, &ik, &value);
                 }
             }
@@ -587,12 +598,14 @@ pub async fn copy(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     engine
         .store
         .run_key(&dst, move |ctx| {
-            if replace {
-                del_key(ctx, &d);
-            }
+            let clobber = if replace {
+                del_key_hlc(ctx, &d).unwrap_or(0)
+            } else {
+                0
+            };
             for (tag, suffix, value) in records {
                 let ik = rebuild_ikey(tag, &d, &suffix);
-                if let Some(value) = restamp_record(ctx, &value) {
+                if let Some(value) = restamp_record(ctx, &value, clobber) {
                     write_merged(ctx, &ik, &value);
                 }
             }
@@ -729,6 +742,20 @@ fn collect_key_records(ctx: &ShardCtx, key: &[u8]) -> Option<Vec<KeyRecord>> {
     Some(out)
 }
 
+/// Raise a head payload's `del_hlc` field (`[ctype][del_hlc u64][tail]`) to
+/// at least `min`, preserving ctype and any type-specific tail. Used to make
+/// a COPY/RENAME clobber shadow the destination's stale elements.
+fn shadow_head_del_hlc(payload: &[u8], min: u64) -> Vec<u8> {
+    let mut out = payload.to_vec();
+    if out.len() >= 9 {
+        let cur = u64::from_be_bytes(out[1..9].try_into().unwrap());
+        if min > cur {
+            out[1..9].copy_from_slice(&min.to_be_bytes());
+        }
+    }
+    out
+}
+
 fn rebuild_ikey(tag: u8, userkey: &[u8], suffix: &[u8]) -> Vec<u8> {
     match tag {
         b's' => ikey::string_key(userkey),
@@ -744,13 +771,20 @@ fn rebuild_ikey(tag: u8, userkey: &[u8], suffix: &[u8]) -> Vec<u8> {
     }
 }
 
-fn restamp_record(ctx: &ShardCtx, value: &[u8]) -> Option<Vec<u8>> {
+/// Re-stamp a collected source record for writing at the destination. For
+/// the head record, `min_head_del_hlc` forces the head's `del_hlc` up to at
+/// least the destination clobber clock (0 = no clobber / fresh dest), so a
+/// REPLACE onto an existing collection shadows the destination's stale
+/// elements instead of resurrecting them. The type-specific head tail
+/// (stream counters) is preserved.
+fn restamp_record(ctx: &ShardCtx, value: &[u8], min_head_del_hlc: u64) -> Option<Vec<u8>> {
     let (env, payload) = Envelope::decode(value)?;
     if env.is_head() {
+        let payload = shadow_head_del_hlc(payload, min_head_del_hlc);
         return Some(
             Envelope::head(ctx.hlc.now(), ctx.node_id)
                 .with_ttl(env.ttl_deadline_ms)
-                .encode_with(payload),
+                .encode_with(&payload),
         );
     }
     if env.rtype().is_or_element() {

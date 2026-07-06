@@ -11,8 +11,8 @@ use std::sync::Arc;
 use crate::cmd::{eq_ignore_case, parse_u64};
 use crate::reply::Reply;
 use crate::store::{
-    check_type, ensure_head, get_raw, new_lww, new_tombstone, now_ms, scan_prefix, visible,
-    write_merged, ShardCtx,
+    check_type, ensure_head, get_raw, key_type, new_lww, new_tombstone, now_ms, scan_prefix,
+    visible, write_merged, ShardCtx,
 };
 use crate::Engine;
 use marekvs_core::envelope::{head, Envelope, RecordType};
@@ -69,6 +69,30 @@ fn stream_head(ctx: &ShardCtx, key: &[u8]) -> Option<(Envelope, u64, StreamMeta)
         return None;
     }
     Some((env, del, decode_stream_meta(pay)))
+}
+
+/// Like `stream_head` but treats a tombstoned/expired stream head as absent.
+/// Read/metadata ops (XINFO, XSETID) must not operate on a DEL'd or
+/// TTL-expired stream; the mutating ops (XADD/XDEL/XTRIM) keep using
+/// `stream_head` because they need the tombstone's delete clock to recreate
+/// or merge.
+fn live_stream_head(ctx: &ShardCtx, key: &[u8]) -> Option<(Envelope, u64, StreamMeta)> {
+    let (env, del, meta) = stream_head(ctx, key)?;
+    if env.is_tombstone() || env.is_expired(now_ms()) {
+        return None;
+    }
+    Some((env, del, meta))
+}
+
+/// Error reply when a stream read/metadata op finds no live stream: `no such
+/// key` when the key is absent or a dead/empty stream, WRONGTYPE when a live
+/// key of another type occupies it. (`key_type` already returns None for a
+/// tombstoned/expired/empty collection, so a dead stream maps to no-such-key.)
+fn no_live_stream_err(ctx: &ShardCtx, key: &[u8]) -> Reply {
+    match key_type(ctx, key) {
+        None => Reply::err("ERR no such key"),
+        Some(_) => Reply::wrongtype(),
+    }
 }
 
 fn write_stream_head(ctx: &ShardCtx, key: &[u8], ttl: u64, del: u64, meta: StreamMeta) {
@@ -687,8 +711,8 @@ pub async fn xsetid(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     engine
         .store
         .run_key(&args[1], move |ctx| {
-            let Some((head_env, del, mut meta)) = stream_head(ctx, &key) else {
-                return Reply::err("ERR no such key");
+            let Some((head_env, del, mut meta)) = live_stream_head(ctx, &key) else {
+                return no_live_stream_err(ctx, &key);
             };
             if let Some(last) = stream_last_id(ctx, &key) {
                 if id < last {
@@ -731,8 +755,8 @@ pub async fn xinfo(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     engine
         .store
         .run_key(&args[2], move |ctx| {
-            let Some((_head_env, del, meta)) = stream_head(ctx, &key) else {
-                return Reply::wrongtype();
+            let Some((_head_env, del, meta)) = live_stream_head(ctx, &key) else {
+                return no_live_stream_err(ctx, &key);
             };
             let entries = collect_entries(ctx, &key, del);
             let last_id = effective_last_id(ctx, &key, meta).unwrap_or((0, 0));

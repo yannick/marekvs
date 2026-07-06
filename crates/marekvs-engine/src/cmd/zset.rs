@@ -566,12 +566,10 @@ pub async fn zrange(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             return Reply::syntax();
         }
     }
-    if limit.is_some() && !byscore {
-        if !bylex {
-            return Reply::err(
-                "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX",
-            );
-        }
+    if limit.is_some() && !byscore && !bylex {
+        return Reply::err(
+            "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX",
+        );
     }
 
     if bylex {
@@ -1113,12 +1111,15 @@ fn try_zpop(
     Ok(popped)
 }
 
+/// A ZMPOP/BZMPOP hit: the source key and the popped (score, member) pairs.
+type ZmpopHit = (Vec<u8>, Vec<(f64, Vec<u8>)>);
+
 async fn zmpop_inner(
     engine: &Arc<Engine>,
     keys: &[Vec<u8>],
     max: bool,
     count: usize,
-) -> Result<Option<(Vec<u8>, Vec<(f64, Vec<u8>)>)>, Reply> {
+) -> Result<Option<ZmpopHit>, Reply> {
     for key in keys {
         engine.ensure_local(key).await;
         let k = key.clone();
@@ -1135,10 +1136,19 @@ async fn zmpop_inner(
     Ok(None)
 }
 
-fn zmpop_reply(hit: Option<(Vec<u8>, Vec<(f64, Vec<u8>)>)>) -> Reply {
+fn zmpop_reply(hit: Option<ZmpopHit>) -> Reply {
     match hit {
         None => Reply::NullArray,
-        Some((key, items)) => Reply::Array(vec![Reply::Bulk(key), emit(items, true)]),
+        Some((key, items)) => {
+            // ZMPOP/BZMPOP: the second element is an array of two-element
+            // [member, score] sub-arrays (NOT the flat [m, s, m, s] that
+            // `emit` / RESP2 ZPOPMIN-count produce).
+            let pairs = items
+                .into_iter()
+                .map(|(s, m)| Reply::Array(vec![Reply::Bulk(m), Reply::Double(s)]))
+                .collect();
+            Reply::Array(vec![Reply::Bulk(key), Reply::Array(pairs)])
+        }
     }
 }
 
@@ -1479,7 +1489,12 @@ pub async fn zintercard(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             None => set,
             Some(cur) => cur.intersection(&set).cloned().collect(),
         });
-        if acc.as_ref().is_some_and(|s| s.len() >= limit) {
+        // Only a genuinely EMPTY running intersection is a safe early exit
+        // (it can never grow). A `>= limit` break here would be WRONG: the
+        // intersection only shrinks as more keys are folded in, so a later
+        // key can drop the count back below `limit`. The limit is a final
+        // cap on the fully-computed intersection.
+        if acc.as_ref().is_some_and(|s| s.is_empty()) {
             break;
         }
     }
