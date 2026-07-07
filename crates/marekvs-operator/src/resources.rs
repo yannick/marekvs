@@ -52,8 +52,20 @@ pub fn statefulset(cr: &MarekvsCluster, replicas: i32) -> StatefulSet {
     if let Some(class) = &spec.storage.class_name {
         pvc_spec["storageClassName"] = json!(class);
     }
+    let mut hostname_spread = json!({
+        "maxSkew": 1, "topologyKey": "kubernetes.io/hostname",
+        "whenUnsatisfiable": "ScheduleAnyway",
+        "labelSelector": {"matchLabels": {"app": name}},
+    });
+    if let Some(when) = &spec.hostname_spread_when_unsatisfiable {
+        hostname_spread["whenUnsatisfiable"] = json!(when);
+        // Without Honor, nodes the pods can never land on (untolerated
+        // taints, e.g. control planes) count as zero-pod domains and a
+        // DoNotSchedule maxSkew=1 spread wedges after the first pod.
+        hostname_spread["nodeTaintsPolicy"] = json!("Honor");
+    }
 
-    serde_json::from_value(json!({
+    let mut sts = json!({
         "apiVersion": "apps/v1",
         "kind": "StatefulSet",
         "metadata": {
@@ -78,9 +90,7 @@ pub fn statefulset(cr: &MarekvsCluster, replicas: i32) -> StatefulSet {
                         "fsGroup": 65534,
                     },
                     "topologySpreadConstraints": [
-                        {"maxSkew": 1, "topologyKey": "kubernetes.io/hostname",
-                         "whenUnsatisfiable": "ScheduleAnyway",
-                         "labelSelector": {"matchLabels": {"app": name}}},
+                        hostname_spread,
                         {"maxSkew": 1, "topologyKey": "topology.kubernetes.io/zone",
                          "whenUnsatisfiable": "ScheduleAnyway",
                          "labelSelector": {"matchLabels": {"app": name}}},
@@ -121,8 +131,16 @@ pub fn statefulset(cr: &MarekvsCluster, replicas: i32) -> StatefulSet {
                 "spec": pvc_spec,
             }],
         },
-    }))
-    .expect("statefulset json is valid")
+    });
+    let pod = &mut sts["spec"]["template"]["spec"];
+    if !spec.node_selector.is_empty() {
+        pod["nodeSelector"] = json!(spec.node_selector);
+    }
+    if !spec.tolerations.is_empty() {
+        pod["tolerations"] =
+            serde_json::to_value(&spec.tolerations).expect("tolerations serialize");
+    }
+    serde_json::from_value(sts).expect("statefulset json is valid")
 }
 
 pub fn client_service(cr: &MarekvsCluster) -> Service {
@@ -206,6 +224,9 @@ mod tests {
                 autoscale: None,
                 reclaim_pvcs: false,
                 extra_env: Default::default(),
+                node_selector: Default::default(),
+                tolerations: Default::default(),
+                hostname_spread_when_unsatisfiable: None,
             },
         );
         cr.metadata.namespace = Some("ns1".into());
@@ -248,6 +269,43 @@ mod tests {
             assert_eq!(o.kind, "MarekvsCluster");
             assert!(o.controller.unwrap());
         }
+    }
+
+    #[test]
+    fn statefulset_omits_scheduling_when_unset() {
+        let pod = statefulset(&cr(), 3).spec.unwrap().template.spec.unwrap();
+        assert!(pod.node_selector.is_none());
+        assert!(pod.tolerations.is_none());
+        let spread = pod.topology_spread_constraints.unwrap();
+        assert_eq!(spread[0].when_unsatisfiable, "ScheduleAnyway");
+        assert!(spread[0].node_taints_policy.is_none());
+    }
+
+    #[test]
+    fn statefulset_carries_scheduling() {
+        let mut cr = cr();
+        cr.spec.node_selector = [("disk".to_string(), "nvme".to_string())].into();
+        cr.spec.tolerations = vec![crate::types::Toleration {
+            key: Some("dedicated".into()),
+            operator: Some("Equal".into()),
+            value: Some("caching".into()),
+            effect: Some("NoSchedule".into()),
+            ..Default::default()
+        }];
+        cr.spec.hostname_spread_when_unsatisfiable = Some("DoNotSchedule".into());
+
+        let pod = statefulset(&cr, 3).spec.unwrap().template.spec.unwrap();
+        assert_eq!(pod.node_selector.unwrap()["disk"], "nvme");
+        let tol = &pod.tolerations.unwrap()[0];
+        assert_eq!(tol.key.as_deref(), Some("dedicated"));
+        assert_eq!(tol.value.as_deref(), Some("caching"));
+        assert_eq!(tol.effect.as_deref(), Some("NoSchedule"));
+        let spread = pod.topology_spread_constraints.unwrap();
+        assert_eq!(spread[0].topology_key, "kubernetes.io/hostname");
+        assert_eq!(spread[0].when_unsatisfiable, "DoNotSchedule");
+        assert_eq!(spread[0].node_taints_policy.as_deref(), Some("Honor"));
+        // the zone spread stays soft
+        assert_eq!(spread[1].when_unsatisfiable, "ScheduleAnyway");
     }
 
     #[test]

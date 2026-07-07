@@ -60,6 +60,44 @@ pub struct MarekvsClusterSpec {
     /// Extra environment for the marekvs container (e.g. RUST_LOG).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub extra_env: std::collections::BTreeMap<String, String>,
+
+    /// Restrict marekvs pods to nodes with these labels.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub node_selector: std::collections::BTreeMap<String, String>,
+
+    /// Tolerations for the marekvs pods (e.g. dedicated node pools).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tolerations: Vec<Toleration>,
+
+    /// `whenUnsatisfiable` for the per-hostname topology spread constraint.
+    /// Default is ScheduleAnyway (best-effort one pod per node). Set to
+    /// DoNotSchedule to make one-per-node a hard guarantee: excess pods stay
+    /// Pending, which lets a cluster-autoscaler add nodes instead of
+    /// doubling up. Untolerated-tainted nodes are excluded from the skew
+    /// calculation (nodeTaintsPolicy: Honor) so e.g. control-plane nodes
+    /// don't count as empty domains and wedge scheduling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname_spread_when_unsatisfiable: Option<String>,
+}
+
+/// core/v1 Toleration, restated locally: the CRD schema needs JsonSchema,
+/// which k8s-openapi types don't derive without its `schemars` feature.
+/// Field names serialize to the exact core/v1 wire shape.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Toleration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Equal | Exists
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// NoSchedule | PreferNoSchedule | NoExecute
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toleration_seconds: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

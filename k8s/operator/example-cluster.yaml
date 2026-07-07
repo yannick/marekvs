@@ -25,3 +25,15 @@ spec:
   reclaimPvcs: false
   extraEnv:
     RUST_LOG: info
+  # Scheduling (all optional). tolerations/nodeSelector place the pods on
+  # dedicated or tainted pools; hostnameSpreadWhenUnsatisfiable: DoNotSchedule
+  # turns the soft one-pod-per-node spread into a hard guarantee (excess pods
+  # stay Pending, which lets a cluster-autoscaler add nodes).
+  # nodeSelector:
+  #   node-group: caching
+  # tolerations:
+  #   - key: dedicated
+  #     operator: Equal
+  #     value: caching
+  #     effect: NoSchedule
+  # hostnameSpreadWhenUnsatisfiable: DoNotSchedule
