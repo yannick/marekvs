@@ -111,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
     // resolve it to an IP once at startup.
     let gossip_advertise = resolve(&advertise_ip, gossip_addr.port()).await?;
     let mesh_advertise = resolve(&advertise_ip, mesh_addr.port()).await?;
+    let resp_advertise = resolve(&advertise_ip, resp_addr.port()).await?;
 
     tracing::info!(
         node_id,
@@ -177,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
         gossip_listen: gossip_addr,
         gossip_advertise,
         mesh_advertise,
+        resp_advertise,
         seeds,
         replicas_n,
         gossip_interval: Duration::from_millis(500),

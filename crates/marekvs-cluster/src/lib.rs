@@ -57,6 +57,14 @@ pub struct Member {
     /// address went stale (environments without stable IPs or DNS, e.g.
     /// Apple containers give every restart a fresh IP).
     pub gossip_addr: SocketAddr,
+    /// The peer's client-facing RESP endpoint, for CLUSTER SLOTS/NODES
+    /// (design/15). None while a mixed-version cluster still has members
+    /// that don't gossip it — such members are omitted from topology
+    /// replies, never guessed.
+    pub resp_addr: Option<SocketAddr>,
+    /// chitchat generation (boot timestamp) — the member's incarnation,
+    /// reported as config-epoch in CLUSTER NODES/INFO.
+    pub generation: u64,
     pub phase: NodePhase,
 }
 
@@ -166,6 +174,7 @@ pub struct ClusterConfig {
     pub gossip_listen: SocketAddr,
     pub gossip_advertise: SocketAddr,
     pub mesh_advertise: SocketAddr,
+    pub resp_advertise: SocketAddr,
     pub seeds: Vec<String>,
     pub replicas_n: usize,
     pub gossip_interval: Duration,
@@ -208,6 +217,7 @@ impl Cluster {
         };
         let initial_kvs = vec![
             ("mesh_addr".to_string(), cfg.mesh_advertise.to_string()),
+            ("resp_addr".to_string(), cfg.resp_advertise.to_string()),
             ("state".to_string(), NodePhase::Joining.as_str().to_string()),
         ];
         let handle = spawn_chitchat(config, initial_kvs, &UdpTransport).await?;
@@ -264,6 +274,8 @@ impl Cluster {
                 node,
                 mesh_addr: addr,
                 gossip_addr: id.gossip_advertise_addr,
+                resp_addr: state.get("resp_addr").and_then(|a| a.parse().ok()),
+                generation: id.generation_id,
                 phase,
             });
         }
