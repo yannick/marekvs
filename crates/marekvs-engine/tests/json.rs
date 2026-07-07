@@ -784,7 +784,13 @@ async fn restart_persistence() {
     let v = serde_json::json!({"a": {"b": [1, "x", null]}, "n": 3.5});
     {
         let e = open_engine(&dir, 7);
-        jset(&e, b"p", b"$", serde_json::to_string(&v).unwrap().as_bytes()).await;
+        jset(
+            &e,
+            b"p",
+            b"$",
+            serde_json::to_string(&v).unwrap().as_bytes(),
+        )
+        .await;
         json::arrappend(&e, &a(&[b"JSON.ARRAPPEND", b"p", b".a.b", b"9"])).await;
         json::del(&e, &a(&[b"JSON.DEL", b"p", b"$.a.b[0]"])).await;
         drop(e); // Store::drop closes ondadb cleanly
@@ -807,10 +813,14 @@ async fn replicate_json(src: &Arc<Engine>, dst: &Arc<Engine>, key: &[u8], revers
             if let Some(h) = store::get_raw(ctx, &ikey::head_key(&k)) {
                 out.push((ikey::head_key(&k), h));
             }
-            store::scan_prefix(ctx, &ikey::collection_prefix(ikey::Tag::Json, &k), |ik, v| {
-                out.push((ik.to_vec(), v.to_vec()));
-                true
-            });
+            store::scan_prefix(
+                ctx,
+                &ikey::collection_prefix(ikey::Tag::Json, &k),
+                |ik, v| {
+                    out.push((ik.to_vec(), v.to_vec()));
+                    true
+                },
+            );
             out
         })
         .await;
@@ -842,9 +852,18 @@ async fn concurrent_editors_converge() {
         (dir, e)
     };
     // node 1 creates the doc; ship it to node 2
-    jset(&e1, b"c", b"$", br#"{"title":"x","tags":["a"],"meta":{"k":1}}"#).await;
+    jset(
+        &e1,
+        b"c",
+        b"$",
+        br#"{"title":"x","tags":["a"],"meta":{"k":1}}"#,
+    )
+    .await;
     replicate_json(&e1, &e2, b"c", false).await;
-    assert_eq!(jval(&jget(&e2, b"c", b".").await), jval(&jget(&e1, b"c", b".").await));
+    assert_eq!(
+        jval(&jget(&e2, b"c", b".").await),
+        jval(&jget(&e1, b"c", b".").await)
+    );
 
     // concurrent edits: disjoint fields, same-array appends, subtree delete
     jset(&e1, b"c", b"$.title", br#""from-1""#).await;
@@ -852,7 +871,11 @@ async fn concurrent_editors_converge() {
     json::del(&e1, &a(&[b"JSON.DEL", b"c", b"$.meta"])).await;
 
     jset(&e2, b"c", b"$.other", b"42").await;
-    json::arrappend(&e2, &a(&[b"JSON.ARRAPPEND", b"c", b".tags", br#""n2a""#, br#""n2b""#])).await;
+    json::arrappend(
+        &e2,
+        &a(&[b"JSON.ARRAPPEND", b"c", b".tags", br#""n2a""#, br#""n2b""#]),
+    )
+    .await;
     // concurrent write INTO the subtree node 1 deletes: the delete wins —
     // a leaf write does not re-assert its ancestors' presence (documented)
     jset(&e2, b"c", b"$.meta.fresh", b"true").await;
@@ -904,8 +927,14 @@ async fn double_arrpop_converges() {
 
     replicate_json(&e1, &e2, b"q", false).await;
     replicate_json(&e2, &e1, b"q", true).await;
-    assert_eq!(jval(&jget(&e1, b"q", b".").await), serde_json::json!([10, 20]));
-    assert_eq!(jval(&jget(&e2, b"q", b".").await), serde_json::json!([10, 20]));
+    assert_eq!(
+        jval(&jget(&e1, b"q", b".").await),
+        serde_json::json!([10, 20])
+    );
+    assert_eq!(
+        jval(&jget(&e2, b"q", b".").await),
+        serde_json::json!([10, 20])
+    );
 }
 
 /// Field set racing a field delete: the set's unobserved dot survives
