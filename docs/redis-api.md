@@ -224,9 +224,9 @@ and JSON projection. Full guide: [Protobuf values](../protobuf/).
 |---|---|
 | `PROTO.SCHEMA SET/COMPILE/GET/LIST/TYPES/DEL` | Registry: upload `.proto` source (server-compiled, imports resolve from the registry) or a compiled descriptor set; versioned; `DEL` keeps old versions so stored values always decode. |
 | `PROTO.BIND` `PROTO.UNBIND` `PROTO.BINDINGS` | Bind key prefixes to message types; longest prefix wins; explicit `TYPE` argument overrides. |
-| `PROTO.SET` `PROTO.GET` `PROTO.INFO` | Validated whole-message values (LWW); `GET` returns raw bytes, `INFO` the stored `{schema, version, type, bytes}`. |
+| `PROTO.SET` `PROTO.GET` `PROTO.INFO` | Validated values stored decomposed into per-field CRDT records; `GET` materializes the message, `INFO` reports `{schema, version, type, format, records, bytes}` (`format` = `whole` for legacy values, `fields` for decomposed). |
 | `PROTO.GETJSON` `PROTO.SETJSON` | Canonical protobuf-JSON projection in/out. |
-| `PROTO.GETFIELD` `PROTO.SETFIELD` `PROTO.CLEARFIELD` | Dot-path field access; `SETFIELD`/`CLEARFIELD` are atomic per-key read-modify-writes. |
+| `PROTO.GETFIELD` `PROTO.SETFIELD` `PROTO.CLEARFIELD` | Dot-path field access; `SETFIELD`/`CLEARFIELD` write per-field CRDT deltas — concurrent edits to different fields merge (repeated = RGA, map = add-wins, oneof = deterministic winner). Legacy whole-message values upgrade on first write; upgrade the whole cluster before the first field-level write. |
 | `PROTO.HSET` `PROTO.SADD` | Validate values, then store as ordinary hash fields / set members (raw bytes; plain `HGET`/`SMEMBERS` unchanged). |
 | `PROTO.HGETJSON` `PROTO.HGETFIELD` | Decode one hash element at read time. |
 
