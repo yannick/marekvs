@@ -11,7 +11,7 @@ use prost::Message;
 use prost_reflect::DynamicMessage;
 
 use crate::cmd::{eq_ignore_case, parse_u64};
-use crate::proto::{compile, registry, ProtoErr};
+use crate::proto::{compile, path, registry, ProtoErr};
 use crate::pubsub::glob_match;
 use crate::reply::Reply;
 use crate::store::{get_head, get_raw, now_ms, read_lww, write_merged, ShardCtx};
@@ -612,6 +612,197 @@ async fn load_message(
             desc,
         },
     )))
+}
+
+// ---------------------------------------------------------------------------
+// field access: PROTO.GETFIELD / SETFIELD / CLEARFIELD
+// ---------------------------------------------------------------------------
+
+/// `PROTO.GETFIELD key path [path…]` — scalars as native RESP types, enums
+/// as names, message/repeated/map as canonical JSON; unset → Null. One
+/// path → the value; several → an Array.
+pub async fn getfield(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 3 {
+        return Reply::wrong_args("proto.getfield");
+    }
+    let mut paths = Vec::with_capacity(args.len() - 2);
+    for raw in &args[2..] {
+        match path::parse_path(raw) {
+            Ok(p) => paths.push(p),
+            Err(e) => return e.reply(),
+        }
+    }
+    let (m, _) = match load_message(engine, &args[1]).await {
+        Err(r) => return r,
+        Ok(None) => return Reply::Null,
+        Ok(Some(v)) => v,
+    };
+    let mut out = Vec::with_capacity(paths.len());
+    for p in &paths {
+        match path::get_path(&m, p) {
+            Ok(Some(r)) => out.push(path::render(&r)),
+            Ok(None) => out.push(Reply::Null),
+            Err(e) => return e.reply(),
+        }
+    }
+    if out.len() == 1 {
+        out.pop().unwrap()
+    } else {
+        Reply::Array(out)
+    }
+}
+
+/// The mutation a PROTO.SETFIELD/CLEARFIELD RMW applies on the shard thread.
+type RmwApply = Arc<dyn Fn(&mut DynamicMessage) -> Result<Reply, ProtoErr> + Send + Sync>;
+
+enum RmwOut {
+    Done(Reply),
+    /// The stored (schema, version, type) changed between the identity read
+    /// and the shard RMW — re-resolve the descriptor and try again.
+    Retry,
+}
+
+/// Atomic read-modify-write of a stored proto value ON ITS SHARD THREAD:
+/// decode → `apply` → re-encode → LWW head write (same schema/version/
+/// type tail, TTL preserved, delete clock verbatim). The descriptor pool is
+/// resolved asynchronously first; a concurrent type change is detected on
+/// the shard and retried.
+async fn rmw_message(engine: &Arc<Engine>, key: &[u8], apply: RmwApply) -> Reply {
+    engine.ensure_local(key).await;
+    let max_value = engine.proto.limits.max_value;
+    for _ in 0..3 {
+        // 1. identity read: which (schema, version, type) is stored now?
+        let k = key.to_vec();
+        let tail = engine
+            .store
+            .run_key(key, move |ctx| read_proto_head(ctx, &k))
+            .await;
+        let (schema, version, tname) = match tail {
+            Err(()) => return Reply::wrongtype(),
+            Ok(None) => return Reply::err("ERR no such key (write it with PROTO.SET first)"),
+            Ok(Some((_, _, t))) => match protohead::decode(&t) {
+                Some(ph) => (
+                    ph.schema.to_string(),
+                    ph.schema_version,
+                    ph.type_name.to_string(),
+                ),
+                None => return Reply::err("ERR corrupt proto value"),
+            },
+        };
+        // 2. resolve the descriptor (async: registry may live on another
+        //    shard / node — never from inside the shard job).
+        let (_, pool) = match registry::pool_for(engine, &schema, version).await {
+            Ok(v) => v,
+            Err(e) => return e.reply(),
+        };
+        let Some(desc) = pool.get_message_by_name(&tname) else {
+            return ProtoErr::NoSchema(format!(
+                "schema '{schema}' version {version} does not define type '{tname}'"
+            ))
+            .reply();
+        };
+        // 3. shard-thread RMW.
+        let (k, apply2) = (key.to_vec(), apply.clone());
+        let out = engine
+            .store
+            .run_key(key, move |ctx| {
+                let (env, del, tail) = match read_proto_head(ctx, &k) {
+                    Err(()) => return RmwOut::Done(Reply::wrongtype()),
+                    Ok(None) => {
+                        return RmwOut::Done(Reply::err(
+                            "ERR no such key (write it with PROTO.SET first)",
+                        ))
+                    }
+                    Ok(Some(v)) => v,
+                };
+                let Some(ph) = protohead::decode(&tail) else {
+                    return RmwOut::Done(Reply::err("ERR corrupt proto value"));
+                };
+                if ph.schema != schema || ph.schema_version != version || ph.type_name != tname {
+                    return RmwOut::Retry;
+                }
+                let mut m = match DynamicMessage::decode(desc.clone(), ph.msg) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        return RmwOut::Done(Reply::err(format!(
+                            "ERR stored value does not decode: {e}"
+                        )))
+                    }
+                };
+                let reply = match apply2(&mut m) {
+                    Ok(r) => r,
+                    Err(e) => return RmwOut::Done(e.reply()),
+                };
+                let msg = m.encode_to_vec();
+                if msg.len() > max_value {
+                    return RmwOut::Done(
+                        ProtoErr::Validate(format!(
+                            "value too large after edit ({} bytes, limit {max_value})",
+                            msg.len()
+                        ))
+                        .reply(),
+                    );
+                }
+                let mut payload = head::encode(head::CTYPE_PROTO, del);
+                payload.extend_from_slice(&protohead::encode(&schema, version, &tname, &msg));
+                let env2 = Envelope::head(ctx.hlc.now(), ctx.node_id).with_ttl(env.ttl_deadline_ms);
+                write_merged(ctx, &ikey::head_key(&k), &env2.encode_with(&payload));
+                RmwOut::Done(reply)
+            })
+            .await;
+        match out {
+            RmwOut::Done(r) => return r,
+            RmwOut::Retry => continue,
+        }
+    }
+    Reply::err("TRYAGAIN concurrent type change on the key; retry")
+}
+
+/// `PROTO.SETFIELD key path value [path value…]` — one atomic RMW; scalar
+/// values from strings, message/repeated/map values from JSON.
+pub async fn setfield(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 4 || (args.len() - 2) % 2 != 0 {
+        return Reply::wrong_args("proto.setfield");
+    }
+    let mut ops: Vec<(Vec<String>, Vec<u8>)> = Vec::with_capacity((args.len() - 2) / 2);
+    for pair in args[2..].chunks(2) {
+        match path::parse_path(&pair[0]) {
+            Ok(p) => ops.push((p, pair[1].clone())),
+            Err(e) => return e.reply(),
+        }
+    }
+    let apply = Arc::new(move |m: &mut DynamicMessage| {
+        for (p, raw) in &ops {
+            path::set_path(m, p, raw)?;
+        }
+        Ok(Reply::ok())
+    });
+    rmw_message(engine, &args[1], apply).await
+}
+
+/// `PROTO.CLEARFIELD key path [path…]` → Int: how many paths had something
+/// to clear.
+pub async fn clearfield(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 3 {
+        return Reply::wrong_args("proto.clearfield");
+    }
+    let mut paths = Vec::with_capacity(args.len() - 2);
+    for raw in &args[2..] {
+        match path::parse_path(raw) {
+            Ok(p) => paths.push(p),
+            Err(e) => return e.reply(),
+        }
+    }
+    let apply = Arc::new(move |m: &mut DynamicMessage| {
+        let mut n = 0i64;
+        for p in &paths {
+            if path::clear_path(m, p)? {
+                n += 1;
+            }
+        }
+        Ok(Reply::Int(n))
+    });
+    rmw_message(engine, &args[1], apply).await
 }
 
 /// `PROTO.GETJSON key` → canonical protobuf-JSON of the stored message.

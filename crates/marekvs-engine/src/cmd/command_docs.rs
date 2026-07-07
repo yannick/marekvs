@@ -992,6 +992,12 @@ static TABLE: &[CommandDoc] = &[
     with_args(cmd("proto.setjson", -3, CW, 1, 1, 1, "Stores a protobuf value from canonical protobuf-JSON.", "1.3.0", "proto"),
         &[A_KEY, arg("json", "string"),
           Arg { token: Some("TYPE"), optional: true, ..arg("type", "string") }]),
+    with_args(cmd("proto.getfield", -3, CRO, 1, 1, 1, "Returns message fields by dot-path (scalars native, containers as JSON).", "1.3.0", "proto"),
+        &[A_KEY, Arg { multiple: true, ..arg("path", "string") }]),
+    with_args(cmd("proto.setfield", -4, CW, 1, 1, 1, "Sets message fields by dot-path in one atomic read-modify-write.", "1.3.0", "proto"),
+        &[A_KEY, Arg { multiple: true, name: "path-value", typ: "block", args: &[arg("path", "string"), arg("value", "string")], ..arg("path-value", "block") }]),
+    with_args(cmd("proto.clearfield", -3, CW, 1, 1, 1, "Clears message fields / list elements / map keys by dot-path.", "1.3.0", "proto"),
+        &[A_KEY, Arg { multiple: true, ..arg("path", "string") }]),
 ];
 
 /// The full command catalog.

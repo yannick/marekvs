@@ -93,6 +93,9 @@ pub async fn dispatch(
         "PROTO.INFO" => proto::info(engine, &args).await,
         "PROTO.GETJSON" => proto::getjson(engine, &args).await,
         "PROTO.SETJSON" => proto::setjson(engine, &args).await,
+        "PROTO.GETFIELD" => proto::getfield(engine, &args).await,
+        "PROTO.SETFIELD" => proto::setfield(engine, &args).await,
+        "PROTO.CLEARFIELD" => proto::clearfield(engine, &args).await,
 
         // --- generic / keyspace ---
         "DEL" | "UNLINK" => generic::del(engine, &args).await,

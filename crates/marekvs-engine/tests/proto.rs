@@ -695,6 +695,233 @@ async fn proto_del_recreate_keeps_delete_clock() {
     assert!(del_hlc > 0, "delete clock must carry forward");
 }
 
+// ---------------------------------------------------------------------------
+// B5 — field access: PROTO.GETFIELD / SETFIELD / CLEARFIELD
+// ---------------------------------------------------------------------------
+
+async fn seed_order(e: &Arc<Engine>, key: &[u8]) {
+    let json = br#"{
+        "id": "o-1",
+        "totalCents": "18446744073709551615",
+        "tags": ["a", "b"],
+        "scores": {"alice": "10"},
+        "customer": {"name": "Ada", "tier": 3},
+        "ratio": 1.5,
+        "paid": true
+    }"#;
+    ok(proto_cmd::setjson(e, &a(&[b"PROTO.SETJSON", key, json])).await);
+}
+
+#[tokio::test]
+async fn getfield_native_types() {
+    let (_d, e) = bound_engine().await;
+    seed_order(&e, b"order:f").await;
+    let gf = |path: &'static [u8]| {
+        let e = e.clone();
+        async move { proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:f", path])).await }
+    };
+    assert_eq!(gf(b"id").await, Reply::Bulk(b"o-1".to_vec()));
+    // u64 above i64::MAX renders as its decimal string
+    assert_eq!(
+        gf(b"total_cents").await,
+        Reply::Bulk(b"18446744073709551615".to_vec())
+    );
+    assert_eq!(gf(b"ratio").await, Reply::Double(1.5));
+    assert_eq!(gf(b"paid").await, Reply::Bool(true));
+    assert_eq!(gf(b"customer.tier").await, Reply::Int(3));
+    assert_eq!(gf(b"tags.0").await, Reply::Bulk(b"a".to_vec()));
+    assert_eq!(gf(b"scores.alice").await, Reply::Int(10));
+    // containers → canonical JSON
+    assert_eq!(gf(b"tags").await, Reply::Bulk(br#"["a","b"]"#.to_vec()));
+    assert_eq!(
+        gf(b"customer").await,
+        Reply::Bulk(br#"{"name":"Ada","tier":3}"#.to_vec())
+    );
+    // unset/missing → Null
+    assert_eq!(gf(b"tags.9").await, Reply::Null);
+    assert_eq!(gf(b"scores.nobody").await, Reply::Null);
+    // multiple paths → Array
+    let r = proto_cmd::getfield(
+        &e,
+        &a(&[b"PROTO.GETFIELD", b"order:f", b"id", b"paid"]),
+    )
+    .await;
+    assert_eq!(
+        r,
+        Reply::Array(vec![Reply::Bulk(b"o-1".to_vec()), Reply::Bool(true)])
+    );
+}
+
+#[tokio::test]
+async fn getfield_path_errors() {
+    let (_d, e) = bound_engine().await;
+    seed_order(&e, b"order:pe").await;
+    assert_err_contains(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:pe", b"nosuch"])).await,
+        "PROTOPATH",
+    );
+    let deep = vec!["a"; 33].join(".");
+    assert_err_contains(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:pe", deep.as_bytes()])).await,
+        "PROTOPATH",
+    );
+    assert_err_contains(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:pe", b"id.deeper"])).await,
+        "PROTOPATH",
+    );
+    // absent key → Null
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:absent", b"id"])).await,
+        Reply::Null
+    );
+}
+
+#[tokio::test]
+async fn setfield_rmw_preserves_untouched_fields() {
+    let (_d, e) = bound_engine().await;
+    seed_order(&e, b"order:rm").await;
+    ok(proto_cmd::setfield(
+        &e,
+        &a(&[b"PROTO.SETFIELD", b"order:rm", b"customer.name", b"Grace"]),
+    )
+    .await);
+    // Touched path changed…
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:rm", b"customer.name"])).await,
+        Reply::Bulk(b"Grace".to_vec())
+    );
+    // …everything else intact.
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:rm", b"id"])).await,
+        Reply::Bulk(b"o-1".to_vec())
+    );
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:rm", b"customer.tier"])).await,
+        Reply::Int(3)
+    );
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:rm", b"tags"])).await,
+        Reply::Bulk(br#"["a","b"]"#.to_vec())
+    );
+
+    // Multiple path/value pairs in one atomic RMW; JSON for containers.
+    ok(proto_cmd::setfield(
+        &e,
+        &a(&[
+            b"PROTO.SETFIELD",
+            b"order:rm",
+            b"tags",
+            br#"["x","y","z"]"#,
+            b"scores.bob",
+            b"7",
+        ]),
+    )
+    .await);
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:rm", b"tags.2"])).await,
+        Reply::Bulk(b"z".to_vec())
+    );
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:rm", b"scores.bob"])).await,
+        Reply::Int(7)
+    );
+
+    // Errors: unknown field, bad value, absent key.
+    assert_err_contains(
+        proto_cmd::setfield(&e, &a(&[b"PROTO.SETFIELD", b"order:rm", b"nosuch", b"1"])).await,
+        "PROTOPATH",
+    );
+    assert_err_contains(
+        proto_cmd::setfield(
+            &e,
+            &a(&[b"PROTO.SETFIELD", b"order:rm", b"customer.tier", b"notanint"]),
+        )
+        .await,
+        "PROTOPATH",
+    );
+    assert_err_contains(
+        proto_cmd::setfield(&e, &a(&[b"PROTO.SETFIELD", b"order:no", b"id", b"x"])).await,
+        "no such key",
+    );
+}
+
+#[tokio::test]
+async fn setfield_keeps_ttl_and_lww_stamps() {
+    let (_d, e) = bound_engine().await;
+    let msg = order_bytes("keepttl", 5);
+    ok(proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:st", &msg, b"EX", b"100"])).await);
+    ok(proto_cmd::setfield(&e, &a(&[b"PROTO.SETFIELD", b"order:st", b"id", b"new-id"])).await);
+    let ttl = int(generic::ttl(&e, &a(&[b"TTL", b"order:st"]), false).await);
+    assert!(ttl > 90 && ttl <= 100, "SETFIELD must keep the TTL, got {ttl}");
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:st", b"id"])).await,
+        Reply::Bulk(b"new-id".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn clearfield_scalars_lists_maps() {
+    let (_d, e) = bound_engine().await;
+    seed_order(&e, b"order:cl").await;
+    // clear a scalar, a list element and a map key: 3 cleared
+    let n = int(
+        proto_cmd::clearfield(
+            &e,
+            &a(&[
+                b"PROTO.CLEARFIELD",
+                b"order:cl",
+                b"paid",
+                b"tags.0",
+                b"scores.alice",
+            ]),
+        )
+        .await,
+    );
+    assert_eq!(n, 3);
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:cl", b"paid"])).await,
+        Reply::Bool(false) // proto3 scalar resets to default
+    );
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:cl", b"tags"])).await,
+        Reply::Bulk(br#"["b"]"#.to_vec())
+    );
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:cl", b"scores.alice"])).await,
+        Reply::Null
+    );
+    // clearing something already absent counts 0
+    assert_eq!(
+        int(proto_cmd::clearfield(&e, &a(&[b"PROTO.CLEARFIELD", b"order:cl", b"scores.alice"])).await),
+        0
+    );
+    // message field clears to unset (Null)
+    assert_eq!(
+        int(proto_cmd::clearfield(&e, &a(&[b"PROTO.CLEARFIELD", b"order:cl", b"customer"])).await),
+        1
+    );
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:cl", b"customer"])).await,
+        Reply::Null
+    );
+}
+
+#[tokio::test]
+async fn setjson_getjson_roundtrip_after_field_edits() {
+    let (_d, e) = bound_engine().await;
+    seed_order(&e, b"order:rt").await;
+    ok(proto_cmd::setfield(&e, &a(&[b"PROTO.SETFIELD", b"order:rt", b"id", b"o-2"])).await);
+    let out = bulk(proto_cmd::getjson(&e, &a(&[b"PROTO.GETJSON", b"order:rt"])).await);
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["id"], "o-2");
+    assert_eq!(v["totalCents"], "18446744073709551615"); // u64 as string
+    assert_eq!(v["customer"]["name"], "Ada");
+    // Round-trip the produced JSON back through SETJSON: identical JSON out.
+    ok(proto_cmd::setjson(&e, &a(&[b"PROTO.SETJSON", b"order:rt2", &out])).await);
+    let out2 = bulk(proto_cmd::getjson(&e, &a(&[b"PROTO.GETJSON", b"order:rt2"])).await);
+    assert_eq!(out, out2);
+}
+
 #[tokio::test]
 async fn expire_preserves_proto_tail() {
     let (_d, e) = engine();
