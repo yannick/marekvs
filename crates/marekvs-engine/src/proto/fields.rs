@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use super::err::ProtoErr;
 use marekvs_core::json::{rga_order, Eid, EID_HEAD};
 use marekvs_core::merge::Dot;
 use marekvs_core::pdoc::{push_seg, split_last, MKey, PArrElem, PNodeIn, PRecord, PSeg, PVal};
@@ -254,7 +255,7 @@ fn max_dot(dots: &[Dot]) -> Dot {
 /// synthetic single-member oneof, which must not participate in exclusion —
 /// a one-member group needs no exclusion anyway, so member count is a safe,
 /// version-independent detector.
-fn real_oneof(fd: &FieldDescriptor) -> Option<prost_reflect::OneofDescriptor> {
+pub(crate) fn real_oneof(fd: &FieldDescriptor) -> Option<prost_reflect::OneofDescriptor> {
     fd.containing_oneof().filter(|o| o.fields().count() > 1)
 }
 
@@ -420,6 +421,262 @@ pub fn transcribe_records(
         origin: head_origin,
     };
     decompose_msg(&[], msg, &mut fresh)
+}
+
+/// Emit the DESCENDANT records of `value` rooted at `node_path` (the node at
+/// `node_path` itself is written kind-aware by the caller). `fd` is the leaf
+/// field context; `element` = `value` is a single repeated element (its own
+/// record is kind-B, so a message element's fields still descend here). Fresh
+/// element ids come from `fresh` (normal writes ignore its arguments).
+pub fn children_records(
+    node_path: &[u8],
+    value: &Value,
+    fd: &FieldDescriptor,
+    element: bool,
+    fresh: &mut FreshEid<'_>,
+) -> Vec<PRecord> {
+    let mut out = Vec::new();
+    let mut path = node_path.to_vec();
+    if !element && fd.is_map() {
+        if let Value::Map(map) = value {
+            // sorted by encoded key segment (map iteration order is not
+            // deterministic; the record set must be)
+            let mut entries: Vec<(Vec<u8>, MKey, &Value)> = map
+                .iter()
+                .map(|(k, v)| {
+                    let mk = mkey_of(k);
+                    let mut seg = Vec::new();
+                    push_seg(&mut seg, &PSeg::MapKey(mk.clone()));
+                    (seg, mk, v)
+                })
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            for (_, mk, v) in entries {
+                let l = path.len();
+                push_seg(&mut path, &PSeg::MapKey(mk));
+                decompose_value(&mut path, v, fresh, &mut out);
+                path.truncate(l);
+            }
+        }
+    } else if !element && fd.is_list() {
+        if let Value::List(list) = value {
+            let mut left = EID_HEAD;
+            for (ordinal, v) in list.iter().enumerate() {
+                let e = fresh(&path, ordinal as u32);
+                let l = path.len();
+                push_seg(&mut path, &PSeg::Elem(e));
+                out.push(PRecord::Elem {
+                    path: path.clone(),
+                    elem: PArrElem {
+                        left,
+                        val: pval_of(v),
+                    },
+                });
+                if let Value::Message(m) = v {
+                    decompose_children(&mut path, m, fresh, &mut out);
+                }
+                path.truncate(l);
+                left = e;
+            }
+        }
+    } else if let Value::Message(m) = value {
+        decompose_children(&mut path, m, fresh, &mut out);
+    }
+    out
+}
+
+/// The resolved target of a user dot-path against a decomposed value's
+/// descriptor + [`PIndex`] (design/18). Record paths are keyed by field
+/// number so they survive schema renames.
+pub enum Resolved {
+    /// A kind-A slot (singular field, whole repeated/map field, or map-entry
+    /// value). `fd` is the value's field context (`parse_value` with
+    /// `element = false`); `oneof_siblings` are the record paths of the other
+    /// members of a real oneof this field belongs to (empty otherwise).
+    Node {
+        node_path: Vec<u8>,
+        fd: FieldDescriptor,
+        oneof_siblings: Vec<Vec<u8>>,
+    },
+    /// An existing repeated element (index < len): rewrite in place keeping
+    /// the stored left anchor. `fd` is the repeated field (`element = true`).
+    Elem {
+        elem_path: Vec<u8>,
+        fd: FieldDescriptor,
+    },
+    /// Append past the last element (index == len): a fresh element chained
+    /// after `left`. `fd` is the repeated field (`element = true`).
+    Append {
+        list_path: Vec<u8>,
+        left: Eid,
+        fd: FieldDescriptor,
+    },
+    /// The index addresses past the end of the list, or descends through a
+    /// missing element. SETFIELD errors; CLEARFIELD counts nothing.
+    OutOfRange,
+}
+
+/// A resolved write path plus the container marker nodes that must be created
+/// first (missing intermediate messages/maps/lists), each written kind-A with
+/// observed = [].
+pub struct WritePath {
+    pub intermediates: Vec<(Vec<u8>, PVal)>,
+    pub target: Resolved,
+}
+
+/// Resolve a parsed dot-path (`super::path::parse_path`) into a record-level
+/// write target. Walks the descriptor exactly like `path::set_in_value`, but
+/// against the stored [`PIndex`] instead of a live message, so index/key
+/// addressing resolves to stable element ids and observed dots; container
+/// nodes that don't yet exist are collected as `intermediates`.
+pub fn resolve_path(
+    desc: &MessageDescriptor,
+    segs: &[String],
+    index: &PIndex,
+) -> Result<WritePath, ProtoErr> {
+    use super::path::{parse_index, parse_map_key, resolve_field};
+    let mut path: Vec<u8> = Vec::new(); // record path of the container we're in
+    let mut cur = desc.clone();
+    let mut intermediates: Vec<(Vec<u8>, PVal)> = Vec::new();
+    let mut i = 0;
+    let ensure = |intermediates: &mut Vec<(Vec<u8>, PVal)>, p: &[u8], marker: PVal| {
+        if !index.node_dots.contains_key(p) {
+            intermediates.push((p.to_vec(), marker));
+        }
+    };
+    loop {
+        let fd = resolve_field(&cur, &segs[i])?;
+        let mut field_path = path.clone();
+        push_seg(&mut field_path, &PSeg::Field(fd.number()));
+        let last = i + 1 == segs.len();
+        if fd.is_map() {
+            if last {
+                return Ok(WritePath {
+                    intermediates,
+                    target: Resolved::Node {
+                        node_path: field_path,
+                        fd,
+                        oneof_siblings: Vec::new(),
+                    },
+                });
+            }
+            ensure(&mut intermediates, &field_path, PVal::Map);
+            let Kind::Message(entry) = fd.kind() else {
+                return Err(ProtoErr::Path("internal: map entry kind".into()));
+            };
+            let key = parse_map_key(&segs[i + 1], &entry.map_entry_key_field().kind())?;
+            let vfd = entry.map_entry_value_field();
+            let mut entry_path = field_path;
+            push_seg(&mut entry_path, &PSeg::MapKey(mkey_of(&key)));
+            if i + 1 == segs.len() - 1 {
+                return Ok(WritePath {
+                    intermediates,
+                    target: Resolved::Node {
+                        node_path: entry_path,
+                        fd: vfd,
+                        oneof_siblings: Vec::new(),
+                    },
+                });
+            }
+            let Kind::Message(sub) = vfd.kind() else {
+                return Err(ProtoErr::Path(format!(
+                    "cannot descend into scalar at '{}'",
+                    segs[i + 2]
+                )));
+            };
+            ensure(&mut intermediates, &entry_path, PVal::Msg);
+            cur = sub;
+            path = entry_path;
+            i += 2;
+            continue;
+        }
+        if fd.is_list() {
+            if last {
+                return Ok(WritePath {
+                    intermediates,
+                    target: Resolved::Node {
+                        node_path: field_path,
+                        fd,
+                        oneof_siblings: Vec::new(),
+                    },
+                });
+            }
+            ensure(&mut intermediates, &field_path, PVal::List);
+            let idx = parse_index(&segs[i + 1])?;
+            let arr = index.arrays.get(&field_path);
+            let len = arr.map_or(0, |a| a.order.len());
+            let elem_is_last = i + 1 == segs.len() - 1;
+            if idx > len || (idx == len && !elem_is_last) {
+                return Ok(WritePath {
+                    intermediates,
+                    target: Resolved::OutOfRange,
+                });
+            }
+            if idx == len {
+                let left = arr.and_then(|a| a.last).unwrap_or(EID_HEAD);
+                return Ok(WritePath {
+                    intermediates,
+                    target: Resolved::Append {
+                        list_path: field_path,
+                        left,
+                        fd,
+                    },
+                });
+            }
+            let eid = arr.expect("idx < len implies arr").order[idx];
+            let mut elem_path = field_path;
+            push_seg(&mut elem_path, &PSeg::Elem(eid));
+            if elem_is_last {
+                return Ok(WritePath {
+                    intermediates,
+                    target: Resolved::Elem { elem_path, fd },
+                });
+            }
+            let Kind::Message(sub) = fd.kind() else {
+                return Err(ProtoErr::Path(format!(
+                    "cannot descend into scalar at '{}'",
+                    segs[i + 2]
+                )));
+            };
+            cur = sub;
+            path = elem_path;
+            i += 2;
+            continue;
+        }
+        // singular field
+        if last {
+            let oneof_siblings = real_oneof(&fd)
+                .map(|o| {
+                    o.fields()
+                        .filter(|s| s.number() != fd.number())
+                        .map(|s| {
+                            let mut p = path.clone();
+                            push_seg(&mut p, &PSeg::Field(s.number()));
+                            p
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            return Ok(WritePath {
+                intermediates,
+                target: Resolved::Node {
+                    node_path: field_path,
+                    fd,
+                    oneof_siblings,
+                },
+            });
+        }
+        let Kind::Message(sub) = fd.kind() else {
+            return Err(ProtoErr::Path(format!(
+                "cannot descend into scalar at '{}'",
+                segs[i + 1]
+            )));
+        };
+        ensure(&mut intermediates, &field_path, PVal::Msg);
+        cur = sub;
+        path = field_path;
+        i += 1;
+    }
 }
 
 /// FNV-1a 64-bit (derived-eid hash; local impl, no dependency).
@@ -841,6 +1098,117 @@ mod tests {
             assert_eq!(fold(&order), baseline, "rotation {rot} diverged");
             order.reverse();
             assert_eq!(fold(&order), baseline, "reversed rotation {rot} diverged");
+        }
+    }
+
+    // -- resolve_path -----------------------------------------------------------
+
+    /// Materialize the torture message and index for resolve_path tests.
+    fn torture_pdoc(pool: &DescriptorPool) -> PDoc {
+        let msg = torture_msg(pool);
+        let recs = decompose_msg(&[], &msg, &mut seq_eids());
+        build_msg(&torture_desc(pool), &as_nodes(&recs)).unwrap()
+    }
+
+    fn segs(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn resolve_singular_scalar_and_nested_message() {
+        let pool = pool();
+        let desc = torture_desc(&pool);
+        let pdoc = torture_pdoc(&pool);
+        // singular scalar `name` (field 1): kind-A node, no intermediates
+        let wp = resolve_path(&desc, &segs(&["name"]), &pdoc.index).unwrap();
+        assert!(wp.intermediates.is_empty());
+        match wp.target {
+            Resolved::Node { node_path, .. } => {
+                assert_eq!(node_path, encode_path(&[PSeg::Field(1)]))
+            }
+            _ => panic!("expected Node"),
+        }
+        // existing nested message field `inner.note` (7.1): no intermediates
+        let wp = resolve_path(&desc, &segs(&["inner", "note"]), &pdoc.index).unwrap();
+        assert!(wp.intermediates.is_empty());
+        match wp.target {
+            Resolved::Node { node_path, .. } => {
+                assert_eq!(node_path, encode_path(&[PSeg::Field(7), PSeg::Field(1)]))
+            }
+            _ => panic!("expected Node"),
+        }
+    }
+
+    #[test]
+    fn resolve_creates_missing_intermediate_markers() {
+        let pool = pool();
+        let desc = torture_desc(&pool);
+        // a message with ONLY `name` set — `inner` has no marker record
+        let mut m = DynamicMessage::new(desc.clone());
+        m.set_field(&desc.get_field(1).unwrap(), Value::String("x".into()));
+        let recs = decompose_msg(&[], &m, &mut seq_eids());
+        let pdoc = build_msg(&desc, &as_nodes(&recs)).unwrap();
+        let wp = resolve_path(&desc, &segs(&["inner", "note"]), &pdoc.index).unwrap();
+        assert_eq!(
+            wp.intermediates,
+            vec![(encode_path(&[PSeg::Field(7)]), PVal::Msg)]
+        );
+    }
+
+    #[test]
+    fn resolve_repeated_replace_append_out_of_range() {
+        let pool = pool();
+        let desc = torture_desc(&pool);
+        let pdoc = torture_pdoc(&pool); // items (field 8) has 2 elements
+        assert!(matches!(
+            resolve_path(&desc, &segs(&["items", "0"]), &pdoc.index)
+                .unwrap()
+                .target,
+            Resolved::Elem { .. }
+        ));
+        assert!(matches!(
+            resolve_path(&desc, &segs(&["items", "2"]), &pdoc.index)
+                .unwrap()
+                .target,
+            Resolved::Append { .. }
+        ));
+        assert!(matches!(
+            resolve_path(&desc, &segs(&["items", "5"]), &pdoc.index)
+                .unwrap()
+                .target,
+            Resolved::OutOfRange
+        ));
+    }
+
+    #[test]
+    fn resolve_map_entry_and_oneof_siblings() {
+        let pool = pool();
+        let desc = torture_desc(&pool);
+        let pdoc = torture_pdoc(&pool); // scores {a,b}, choice=label(13)
+                                        // map entry `scores.a` → Field(9)+MapKey("a")
+        let wp = resolve_path(&desc, &segs(&["scores", "a"]), &pdoc.index).unwrap();
+        match wp.target {
+            Resolved::Node { node_path, .. } => assert_eq!(
+                node_path,
+                encode_path(&[PSeg::Field(9), PSeg::MapKey(MKey::Str(b"a".to_vec()))])
+            ),
+            _ => panic!("expected Node"),
+        }
+        // real oneof member `code` (14): siblings are label(13) + boxed(15)
+        let wp = resolve_path(&desc, &segs(&["code"]), &pdoc.index).unwrap();
+        match wp.target {
+            Resolved::Node { oneof_siblings, .. } => {
+                assert_eq!(oneof_siblings.len(), 2);
+                assert!(oneof_siblings.contains(&encode_path(&[PSeg::Field(13)])));
+                assert!(oneof_siblings.contains(&encode_path(&[PSeg::Field(15)])));
+            }
+            _ => panic!("expected Node"),
+        }
+        // proto3 optional `maybe` (16, synthetic oneof) has NO siblings
+        let wp = resolve_path(&desc, &segs(&["maybe"]), &pdoc.index).unwrap();
+        match wp.target {
+            Resolved::Node { oneof_siblings, .. } => assert!(oneof_siblings.is_empty()),
+            _ => panic!("expected Node"),
         }
     }
 }

@@ -569,6 +569,16 @@ pub(crate) fn onda_ttl_for_keyed(ikey_bytes: &[u8], value: &[u8]) -> Duration {
                 {
                     return Duration::ZERO;
                 }
+                // Proto repeated-element tombstones are RGA anchors too (their
+                // map-key segment tag differs from JSON, so use pdoc's codec).
+                if p.tag == Tag::ProtoField as u8
+                    && matches!(
+                        marekvs_core::pdoc::split_last(p.suffix),
+                        Some((_, marekvs_core::pdoc::PSeg::Elem(_)))
+                    )
+                {
+                    return Duration::ZERO;
+                }
             }
         }
     }

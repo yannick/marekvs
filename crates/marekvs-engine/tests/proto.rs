@@ -988,6 +988,73 @@ async fn setjson_getjson_roundtrip_after_field_edits() {
     assert_eq!(out, out2);
 }
 
+#[tokio::test]
+async fn proto_set_decomposes_to_fmt2() {
+    let (_d, e) = bound_engine().await;
+    let msg = order_bytes("o-1", 995);
+    ok(proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:1", &msg])).await);
+    let info = proto_cmd::info(&e, &a(&[b"PROTO.INFO", b"order:1"])).await;
+    assert_eq!(map_get(&info, "format"), Reply::bulk_str("fields"));
+    // root marker + id + total_cents = 3 records
+    assert_eq!(map_get(&info, "records"), Reply::Int(3));
+    // GET materializes the field records back to the identical wire bytes.
+    assert_eq!(
+        bulk(proto_cmd::get(&e, &a(&[b"PROTO.GET", b"order:1"])).await),
+        msg
+    );
+}
+
+#[tokio::test]
+async fn legacy_fmt1_upgrades_on_setfield() {
+    let (_d, e) = bound_engine().await;
+    let msg = order_bytes("legacy", 42);
+    // A pre-design/18 whole-message (fmt=1) value written directly.
+    write_raw_proto(&e, b"order:leg", "orders", 1, "shop.v1.Order", &msg).await;
+    let info = proto_cmd::info(&e, &a(&[b"PROTO.INFO", b"order:leg"])).await;
+    assert_eq!(map_get(&info, "format"), Reply::bulk_str("whole"));
+    // Readable before any upgrade.
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:leg", b"id"])).await,
+        Reply::Bulk(b"legacy".to_vec())
+    );
+    // One SETFIELD upgrades it to fmt=2 in place.
+    ok(proto_cmd::setfield(&e, &a(&[b"PROTO.SETFIELD", b"order:leg", b"id", b"new"])).await);
+    let info = proto_cmd::info(&e, &a(&[b"PROTO.INFO", b"order:leg"])).await;
+    assert_eq!(map_get(&info, "format"), Reply::bulk_str("fields"));
+    // Edited field changed, untouched field preserved through the upgrade.
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:leg", b"id"])).await,
+        Reply::Bulk(b"new".to_vec())
+    );
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:leg", b"total_cents"])).await,
+        Reply::Int(42)
+    );
+}
+
+#[tokio::test]
+async fn setfield_appends_and_replaces_repeated() {
+    let (_d, e) = bound_engine().await;
+    seed_order(&e, b"order:ap").await; // tags = ["a","b"]
+                                       // index == len appends
+    ok(proto_cmd::setfield(&e, &a(&[b"PROTO.SETFIELD", b"order:ap", b"tags.2", b"c"])).await);
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:ap", b"tags"])).await,
+        Reply::Bulk(br#"["a","b","c"]"#.to_vec())
+    );
+    // index < len replaces in place (RGA order preserved)
+    ok(proto_cmd::setfield(&e, &a(&[b"PROTO.SETFIELD", b"order:ap", b"tags.1", b"B"])).await);
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:ap", b"tags"])).await,
+        Reply::Bulk(br#"["a","B","c"]"#.to_vec())
+    );
+    // index past the end errors
+    assert_err_contains(
+        proto_cmd::setfield(&e, &a(&[b"PROTO.SETFIELD", b"order:ap", b"tags.9", b"x"])).await,
+        "range",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // B6 — validated collection elements: PROTO.HSET/SADD/HGETJSON/HGETFIELD
 // ---------------------------------------------------------------------------
