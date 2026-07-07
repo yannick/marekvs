@@ -19,7 +19,7 @@ pages = ["overview", "quickstart"]
 
 [[section]]
 title = "Core"
-pages = ["architecture", "data-model", "redis-api", "cluster-protocol", "budget", "json"]
+pages = ["architecture", "data-model", "redis-api", "cluster-protocol", "budget", "json", "protobuf"]
 
 [[section]]
 title = "Distributed system"

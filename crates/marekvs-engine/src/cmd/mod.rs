@@ -8,6 +8,7 @@ pub mod hash;
 pub mod hll;
 pub mod json;
 pub mod list;
+pub mod proto;
 pub mod pubsub;
 pub mod script;
 pub mod server;
@@ -107,6 +108,23 @@ pub async fn dispatch(
         "JSON.MERGE" => json::merge(engine, &args).await,
         "JSON.RESP" => json::resp(engine, &args).await,
         "JSON.DEBUG" => json::debug(engine, &args).await,
+        // --- protobuf registry + typed values (PROTO.*, design/17) ---
+        "PROTO.SCHEMA" => proto::schema(engine, &args).await,
+        "PROTO.BIND" => proto::bind(engine, &args).await,
+        "PROTO.UNBIND" => proto::unbind(engine, &args).await,
+        "PROTO.BINDINGS" => proto::bindings_cmd(engine, &args).await,
+        "PROTO.SET" => proto::set(engine, &args).await,
+        "PROTO.GET" => proto::get(engine, &args).await,
+        "PROTO.INFO" => proto::info(engine, &args).await,
+        "PROTO.GETJSON" => proto::getjson(engine, &args).await,
+        "PROTO.SETJSON" => proto::setjson(engine, &args).await,
+        "PROTO.GETFIELD" => proto::getfield(engine, &args).await,
+        "PROTO.SETFIELD" => proto::setfield(engine, &args).await,
+        "PROTO.CLEARFIELD" => proto::clearfield(engine, &args).await,
+        "PROTO.HSET" => proto::hset(engine, &args).await,
+        "PROTO.SADD" => proto::sadd(engine, &args).await,
+        "PROTO.HGETJSON" => proto::hgetjson(engine, &args).await,
+        "PROTO.HGETFIELD" => proto::hgetfield(engine, &args).await,
 
         // --- generic / keyspace ---
         "DEL" | "UNLINK" => generic::del(engine, &args).await,

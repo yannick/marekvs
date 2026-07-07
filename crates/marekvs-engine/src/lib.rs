@@ -3,6 +3,7 @@
 
 pub mod cmd;
 pub mod metrics;
+pub mod proto;
 pub mod pubsub;
 pub mod reply;
 pub mod store;
@@ -238,6 +239,9 @@ pub struct Engine {
     pub budget_reqids: parking_lot::Mutex<cmd::budget::ReqidLru>,
     /// Budgets this boot has cleared the grant-fence for (design/13 fix 4).
     pub budget_grant_ready: parking_lot::Mutex<std::collections::HashSet<Vec<u8>>>,
+    /// Protobuf registry/typed-value state (design/17): limits, descriptor-
+    /// pool LRU, binding cache.
+    pub proto: proto::ProtoState,
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
@@ -304,6 +308,7 @@ impl Engine {
             )
                 as usize)),
             budget_grant_ready: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            proto: proto::ProtoState::from_env(),
         })
     }
 
@@ -482,6 +487,14 @@ impl Engine {
                 | "JSON.TOGGLE"
                 | "JSON.CLEAR"
                 | "JSON.MERGE"
+                | "PROTO.BIND"
+                | "PROTO.UNBIND"
+                | "PROTO.SET"
+                | "PROTO.SETFIELD"
+                | "PROTO.CLEARFIELD"
+                | "PROTO.SETJSON"
+                | "PROTO.HSET"
+                | "PROTO.SADD"
         )
     }
 
@@ -666,6 +679,14 @@ impl Engine {
                 | "JSON.CLEAR"
                 | "JSON.MERGE"
                 | "JSON.RESP"
+                | "PROTO.BIND"
+                | "PROTO.UNBIND"
+                | "PROTO.SET"
+                | "PROTO.SETFIELD"
+                | "PROTO.CLEARFIELD"
+                | "PROTO.SETJSON"
+                | "PROTO.HSET"
+                | "PROTO.SADD"
                 | "PING"
                 | "ECHO"
         )
@@ -837,6 +858,14 @@ mod write_command_tests {
             "JSON.TOGGLE",
             "JSON.CLEAR",
             "JSON.MERGE",
+            "PROTO.BIND",
+            "PROTO.UNBIND",
+            "PROTO.SET",
+            "PROTO.SETFIELD",
+            "PROTO.CLEARFIELD",
+            "PROTO.SETJSON",
+            "PROTO.HSET",
+            "PROTO.SADD",
         ] {
             assert!(Engine::is_write_command(c), "{c} must be write-gated");
         }
@@ -884,6 +913,14 @@ mod write_command_tests {
             "JSON.OBJLEN",
             "JSON.RESP",
             "JSON.DEBUG",
+            "PROTO.SCHEMA",
+            "PROTO.BINDINGS",
+            "PROTO.GET",
+            "PROTO.INFO",
+            "PROTO.GETFIELD",
+            "PROTO.GETJSON",
+            "PROTO.HGETJSON",
+            "PROTO.HGETFIELD",
         ] {
             assert!(!Engine::is_write_command(c), "{c} must not be write-gated");
         }

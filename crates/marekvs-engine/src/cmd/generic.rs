@@ -115,6 +115,7 @@ pub async fn type_cmd(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         Some(head::CTYPE_BUDGET) => "budget",
         // RedisJSON module-type name so type-sniffing clients recognize docs.
         Some(head::CTYPE_JSON) => "ReJSON-RL",
+        Some(head::CTYPE_PROTO) => "proto",
         Some(_) => "none",
     })
 }
@@ -326,12 +327,20 @@ fn set_deadline(ctx: &ShardCtx, key: &[u8], deadline: u64) -> bool {
         }
         // Lists (ctype 5) rewrite the head TTL via the head branch below.
         Some(ctype) => {
-            if let Some((_, t, del)) = get_head(ctx, key) {
+            if let Some((_, t, _)) = get_head(ctx, key) {
                 if t == ctype {
-                    let env = Envelope::head(ctx.hlc.now(), ctx.node_id).with_ttl(deadline);
-                    let val = env.encode_with(&head::encode(ctype, del));
-                    write_merged(ctx, &ikey::head_key(key), &val);
-                    return true;
+                    // Re-encode the FULL existing head payload (ctype +
+                    // del_hlc + any type-specific tail — stream counters,
+                    // proto message bytes) under a fresh envelope; only the
+                    // TTL changes.
+                    if let Some(raw) = get_raw(ctx, &ikey::head_key(key)) {
+                        if let Some((_, pay)) = Envelope::decode(&raw) {
+                            let env = Envelope::head(ctx.hlc.now(), ctx.node_id).with_ttl(deadline);
+                            let val = env.encode_with(pay);
+                            write_merged(ctx, &ikey::head_key(key), &val);
+                            return true;
+                        }
+                    }
                 }
             }
             false
@@ -707,17 +716,31 @@ pub async fn object(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             match sub.as_str() {
                 "REFCOUNT" => Reply::Int(1),
                 "IDLETIME" => Reply::Int(0),
-                "ENCODING" => Reply::bulk_str(match t {
-                    b's' => "raw",
-                    head::CTYPE_HASH => "hashtable",
-                    head::CTYPE_SET => "hashtable",
-                    head::CTYPE_ZSET => "skiplist",
-                    head::CTYPE_LIST => "quicklist",
-                    head::CTYPE_STREAM => "stream",
-                    head::CTYPE_HLL => "raw",
-                    head::CTYPE_JSON => "json",
-                    _ => "raw",
-                }),
+                "ENCODING" => {
+                    if t == head::CTYPE_PROTO {
+                        // Proto values report their fq message type name
+                        // (design/17), read from the head's protohead tail.
+                        let tname = get_raw(ctx, &ikey::head_key(&key))
+                            .and_then(|raw| {
+                                let (_, pay) = Envelope::decode(&raw)?;
+                                let ph = marekvs_core::protohead::decode(pay.get(9..)?)?;
+                                Some(ph.type_name.to_string())
+                            })
+                            .unwrap_or_else(|| "proto".into());
+                        return Reply::bulk_str(tname);
+                    }
+                    Reply::bulk_str(match t {
+                        b's' => "raw",
+                        head::CTYPE_HASH => "hashtable",
+                        head::CTYPE_SET => "hashtable",
+                        head::CTYPE_ZSET => "skiplist",
+                        head::CTYPE_LIST => "quicklist",
+                        head::CTYPE_STREAM => "stream",
+                        head::CTYPE_HLL => "raw",
+                        head::CTYPE_JSON => "json",
+                        _ => "raw",
+                    })
+                }
                 _ => Reply::err("ERR unknown subcommand"),
             }
         })
@@ -807,6 +830,10 @@ fn collect_key_records(ctx: &ShardCtx, key: &[u8]) -> Option<Vec<KeyRecord>> {
                 head::CTYPE_STREAM => ikey::Tag::StreamEntry,
                 head::CTYPE_HLL => ikey::Tag::HllRegister,
                 head::CTYPE_LIST => ikey::Tag::ListElem,
+                // Proto values are head-only (design/17): the head record —
+                // already pushed above with its protohead tail verbatim —
+                // IS the whole value; there are no element records.
+                head::CTYPE_PROTO => return Some(out),
                 _ => return None,
             };
             scan_prefix(ctx, &ikey::collection_prefix(tag, key), |k, v| {

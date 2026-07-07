@@ -167,9 +167,9 @@ pub mod head {
     /// JSON document (design/16): per-path CRDT records under `Tag::Json`.
     /// The head carries only the standard delete clock (no tail).
     pub const CTYPE_JSON: u8 = 8;
-    /// Protobuf-typed value (design/17): head-only record; the tail carries
-    /// the schema reference + validated message bytes (`crate::protohead`).
-    /// Merge is whole-message LWW on the head envelope.
+    /// Protobuf typed value (design/17): HEAD-ONLY record — the head tail is
+    /// the `crate::protohead` codec (schema/version/type + message bytes).
+    /// Whole-message LWW via the ordinary head merge.
     pub const CTYPE_PROTO: u8 = 9;
 
     pub fn encode(ctype: u8, del_hlc: u64) -> Vec<u8> {
