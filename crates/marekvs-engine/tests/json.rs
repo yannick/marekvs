@@ -265,3 +265,500 @@ async fn copy_preserves_source() {
     assert_eq!(read_doc(&e, b"c1").await.unwrap(), v);
     assert_eq!(read_doc(&e, b"c2").await.unwrap(), v);
 }
+
+// ===========================================================================
+// Phase A4: JSON.* command matrix
+// ===========================================================================
+
+use marekvs_engine::cmd::json;
+
+fn bulk(r: &Reply) -> String {
+    match r {
+        Reply::Bulk(b) => String::from_utf8(b.clone()).unwrap(),
+        other => panic!("expected Bulk, got {other:?}"),
+    }
+}
+
+fn jval(r: &Reply) -> serde_json::Value {
+    serde_json::from_str(&bulk(r)).unwrap()
+}
+
+async fn jset(e: &Arc<Engine>, key: &[u8], path: &[u8], val: &[u8]) -> Reply {
+    json::set(e, &a(&[b"JSON.SET", key, path, val])).await
+}
+
+async fn jget(e: &Arc<Engine>, key: &[u8], path: &[u8]) -> Reply {
+    json::get(e, &a(&[b"JSON.GET", key, path])).await
+}
+
+#[tokio::test]
+async fn set_get_roundtrip_root() {
+    let (_d, e) = engine();
+    assert_eq!(
+        jset(&e, b"d", b"$", br#"{"a":1,"b":[true,null,"s"]}"#).await,
+        Reply::Simple("OK")
+    );
+    // legacy root: bare doc
+    assert_eq!(
+        jval(&jget(&e, b"d", b".").await),
+        serde_json::json!({"a":1,"b":[true,null,"s"]})
+    );
+    // $: array of matches
+    assert_eq!(
+        jval(&jget(&e, b"d", b"$").await),
+        serde_json::json!([{"a":1,"b":[true,null,"s"]}])
+    );
+    // no-path form: bare doc
+    assert_eq!(
+        jval(&json::get(&e, &a(&[b"JSON.GET", b"d"])).await),
+        serde_json::json!({"a":1,"b":[true,null,"s"]})
+    );
+    // missing key → Null
+    assert_eq!(jget(&e, b"nope", b"$").await, Reply::Null);
+    // invalid JSON value → error
+    match jset(&e, b"d2", b"$", b"{oops").await {
+        Reply::Err(m) => assert!(m.contains("ERR")),
+        other => panic!("expected Err, got {other:?}"),
+    }
+    // non-root set on missing doc → error
+    match jset(&e, b"d3", b"$.a", b"1").await {
+        Reply::Err(m) => assert!(m.to_lowercase().contains("root"), "{m}"),
+        other => panic!("expected Err, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn set_path_create_update_nx_xx() {
+    let (_d, e) = engine();
+    jset(&e, b"d", b"$", br#"{"a":{"b":1},"arr":[1,2]}"#).await;
+
+    // update existing
+    assert_eq!(jset(&e, b"d", b"$.a.b", b"5").await, Reply::Simple("OK"));
+    assert_eq!(jval(&jget(&e, b"d", b".a.b").await), serde_json::json!(5));
+
+    // create a new key on an existing object
+    assert_eq!(
+        jset(&e, b"d", b"$.a.c", b"\"new\"").await,
+        Reply::Simple("OK")
+    );
+    assert_eq!(
+        jval(&jget(&e, b"d", b".a.c").await),
+        serde_json::json!("new")
+    );
+
+    // missing intermediate → error
+    match jset(&e, b"d", b"$.x.y", b"1").await {
+        Reply::Err(_) => {}
+        other => panic!("expected Err, got {other:?}"),
+    }
+
+    // NX on existing path → Null, no change
+    assert_eq!(
+        json::set(&e, &a(&[b"JSON.SET", b"d", b"$.a.b", b"9", b"NX"])).await,
+        Reply::Null
+    );
+    assert_eq!(jval(&jget(&e, b"d", b".a.b").await), serde_json::json!(5));
+    // XX on new path → Null, not created
+    assert_eq!(
+        json::set(&e, &a(&[b"JSON.SET", b"d", b"$.a.zz", b"9", b"XX"])).await,
+        Reply::Null
+    );
+    // NX on new path → OK
+    assert_eq!(
+        json::set(&e, &a(&[b"JSON.SET", b"d", b"$.a.nx", b"9", b"NX"])).await,
+        Reply::Simple("OK")
+    );
+
+    // subtree replace: object → scalar, then read the old child is gone
+    assert_eq!(jset(&e, b"d", b"$.a", b"7").await, Reply::Simple("OK"));
+    assert_eq!(jval(&jget(&e, b"d", b".a").await), serde_json::json!(7));
+    assert_eq!(jget(&e, b"d", b".a.b").await, Reply::Null);
+
+    // set an array element by index
+    assert_eq!(
+        jset(&e, b"d", b"$.arr[1]", b"22").await,
+        Reply::Simple("OK")
+    );
+    assert_eq!(
+        jval(&jget(&e, b"d", b".arr").await),
+        serde_json::json!([1, 22])
+    );
+
+    // WRONGTYPE fence: a string key
+    marekvs_engine::cmd::string::set(&e, &a(&[b"SET", b"str", b"v"])).await;
+    match jset(&e, b"str", b"$", b"1").await {
+        Reply::Err(m) => assert!(m.starts_with("WRONGTYPE"), "{m}"),
+        other => panic!("expected WRONGTYPE, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn get_multi_path_and_query() {
+    let (_d, e) = engine();
+    jset(&e, b"d", b"$", br#"{"a":{"b":2},"b":3}"#).await;
+    // query multi-match
+    let v = jval(&jget(&e, b"d", b"$..b").await);
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert!(arr.contains(&serde_json::json!(2)) && arr.contains(&serde_json::json!(3)));
+    // multiple paths → object keyed by path arg
+    let v = jval(&json::get(&e, &a(&[b"JSON.GET", b"d", b"$.a.b", b".b"])).await);
+    assert_eq!(v, serde_json::json!({"$.a.b": [2], ".b": 3}));
+    // no match: $ → empty array; legacy → Null
+    assert_eq!(jval(&jget(&e, b"d", b"$.zz").await), serde_json::json!([]));
+    assert_eq!(jget(&e, b"d", b".zz").await, Reply::Null);
+    // INDENT/NEWLINE/SPACE formatting
+    let r = json::get(
+        &e,
+        &a(&[
+            b"JSON.GET",
+            b"d",
+            b"INDENT",
+            b"\t",
+            b"NEWLINE",
+            b"\n",
+            b"SPACE",
+            b" ",
+            b".a",
+        ]),
+    )
+    .await;
+    assert_eq!(bulk(&r), "{\n\t\"b\": 2\n}");
+}
+
+#[tokio::test]
+async fn type_del_clear() {
+    let (_d, e) = engine();
+    jset(
+        &e,
+        b"d",
+        b"$",
+        br#"{"o":{"x":1},"a":[1],"s":"t","i":3,"f":1.5,"t":true,"n":null}"#,
+    )
+    .await;
+
+    assert_eq!(
+        json::type_cmd(&e, &a(&[b"JSON.TYPE", b"d", b".o"])).await,
+        Reply::bulk_str("object")
+    );
+    assert_eq!(
+        json::type_cmd(&e, &a(&[b"JSON.TYPE", b"d", b".a"])).await,
+        Reply::bulk_str("array")
+    );
+    assert_eq!(
+        json::type_cmd(&e, &a(&[b"JSON.TYPE", b"d", b".s"])).await,
+        Reply::bulk_str("string")
+    );
+    assert_eq!(
+        json::type_cmd(&e, &a(&[b"JSON.TYPE", b"d", b".i"])).await,
+        Reply::bulk_str("integer")
+    );
+    assert_eq!(
+        json::type_cmd(&e, &a(&[b"JSON.TYPE", b"d", b".f"])).await,
+        Reply::bulk_str("number")
+    );
+    assert_eq!(
+        json::type_cmd(&e, &a(&[b"JSON.TYPE", b"d", b".t"])).await,
+        Reply::bulk_str("boolean")
+    );
+    assert_eq!(
+        json::type_cmd(&e, &a(&[b"JSON.TYPE", b"d", b".n"])).await,
+        Reply::bulk_str("null")
+    );
+    assert_eq!(
+        json::type_cmd(&e, &a(&[b"JSON.TYPE", b"d", b"$.i"])).await,
+        Reply::Array(vec![Reply::bulk_str("integer")])
+    );
+    // default path = root
+    assert_eq!(
+        json::type_cmd(&e, &a(&[b"JSON.TYPE", b"d"])).await,
+        Reply::bulk_str("object")
+    );
+
+    // DEL a subtree
+    assert_eq!(
+        json::del(&e, &a(&[b"JSON.DEL", b"d", b"$.o"])).await,
+        Reply::Int(1)
+    );
+    assert_eq!(jget(&e, b"d", b".o").await, Reply::Null);
+    // the rest of the doc is intact
+    assert_eq!(jval(&jget(&e, b"d", b".i").await), serde_json::json!(3));
+    // DEL missing path → 0
+    assert_eq!(
+        json::del(&e, &a(&[b"JSON.DEL", b"d", b"$.o"])).await,
+        Reply::Int(0)
+    );
+    // root DEL deletes the doc
+    assert_eq!(json::del(&e, &a(&[b"JSON.DEL", b"d"])).await, Reply::Int(1));
+    assert_eq!(jget(&e, b"d", b"$").await, Reply::Null);
+    // DEL on a missing key → 0
+    assert_eq!(json::del(&e, &a(&[b"JSON.DEL", b"d"])).await, Reply::Int(0));
+
+    // CLEAR: containers emptied, numbers zeroed, strings/bools untouched
+    jset(
+        &e,
+        b"c",
+        b"$",
+        br#"{"o":{"x":1},"a":[1,2],"i":7,"s":"keep"}"#,
+    )
+    .await;
+    assert_eq!(
+        json::clear(&e, &a(&[b"JSON.CLEAR", b"c", b"$.*"])).await,
+        Reply::Int(3)
+    );
+    assert_eq!(
+        jval(&jget(&e, b"c", b".").await),
+        serde_json::json!({"o":{},"a":[],"i":0,"s":"keep"})
+    );
+}
+
+#[tokio::test]
+async fn num_ops() {
+    let (_d, e) = engine();
+    jset(
+        &e,
+        b"d",
+        b"$",
+        br#"{"i":4,"f":2.5,"s":"x","nest":{"i":10}}"#,
+    )
+    .await;
+
+    // legacy: bare number string
+    assert_eq!(
+        bulk(&json::numop(&e, &a(&[b"JSON.NUMINCRBY", b"d", b".i", b"3"]), false).await),
+        "7"
+    );
+    // $: JSON array of results
+    assert_eq!(
+        bulk(&json::numop(&e, &a(&[b"JSON.NUMINCRBY", b"d", b"$.i", b"1"]), false).await),
+        "[8]"
+    );
+    // float result
+    assert_eq!(
+        bulk(&json::numop(&e, &a(&[b"JSON.NUMINCRBY", b"d", b".f", b"0.5"]), false).await),
+        "3"
+    );
+    // multiply
+    assert_eq!(
+        bulk(&json::numop(&e, &a(&[b"JSON.NUMMULTBY", b"d", b".i", b"2"]), true).await),
+        "16"
+    );
+    // multi-match with a non-number → null slot
+    let r = json::numop(&e, &a(&[b"JSON.NUMINCRBY", b"d", b"$..i", b"1"]), false).await;
+    let v: serde_json::Value = serde_json::from_str(&bulk(&r)).unwrap();
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    // legacy on a non-number → error
+    match json::numop(&e, &a(&[b"JSON.NUMINCRBY", b"d", b".s", b"1"]), false).await {
+        Reply::Err(_) => {}
+        other => panic!("expected Err, got {other:?}"),
+    }
+    // persisted
+    assert_eq!(jval(&jget(&e, b"d", b".i").await), serde_json::json!(17));
+}
+
+#[tokio::test]
+async fn str_ops_and_toggle() {
+    let (_d, e) = engine();
+    jset(&e, b"d", b"$", br#"{"s":"abc","b":true,"n":5}"#).await;
+
+    // STRLEN
+    assert_eq!(
+        json::strlen(&e, &a(&[b"JSON.STRLEN", b"d", b".s"])).await,
+        Reply::Int(3)
+    );
+    assert_eq!(
+        json::strlen(&e, &a(&[b"JSON.STRLEN", b"d", b"$.s"])).await,
+        Reply::Array(vec![Reply::Int(3)])
+    );
+    // STRAPPEND takes a JSON-encoded string
+    assert_eq!(
+        json::strappend(&e, &a(&[b"JSON.STRAPPEND", b"d", b".s", b"\"de\""])).await,
+        Reply::Int(5)
+    );
+    assert_eq!(
+        jval(&jget(&e, b"d", b".s").await),
+        serde_json::json!("abcde")
+    );
+    // $ non-string match → null slot
+    assert_eq!(
+        json::strappend(&e, &a(&[b"JSON.STRAPPEND", b"d", b"$.n", b"\"x\""])).await,
+        Reply::Array(vec![Reply::Null])
+    );
+
+    // TOGGLE: legacy → "false"/"true" strings; $ → 0/1 ints
+    assert_eq!(
+        json::toggle(&e, &a(&[b"JSON.TOGGLE", b"d", b".b"])).await,
+        Reply::bulk_str("false")
+    );
+    assert_eq!(
+        json::toggle(&e, &a(&[b"JSON.TOGGLE", b"d", b"$.b"])).await,
+        Reply::Array(vec![Reply::Int(1)])
+    );
+    assert_eq!(jval(&jget(&e, b"d", b".b").await), serde_json::json!(true));
+}
+
+#[tokio::test]
+async fn arr_ops() {
+    let (_d, e) = engine();
+    jset(&e, b"d", b"$", br#"{"a":[1,2,3]}"#).await;
+
+    // ARRLEN
+    assert_eq!(
+        json::arrlen(&e, &a(&[b"JSON.ARRLEN", b"d", b".a"])).await,
+        Reply::Int(3)
+    );
+    // ARRAPPEND
+    assert_eq!(
+        json::arrappend(&e, &a(&[b"JSON.ARRAPPEND", b"d", b".a", b"4", b"5"])).await,
+        Reply::Int(5)
+    );
+    assert_eq!(
+        jval(&jget(&e, b"d", b".a").await),
+        serde_json::json!([1, 2, 3, 4, 5])
+    );
+    // ARRINDEX
+    assert_eq!(
+        json::arrindex(&e, &a(&[b"JSON.ARRINDEX", b"d", b".a", b"4"])).await,
+        Reply::Int(3)
+    );
+    assert_eq!(
+        json::arrindex(&e, &a(&[b"JSON.ARRINDEX", b"d", b".a", b"99"])).await,
+        Reply::Int(-1)
+    );
+    // ARRINSERT before index 1
+    assert_eq!(
+        json::arrinsert(&e, &a(&[b"JSON.ARRINSERT", b"d", b".a", b"1", b"\"x\""])).await,
+        Reply::Int(6)
+    );
+    assert_eq!(
+        jval(&jget(&e, b"d", b".a").await),
+        serde_json::json!([1, "x", 2, 3, 4, 5])
+    );
+    // ARRPOP default last
+    assert_eq!(
+        bulk(&json::arrpop(&e, &a(&[b"JSON.ARRPOP", b"d", b".a"])).await),
+        "5"
+    );
+    // ARRPOP index 0
+    assert_eq!(
+        bulk(&json::arrpop(&e, &a(&[b"JSON.ARRPOP", b"d", b".a", b"0"])).await),
+        "1"
+    );
+    assert_eq!(
+        jval(&jget(&e, b"d", b".a").await),
+        serde_json::json!(["x", 2, 3, 4])
+    );
+    // ARRTRIM to [1,2]
+    assert_eq!(
+        json::arrtrim(&e, &a(&[b"JSON.ARRTRIM", b"d", b".a", b"1", b"2"])).await,
+        Reply::Int(2)
+    );
+    assert_eq!(
+        jval(&jget(&e, b"d", b".a").await),
+        serde_json::json!([2, 3])
+    );
+    // pop from empty
+    json::arrtrim(&e, &a(&[b"JSON.ARRTRIM", b"d", b".a", b"1", b"0"])).await;
+    assert_eq!(
+        json::arrpop(&e, &a(&[b"JSON.ARRPOP", b"d", b".a"])).await,
+        Reply::Null
+    );
+    // nested container append round-trips
+    jset(&e, b"d", b"$.a", br#"[]"#).await;
+    assert_eq!(
+        json::arrappend(&e, &a(&[b"JSON.ARRAPPEND", b"d", b".a", br#"{"k":[1]}"#])).await,
+        Reply::Int(1)
+    );
+    assert_eq!(
+        jval(&jget(&e, b"d", b".a").await),
+        serde_json::json!([{"k":[1]}])
+    );
+}
+
+#[tokio::test]
+async fn obj_ops_mget_mset_merge_resp_debug() {
+    let (_d, e) = engine();
+    jset(&e, b"d", b"$", br#"{"o":{"b":1,"a":2},"i":5}"#).await;
+
+    // OBJKEYS lexicographic
+    assert_eq!(
+        json::objkeys(&e, &a(&[b"JSON.OBJKEYS", b"d", b".o"])).await,
+        Reply::Array(vec![Reply::bulk_str("a"), Reply::bulk_str("b")])
+    );
+    assert_eq!(
+        json::objlen(&e, &a(&[b"JSON.OBJLEN", b"d", b".o"])).await,
+        Reply::Int(2)
+    );
+    // non-object → Null
+    assert_eq!(
+        json::objkeys(&e, &a(&[b"JSON.OBJKEYS", b"d", b".i"])).await,
+        Reply::Null
+    );
+
+    // MSET + MGET
+    assert_eq!(
+        json::mset(
+            &e,
+            &a(&[
+                b"JSON.MSET",
+                b"m1",
+                b"$",
+                b"{\"v\":1}",
+                b"m2",
+                b"$",
+                b"{\"v\":2}"
+            ])
+        )
+        .await,
+        Reply::Simple("OK")
+    );
+    let r = json::mget(&e, &a(&[b"JSON.MGET", b"m1", b"m2", b"nope", b"$.v"])).await;
+    match r {
+        Reply::Array(items) => {
+            assert_eq!(items.len(), 3);
+            assert_eq!(items[0], Reply::bulk_str("[1]"));
+            assert_eq!(items[1], Reply::bulk_str("[2]"));
+            assert_eq!(items[2], Reply::Null);
+        }
+        other => panic!("expected Array, got {other:?}"),
+    }
+
+    // MERGE (RFC 7386): update + delete-by-null + add
+    assert_eq!(
+        json::merge(
+            &e,
+            &a(&[
+                b"JSON.MERGE",
+                b"d",
+                b"$",
+                br#"{"o":{"a":null,"c":3},"i":6}"#
+            ])
+        )
+        .await,
+        Reply::Simple("OK")
+    );
+    assert_eq!(
+        jval(&jget(&e, b"d", b".").await),
+        serde_json::json!({"o":{"b":1,"c":3},"i":6})
+    );
+
+    // RESP encoding
+    let r = json::resp(&e, &a(&[b"JSON.RESP", b"d", b".o"])).await;
+    match r {
+        Reply::Array(items) => {
+            assert_eq!(items[0], Reply::bulk_str("{"));
+        }
+        other => panic!("expected Array, got {other:?}"),
+    }
+
+    // DEBUG
+    match json::debug(&e, &a(&[b"JSON.DEBUG", b"MEMORY", b"d"])).await {
+        Reply::Int(n) => assert!(n > 0),
+        other => panic!("expected Int, got {other:?}"),
+    }
+    match json::debug(&e, &a(&[b"JSON.DEBUG", b"HELP"])).await {
+        Reply::Array(_) => {}
+        other => panic!("expected Array, got {other:?}"),
+    }
+}

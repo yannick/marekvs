@@ -1350,6 +1350,7 @@ dependencies = [
  "ondadb",
  "parking_lot",
  "prometheus",
+ "serde",
  "serde_json",
  "serde_json_path",
  "sha1_smol",

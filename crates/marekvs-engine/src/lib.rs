@@ -468,6 +468,20 @@ impl Engine {
                 | "BG.RELEASE"
                 | "BG.DRAW"
                 | "BG.RECLAIM"
+                | "JSON.SET"
+                | "JSON.MSET"
+                | "JSON.DEL"
+                | "JSON.FORGET"
+                | "JSON.NUMINCRBY"
+                | "JSON.NUMMULTBY"
+                | "JSON.STRAPPEND"
+                | "JSON.ARRAPPEND"
+                | "JSON.ARRINSERT"
+                | "JSON.ARRPOP"
+                | "JSON.ARRTRIM"
+                | "JSON.TOGGLE"
+                | "JSON.CLEAR"
+                | "JSON.MERGE"
         )
     }
 
@@ -629,6 +643,29 @@ impl Engine {
                 | "BG.RELEASE"
                 | "BG.DRAW"
                 | "BG.INFO"
+                | "JSON.SET"
+                | "JSON.GET"
+                | "JSON.MGET"
+                | "JSON.MSET"
+                | "JSON.DEL"
+                | "JSON.FORGET"
+                | "JSON.TYPE"
+                | "JSON.NUMINCRBY"
+                | "JSON.NUMMULTBY"
+                | "JSON.STRAPPEND"
+                | "JSON.STRLEN"
+                | "JSON.ARRAPPEND"
+                | "JSON.ARRINDEX"
+                | "JSON.ARRINSERT"
+                | "JSON.ARRLEN"
+                | "JSON.ARRPOP"
+                | "JSON.ARRTRIM"
+                | "JSON.OBJKEYS"
+                | "JSON.OBJLEN"
+                | "JSON.TOGGLE"
+                | "JSON.CLEAR"
+                | "JSON.MERGE"
+                | "JSON.RESP"
                 | "PING"
                 | "ECHO"
         )
@@ -786,6 +823,20 @@ mod write_command_tests {
             "BG.COMMIT",
             "BG.RELEASE",
             "BG.DRAW",
+            "JSON.SET",
+            "JSON.MSET",
+            "JSON.DEL",
+            "JSON.FORGET",
+            "JSON.NUMINCRBY",
+            "JSON.NUMMULTBY",
+            "JSON.STRAPPEND",
+            "JSON.ARRAPPEND",
+            "JSON.ARRINSERT",
+            "JSON.ARRPOP",
+            "JSON.ARRTRIM",
+            "JSON.TOGGLE",
+            "JSON.CLEAR",
+            "JSON.MERGE",
         ] {
             assert!(Engine::is_write_command(c), "{c} must be write-gated");
         }
@@ -823,6 +874,16 @@ mod write_command_tests {
             "SHUTDOWN",
             "REPLICAOF",
             "BG.INFO",
+            "JSON.GET",
+            "JSON.MGET",
+            "JSON.TYPE",
+            "JSON.STRLEN",
+            "JSON.ARRINDEX",
+            "JSON.ARRLEN",
+            "JSON.OBJKEYS",
+            "JSON.OBJLEN",
+            "JSON.RESP",
+            "JSON.DEBUG",
         ] {
             assert!(!Engine::is_write_command(c), "{c} must not be write-gated");
         }

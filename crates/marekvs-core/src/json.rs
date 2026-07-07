@@ -313,7 +313,7 @@ pub fn decompose(
 }
 
 /// The scalar/container marker for a value (containers carry no data).
-fn jval_of(v: &serde_json::Value) -> JVal {
+pub fn jval_of(v: &serde_json::Value) -> JVal {
     match v {
         serde_json::Value::Null => JVal::Null,
         serde_json::Value::Bool(b) => JVal::Bool(*b),
@@ -339,6 +339,20 @@ fn decompose_into(
         val: jval_of(v),
     });
     decompose_children(path, v, fresh, out);
+}
+
+/// Child records of container value `v` under the node at `base_path`. The
+/// node's own record is NOT emitted — the caller writes it (it may be a map
+/// entry or an array element).
+pub fn decompose_children_at(
+    base_path: &[u8],
+    v: &serde_json::Value,
+    fresh: &mut dyn FnMut() -> Eid,
+) -> Vec<JsonRecord> {
+    let mut out = Vec::new();
+    let mut path = base_path.to_vec();
+    decompose_children(&mut path, v, fresh, &mut out);
+    out
 }
 
 /// Emit the child records of a container (nothing for scalars). The
@@ -740,6 +754,25 @@ mod tests {
                     }
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn decompose_children_at_omits_the_node_record() {
+        let mut fresh = counter_eids();
+        let base = encode_path(&[f("k")]);
+        let recs = decompose_children_at(&base, &json!({"a": 1}), &mut fresh);
+        // only the child record — the caller writes the node at `base` itself
+        assert_eq!(
+            recs,
+            vec![JsonRecord::Map {
+                path: encode_path(&[f("k"), f("a")]),
+                val: JVal::Int(1)
+            }]
+        );
+        assert_eq!(
+            decompose_children_at(&base, &json!(42), &mut fresh),
+            Vec::<JsonRecord>::new()
         );
     }
 
