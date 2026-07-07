@@ -432,6 +432,269 @@ fn ok(r: Reply) {
     assert_eq!(r, Reply::Simple("OK"));
 }
 
+// ---------------------------------------------------------------------------
+// B4 — typed values: PROTO.SET/GET/INFO/GETJSON/SETJSON
+// ---------------------------------------------------------------------------
+
+/// Build encoded `shop.v1.Order` bytes without going through the server.
+fn order_bytes(id: &str, cents: u64) -> Vec<u8> {
+    use prost::Message;
+    let out = marekvs_engine::proto::compile::compile_source(
+        "orders",
+        ORDER_SRC,
+        Default::default(),
+        &marekvs_engine::proto::ProtoLimits::from_env(),
+    )
+    .unwrap();
+    let pool = marekvs_engine::proto::compile::pool_from_fds(&out.fds).unwrap();
+    let desc = pool.get_message_by_name("shop.v1.Order").unwrap();
+    let mut m = prost_reflect::DynamicMessage::new(desc);
+    m.set_field_by_name("id", prost_reflect::Value::String(id.into()));
+    m.set_field_by_name("total_cents", prost_reflect::Value::U64(cents));
+    m.encode_to_vec()
+}
+
+/// Registry + binding fixture: schema "orders" bound to prefix "order:".
+async fn bound_engine() -> (tempfile::TempDir, Arc<Engine>) {
+    let (d, e) = engine();
+    assert_eq!(int(schema_set_source(&e, b"orders", ORDER_SRC).await), 1);
+    ok(proto_cmd::bind(&e, &a(&[b"PROTO.BIND", b"order:", b"shop.v1.Order"])).await);
+    (d, e)
+}
+
+#[tokio::test]
+async fn proto_set_get_info_via_binding() {
+    let (_d, e) = bound_engine().await;
+    let msg = order_bytes("o-1", 995);
+    ok(proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:1", &msg])).await);
+    assert_eq!(bulk(proto_cmd::get(&e, &a(&[b"PROTO.GET", b"order:1"])).await), msg);
+    assert_eq!(simple(generic::type_cmd(&e, &a(&[b"TYPE", b"order:1"])).await), "proto");
+    assert_eq!(
+        bulk(generic::object(&e, &a(&[b"OBJECT", b"ENCODING", b"order:1"])).await),
+        b"shop.v1.Order"
+    );
+    let info = proto_cmd::info(&e, &a(&[b"PROTO.INFO", b"order:1"])).await;
+    assert_eq!(map_get(&info, "schema"), Reply::bulk_str("orders"));
+    assert_eq!(map_get(&info, "version"), Reply::Int(1));
+    assert_eq!(map_get(&info, "type"), Reply::bulk_str("shop.v1.Order"));
+    assert_eq!(map_get(&info, "bytes"), Reply::Int(msg.len() as i64));
+    // Absent keys → Null / err
+    assert_eq!(proto_cmd::get(&e, &a(&[b"PROTO.GET", b"order:none"])).await, Reply::Null);
+    assert_err_contains(
+        proto_cmd::info(&e, &a(&[b"PROTO.INFO", b"order:none"])).await,
+        "no such key",
+    );
+}
+
+#[tokio::test]
+async fn proto_set_type_arg_overrides_and_nobinding_errors() {
+    let (_d, e) = bound_engine().await;
+    let msg = order_bytes("o-2", 1);
+    // Key outside any binding: TYPE arg required.
+    assert_err_contains(
+        proto_cmd::set(&e, &a(&[b"PROTO.SET", b"free:1", &msg])).await,
+        "NOBINDING",
+    );
+    ok(proto_cmd::set(
+        &e,
+        &a(&[b"PROTO.SET", b"free:1", &msg, b"TYPE", b"shop.v1.Order"]),
+    )
+    .await);
+    assert_eq!(
+        bulk(generic::object(&e, &a(&[b"OBJECT", b"ENCODING", b"free:1"])).await),
+        b"shop.v1.Order"
+    );
+    // Unknown TYPE errors.
+    assert_err_contains(
+        proto_cmd::set(&e, &a(&[b"PROTO.SET", b"free:2", &msg, b"TYPE", b"no.Type"])).await,
+        "NOSCHEMA",
+    );
+}
+
+#[tokio::test]
+async fn proto_set_validates_bytes() {
+    let (_d, e) = bound_engine().await;
+    assert_err_contains(
+        proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:1", b"\xff\xff\xff\xff\xff"])).await,
+        "PROTOVALIDATE",
+    );
+    assert_eq!(proto_cmd::get(&e, &a(&[b"PROTO.GET", b"order:1"])).await, Reply::Null);
+}
+
+#[tokio::test]
+async fn proto_wrongtype_and_plain_set_shadowing() {
+    let (_d, e) = bound_engine().await;
+    let msg = order_bytes("o", 1);
+
+    // A string under the key: PROTO.SET/GET are WRONGTYPE.
+    use marekvs_engine::cmd::string as string_cmd;
+    ok(string_cmd::set(&e, &a(&[b"SET", b"order:s", b"plain"])).await);
+    assert_err_contains(
+        proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:s", &msg])).await,
+        "WRONGTYPE",
+    );
+    assert_err_contains(
+        proto_cmd::get(&e, &a(&[b"PROTO.GET", b"order:s"])).await,
+        "WRONGTYPE",
+    );
+
+    // A hash under the key blocks PROTO.SET too.
+    use marekvs_engine::cmd::hash as hash_cmd;
+    hash_cmd::hset(&e, &a(&[b"HSET", b"order:h", b"f", b"v"]), false).await;
+    assert_err_contains(
+        proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:h", &msg])).await,
+        "WRONGTYPE",
+    );
+
+    // Plain SET shadows an existing proto value (standard Redis semantics).
+    ok(proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:p", &msg])).await);
+    ok(string_cmd::set(&e, &a(&[b"SET", b"order:p", b"shadow"])).await);
+    assert_eq!(simple(generic::type_cmd(&e, &a(&[b"TYPE", b"order:p"])).await), "string");
+    assert_err_contains(
+        proto_cmd::get(&e, &a(&[b"PROTO.GET", b"order:p"])).await,
+        "WRONGTYPE",
+    );
+}
+
+#[tokio::test]
+async fn proto_set_nx_xx() {
+    let (_d, e) = bound_engine().await;
+    let msg = order_bytes("o", 1);
+    assert_eq!(
+        proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:1", &msg, b"XX"])).await,
+        Reply::Null
+    );
+    ok(proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:1", &msg, b"NX"])).await);
+    assert_eq!(
+        proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:1", &msg, b"NX"])).await,
+        Reply::Null
+    );
+    ok(proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:1", &msg, b"XX"])).await);
+    // NX+XX is a syntax error.
+    assert_err_contains(
+        proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:1", &msg, b"NX", b"XX"])).await,
+        "syntax",
+    );
+}
+
+#[tokio::test]
+async fn proto_set_ttl_options() {
+    let (_d, e) = bound_engine().await;
+    let msg = order_bytes("o", 1);
+    ok(proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:t", &msg, b"EX", b"100"])).await);
+    let ttl = int(generic::ttl(&e, &a(&[b"TTL", b"order:t"]), false).await);
+    assert!(ttl > 90 && ttl <= 100, "ttl {ttl}");
+    // Overwrite without KEEPTTL clears the TTL…
+    ok(proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:t", &msg])).await);
+    assert_eq!(int(generic::ttl(&e, &a(&[b"TTL", b"order:t"]), false).await), -1);
+    // …and KEEPTTL retains it.
+    ok(proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:t", &msg, b"PX", b"90000"])).await);
+    ok(proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:t", &msg, b"KEEPTTL"])).await);
+    let ttl = int(generic::ttl(&e, &a(&[b"TTL", b"order:t"]), false).await);
+    assert!(ttl > 0, "ttl {ttl}");
+}
+
+#[tokio::test]
+async fn proto_json_roundtrip() {
+    let (_d, e) = bound_engine().await;
+    let json = br#"{"id":"o-9","totalCents":"1234","tags":["a"],"paid":true}"#;
+    ok(proto_cmd::setjson(&e, &a(&[b"PROTO.SETJSON", b"order:j", json])).await);
+    let out = bulk(proto_cmd::getjson(&e, &a(&[b"PROTO.GETJSON", b"order:j"])).await);
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["id"], "o-9");
+    assert_eq!(v["totalCents"], "1234"); // canonical: u64 as string
+    assert_eq!(v["paid"], true);
+    assert_eq!(v["tags"][0], "a");
+    // The stored value is real protobuf bytes.
+    let raw = bulk(proto_cmd::get(&e, &a(&[b"PROTO.GET", b"order:j"])).await);
+    assert!(!raw.is_empty());
+    // Bad JSON → PROTOVALIDATE.
+    assert_err_contains(
+        proto_cmd::setjson(&e, &a(&[b"PROTO.SETJSON", b"order:j", b"{nope"])).await,
+        "PROTOVALIDATE",
+    );
+    assert_err_contains(
+        proto_cmd::setjson(&e, &a(&[b"PROTO.SETJSON", b"order:j", br#"{"nosuch":1}"#])).await,
+        "PROTOVALIDATE",
+    );
+    // GETJSON on a plain string key → WRONGTYPE.
+    use marekvs_engine::cmd::string as string_cmd;
+    ok(string_cmd::set(&e, &a(&[b"SET", b"order:js", b"x"])).await);
+    assert_err_contains(
+        proto_cmd::getjson(&e, &a(&[b"PROTO.GETJSON", b"order:js"])).await,
+        "WRONGTYPE",
+    );
+}
+
+#[tokio::test]
+async fn proto_lww_converges_in_both_orders() {
+    let (_d, e) = bound_engine().await;
+    // Two competing head records with distinct versions, applied in both
+    // orders to two fresh keys — the stored bytes must converge.
+    let m1 = order_bytes("first", 1);
+    let m2 = order_bytes("second", 2);
+    let mk = |hlc: u64, origin: u16, msg: &[u8]| {
+        let mut payload = head::encode(head::CTYPE_PROTO, 0);
+        payload.extend_from_slice(&protohead::encode("orders", 1, "shop.v1.Order", msg));
+        Envelope::head(hlc, origin).encode_with(&payload)
+    };
+    let (a_rec, b_rec) = (mk(1000 << 16, 3, &m1), mk(2000 << 16, 2, &m2));
+    let (ra, rb) = (a_rec.clone(), b_rec.clone());
+    e.store
+        .run_key(b"cvg:1", move |ctx| {
+            write_merged(ctx, &ikey::head_key(b"cvg:1"), &ra);
+            write_merged(ctx, &ikey::head_key(b"cvg:1"), &rb);
+        })
+        .await;
+    let (ra, rb) = (a_rec.clone(), b_rec.clone());
+    e.store
+        .run_key(b"cvg:2", move |ctx| {
+            write_merged(ctx, &ikey::head_key(b"cvg:2"), &rb);
+            write_merged(ctx, &ikey::head_key(b"cvg:2"), &ra);
+        })
+        .await;
+    let v1 = e
+        .store
+        .run_key(b"cvg:1", |ctx| {
+            marekvs_engine::store::get_raw(ctx, &ikey::head_key(b"cvg:1")).unwrap()
+        })
+        .await;
+    let v2 = e
+        .store
+        .run_key(b"cvg:2", |ctx| {
+            marekvs_engine::store::get_raw(ctx, &ikey::head_key(b"cvg:2")).unwrap()
+        })
+        .await;
+    assert_eq!(v1, v2, "merge must be order-independent");
+    // The winner is the higher-HLC record (m2).
+    let (_, pay) = Envelope::decode(&v1).unwrap();
+    let ph = protohead::decode(&pay[9..]).unwrap();
+    assert_eq!(ph.msg, &m2[..]);
+}
+
+#[tokio::test]
+async fn proto_del_recreate_keeps_delete_clock() {
+    let (_d, e) = bound_engine().await;
+    let msg = order_bytes("o", 1);
+    ok(proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:d", &msg])).await);
+    assert_eq!(int(generic::del(&e, &a(&[b"DEL", b"order:d"])).await), 1);
+    let msg2 = order_bytes("o2", 2);
+    ok(proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:d", &msg2])).await);
+    assert_eq!(bulk(proto_cmd::get(&e, &a(&[b"PROTO.GET", b"order:d"])).await), msg2);
+    // The re-created head must carry a non-zero delete clock (design/02
+    // carry-forward: stale pre-delete records may not resurrect).
+    let raw = e
+        .store
+        .run_key(b"order:d", |ctx| {
+            marekvs_engine::store::get_raw(ctx, &ikey::head_key(b"order:d")).unwrap()
+        })
+        .await;
+    let (_, pay) = Envelope::decode(&raw).unwrap();
+    let (ctype, del_hlc) = head::decode(pay).unwrap();
+    assert_eq!(ctype, head::CTYPE_PROTO);
+    assert!(del_hlc > 0, "delete clock must carry forward");
+}
+
 #[tokio::test]
 async fn expire_preserves_proto_tail() {
     let (_d, e) = engine();

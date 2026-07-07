@@ -7,12 +7,17 @@
 
 use std::sync::Arc;
 
-use crate::cmd::eq_ignore_case;
+use prost::Message;
+use prost_reflect::DynamicMessage;
+
+use crate::cmd::{eq_ignore_case, parse_u64};
 use crate::proto::{compile, registry, ProtoErr};
 use crate::pubsub::glob_match;
 use crate::reply::Reply;
-use crate::store::now_ms;
+use crate::store::{get_head, get_raw, now_ms, read_lww, write_merged, ShardCtx};
 use crate::Engine;
+use marekvs_core::envelope::{head, Envelope};
+use marekvs_core::{ikey, protohead};
 
 /// Reasonable cap on registry schema names.
 const MAX_NAME: usize = 255;
@@ -316,6 +321,312 @@ pub async fn unbind(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         return Reply::wrong_args("proto.unbind");
     }
     Reply::Int(registry::remove_binding(engine, &args[1]).await as i64)
+}
+
+// ---------------------------------------------------------------------------
+// typed values: PROTO.SET / GET / INFO / GETJSON / SETJSON
+// ---------------------------------------------------------------------------
+
+/// Options shared by PROTO.SET and PROTO.SETJSON.
+#[derive(Default)]
+struct SetOpts {
+    type_name: Option<String>,
+    nx: bool,
+    xx: bool,
+    keepttl: bool,
+    /// Absolute TTL deadline in ms.
+    ttl: Option<u64>,
+}
+
+fn parse_set_opts(args: &[Vec<u8>], mut i: usize) -> Result<SetOpts, Reply> {
+    let mut o = SetOpts::default();
+    let now = now_ms();
+    while i < args.len() {
+        let arg = &args[i];
+        if eq_ignore_case(arg, "TYPE") {
+            let Some(t) = args.get(i + 1) else {
+                return Err(Reply::syntax());
+            };
+            let Ok(t) = String::from_utf8(t.clone()) else {
+                return Err(Reply::err("ERR type name must be utf-8"));
+            };
+            o.type_name = Some(t);
+            i += 1;
+        } else if eq_ignore_case(arg, "NX") {
+            o.nx = true;
+        } else if eq_ignore_case(arg, "XX") {
+            o.xx = true;
+        } else if eq_ignore_case(arg, "KEEPTTL") {
+            o.keepttl = true;
+        } else if eq_ignore_case(arg, "EX") || eq_ignore_case(arg, "PX") {
+            let Some(n) = args.get(i + 1).and_then(|b| parse_u64(b)) else {
+                return Err(Reply::not_int());
+            };
+            if n == 0 {
+                return Err(Reply::err("ERR invalid expire time in 'proto.set' command"));
+            }
+            let mult = if eq_ignore_case(arg, "EX") { 1000 } else { 1 };
+            o.ttl = Some(now + n * mult);
+            i += 1;
+        } else if eq_ignore_case(arg, "EXAT") || eq_ignore_case(arg, "PXAT") {
+            let Some(n) = args.get(i + 1).and_then(|b| parse_u64(b)) else {
+                return Err(Reply::not_int());
+            };
+            let mult = if eq_ignore_case(arg, "EXAT") { 1000 } else { 1 };
+            o.ttl = Some(n * mult);
+            i += 1;
+        } else {
+            return Err(Reply::syntax());
+        }
+        i += 1;
+    }
+    if o.nx && o.xx {
+        return Err(Reply::syntax());
+    }
+    Ok(o)
+}
+
+/// Shard-side read of a key's proto head. `Err(())` = WRONGTYPE (a live
+/// string, legacy list blob or other collection holds the key);
+/// `Ok(None)` = absent. Returns (envelope, del_hlc, protohead tail).
+fn read_proto_head(ctx: &ShardCtx, key: &[u8]) -> Result<Option<(Envelope, u64, Vec<u8>)>, ()> {
+    if read_lww(ctx, &ikey::string_key(key), 0).is_some()
+        || read_lww(ctx, &ikey::list_key(key), 0).is_some()
+    {
+        return Err(()); // live string/list shadows the proto head
+    }
+    let Some((env, ctype, del)) = get_head(ctx, key) else {
+        return Ok(None);
+    };
+    if env.is_tombstone() || env.is_expired(now_ms()) {
+        return Ok(None);
+    }
+    if ctype != head::CTYPE_PROTO {
+        return Err(());
+    }
+    let raw = get_raw(ctx, &ikey::head_key(key)).ok_or(())?;
+    let (_, pay) = Envelope::decode(&raw).ok_or(())?;
+    Ok(Some((env, del, pay.get(9..).unwrap_or(&[]).to_vec())))
+}
+
+/// Resolve the message type for `key`, validate `msg` decodes against it,
+/// then LWW-write the head record (del-clock carry-forward, NX/XX, TTL).
+async fn write_value(
+    engine: &Arc<Engine>,
+    key: Vec<u8>,
+    msg: Vec<u8>,
+    o: SetOpts,
+    resolved: registry::ResolvedType,
+) -> Reply {
+    if msg.len() > engine.proto.limits.max_value {
+        return ProtoErr::Validate(format!(
+            "value too large ({} bytes, limit {})",
+            msg.len(),
+            engine.proto.limits.max_value
+        ))
+        .reply();
+    }
+    // NX/XX/KEEPTTL and the delete clock read the current head; make sure a
+    // cluster-remote key is observable first.
+    engine.ensure_local(&key).await;
+    let (schema, version, type_name) = (resolved.schema, resolved.version, resolved.type_name);
+    engine
+        .store
+        .run_key(&key.clone(), move |ctx| {
+            let existing = match read_proto_head(ctx, &key) {
+                Err(()) => return Reply::wrongtype(),
+                Ok(v) => v,
+            };
+            if (o.nx && existing.is_some()) || (o.xx && existing.is_none()) {
+                return Reply::Null;
+            }
+            // Carry forward the previous delete clock (ensure_head
+            // precedent): a re-created value must keep shadowing stale
+            // pre-delete records arriving via replication/AE.
+            let now = now_ms();
+            let prev_del = get_head(ctx, &key).map_or(0, |(env, _, del)| {
+                let mut d = del;
+                if env.is_tombstone() {
+                    d = d.max(env.hlc);
+                }
+                if env.is_expired(now) {
+                    d = d.max(env.expiry_hlc());
+                }
+                d
+            });
+            let ttl = match (o.ttl, o.keepttl) {
+                (Some(t), _) => t,
+                (None, true) => existing.as_ref().map_or(0, |(env, _, _)| env.ttl_deadline_ms),
+                (None, false) => 0,
+            };
+            let mut payload = head::encode(head::CTYPE_PROTO, prev_del);
+            payload.extend_from_slice(&protohead::encode(&schema, version, &type_name, &msg));
+            let env = Envelope::head(ctx.hlc.now(), ctx.node_id).with_ttl(ttl);
+            write_merged(ctx, &ikey::head_key(&key), &env.encode_with(&payload));
+            Reply::ok()
+        })
+        .await
+}
+
+/// `PROTO.SET key value [TYPE t] [NX|XX] [EX s|PX ms|EXAT ts|PXAT ts|KEEPTTL]`.
+pub async fn set(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 3 {
+        return Reply::wrong_args("proto.set");
+    }
+    let (key, msg) = (args[1].clone(), args[2].clone());
+    let o = match parse_set_opts(args, 3) {
+        Ok(o) => o,
+        Err(r) => return r,
+    };
+    let resolved =
+        match registry::resolve_for_key(engine, &key, o.type_name.as_deref(), None, 0).await {
+            Ok(r) => r,
+            Err(e) => return e.reply(),
+        };
+    // Validate: the bytes must decode against the resolved message type.
+    if let Err(e) = DynamicMessage::decode(resolved.desc.clone(), &msg[..]) {
+        return ProtoErr::Validate(format!("{}: {e}", resolved.type_name)).reply();
+    }
+    write_value(engine, key, msg, o, resolved).await
+}
+
+/// `PROTO.SETJSON key json [TYPE t] [NX|XX] [ttl opts]` — canonical
+/// protobuf-JSON in, validated protobuf bytes stored.
+pub async fn setjson(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 3 {
+        return Reply::wrong_args("proto.setjson");
+    }
+    let (key, json) = (args[1].clone(), args[2].clone());
+    let o = match parse_set_opts(args, 3) {
+        Ok(o) => o,
+        Err(r) => return r,
+    };
+    let resolved =
+        match registry::resolve_for_key(engine, &key, o.type_name.as_deref(), None, 0).await {
+            Ok(r) => r,
+            Err(e) => return e.reply(),
+        };
+    let mut de = serde_json::Deserializer::from_slice(&json);
+    let msg = match DynamicMessage::deserialize(resolved.desc.clone(), &mut de) {
+        Ok(m) => m,
+        Err(e) => return ProtoErr::Validate(format!("{}: {e}", resolved.type_name)).reply(),
+    };
+    write_value(engine, key, msg.encode_to_vec(), o, resolved).await
+}
+
+/// `PROTO.GET key` → the raw message bytes (no schema needed).
+pub async fn get(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() != 2 {
+        return Reply::wrong_args("proto.get");
+    }
+    let key = args[1].clone();
+    engine.ensure_local(&key).await;
+    engine
+        .store
+        .run_key(&args[1], move |ctx| match read_proto_head(ctx, &key) {
+            Err(()) => Reply::wrongtype(),
+            Ok(None) => Reply::Null,
+            Ok(Some((_, _, tail))) => match protohead::decode(&tail) {
+                Some(ph) => Reply::Bulk(ph.msg.to_vec()),
+                None => Reply::err("ERR corrupt proto value"),
+            },
+        })
+        .await
+}
+
+/// `PROTO.INFO key` → Map {schema, version, type, bytes}.
+pub async fn info(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() != 2 {
+        return Reply::wrong_args("proto.info");
+    }
+    let key = args[1].clone();
+    engine.ensure_local(&key).await;
+    engine
+        .store
+        .run_key(&args[1], move |ctx| match read_proto_head(ctx, &key) {
+            Err(()) => Reply::wrongtype(),
+            Ok(None) => Reply::err("ERR no such key"),
+            Ok(Some((_, _, tail))) => match protohead::decode(&tail) {
+                Some(ph) => Reply::Map(vec![
+                    (Reply::bulk_str("schema"), Reply::bulk_str(ph.schema)),
+                    (
+                        Reply::bulk_str("version"),
+                        Reply::Int(ph.schema_version as i64),
+                    ),
+                    (Reply::bulk_str("type"), Reply::bulk_str(ph.type_name)),
+                    (Reply::bulk_str("bytes"), Reply::Int(ph.msg.len() as i64)),
+                ]),
+                None => Reply::err("ERR corrupt proto value"),
+            },
+        })
+        .await
+}
+
+/// Read + decode a stored proto value into a DynamicMessage (resolves the
+/// EXACT schema version the value was written with — version records are
+/// retained even after PROTO.SCHEMA DEL, so old values always decode).
+async fn load_message(
+    engine: &Arc<Engine>,
+    key: &[u8],
+) -> Result<Option<(DynamicMessage, registry::ResolvedType)>, Reply> {
+    engine.ensure_local(key).await;
+    let k = key.to_vec();
+    let tail = engine
+        .store
+        .run_key(key, move |ctx| read_proto_head(ctx, &k))
+        .await;
+    let tail = match tail {
+        Err(()) => return Err(Reply::wrongtype()),
+        Ok(None) => return Ok(None),
+        Ok(Some((_, _, t))) => t,
+    };
+    let Some(ph) = protohead::decode(&tail) else {
+        return Err(Reply::err("ERR corrupt proto value"));
+    };
+    let (schema, version, type_name, msg) = (
+        ph.schema.to_string(),
+        ph.schema_version,
+        ph.type_name.to_string(),
+        ph.msg.to_vec(),
+    );
+    let (version, pool) = match registry::pool_for(engine, &schema, version).await {
+        Ok(v) => v,
+        Err(e) => return Err(e.reply()),
+    };
+    let Some(desc) = pool.get_message_by_name(&type_name) else {
+        return Err(ProtoErr::NoSchema(format!(
+            "schema '{schema}' version {version} does not define type '{type_name}'"
+        ))
+        .reply());
+    };
+    let m = match DynamicMessage::decode(desc.clone(), &msg[..]) {
+        Ok(m) => m,
+        Err(e) => return Err(Reply::err(format!("ERR stored value does not decode: {e}"))),
+    };
+    Ok(Some((
+        m,
+        registry::ResolvedType {
+            schema,
+            version,
+            type_name,
+            desc,
+        },
+    )))
+}
+
+/// `PROTO.GETJSON key` → canonical protobuf-JSON of the stored message.
+pub async fn getjson(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() != 2 {
+        return Reply::wrong_args("proto.getjson");
+    }
+    match load_message(engine, &args[1]).await {
+        Err(r) => r,
+        Ok(None) => Reply::Null,
+        Ok(Some((m, _))) => match serde_json::to_string(&m) {
+            Ok(s) => Reply::Bulk(s.into_bytes()),
+            Err(e) => Reply::err(format!("ERR json render failed: {e}")),
+        },
+    }
 }
 
 /// `PROTO.BINDINGS [MATCH glob]` → Map prefix → {schema, version, type}.

@@ -88,6 +88,11 @@ pub async fn dispatch(
         "PROTO.BIND" => proto::bind(engine, &args).await,
         "PROTO.UNBIND" => proto::unbind(engine, &args).await,
         "PROTO.BINDINGS" => proto::bindings_cmd(engine, &args).await,
+        "PROTO.SET" => proto::set(engine, &args).await,
+        "PROTO.GET" => proto::get(engine, &args).await,
+        "PROTO.INFO" => proto::info(engine, &args).await,
+        "PROTO.GETJSON" => proto::getjson(engine, &args).await,
+        "PROTO.SETJSON" => proto::setjson(engine, &args).await,
 
         // --- generic / keyspace ---
         "DEL" | "UNLINK" => generic::del(engine, &args).await,

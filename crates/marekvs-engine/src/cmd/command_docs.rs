@@ -978,6 +978,20 @@ static TABLE: &[CommandDoc] = &[
         &[arg("prefix", "string")]),
     with_args(cmd("proto.bindings", -1, CRO, 0, 0, 0, "Lists protobuf prefix bindings.", "1.3.0", "proto"),
         &[Arg { token: Some("MATCH"), optional: true, ..arg("pattern", "pattern") }]),
+    with_args(cmd("proto.set", -3, CW, 1, 1, 1, "Stores a validated protobuf message under a key (whole-message LWW).", "1.3.0", "proto"),
+        &[A_KEY, arg("value", "string"),
+          Arg { token: Some("TYPE"), optional: true, ..arg("type", "string") },
+          Arg { name: "condition", typ: "oneof", optional: true, args: SET_CONDITION, ..arg("condition", "oneof") },
+          Arg { token: Some("KEEPTTL"), optional: true, ..arg("keepttl", "pure-token") }]),
+    with_args(cmd("proto.get", 2, CF, 1, 1, 1, "Returns the raw protobuf message bytes stored under a key.", "1.3.0", "proto"),
+        ARGS_KEY),
+    with_args(cmd("proto.info", 2, CF, 1, 1, 1, "Returns schema, version, type and size of a stored protobuf value.", "1.3.0", "proto"),
+        ARGS_KEY),
+    with_args(cmd("proto.getjson", 2, CRO, 1, 1, 1, "Returns a stored protobuf value as canonical protobuf-JSON.", "1.3.0", "proto"),
+        ARGS_KEY),
+    with_args(cmd("proto.setjson", -3, CW, 1, 1, 1, "Stores a protobuf value from canonical protobuf-JSON.", "1.3.0", "proto"),
+        &[A_KEY, arg("json", "string"),
+          Arg { token: Some("TYPE"), optional: true, ..arg("type", "string") }]),
 ];
 
 /// The full command catalog.
