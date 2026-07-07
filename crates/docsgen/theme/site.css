@@ -42,7 +42,7 @@ img { max-width: 100%; }
   border-bottom: 1px solid var(--mk-border);
 }
 .topbar-inner {
-  max-width: var(--mk-container); margin: 0 auto;
+  max-width: var(--mk-container-wide); margin: 0 auto;
   padding: 0 var(--mk-space-6); height: 76px;
   display: flex; align-items: center; justify-content: space-between; gap: var(--mk-space-4);
 }
@@ -68,7 +68,7 @@ img { max-width: 100%; }
 
 /* ---------- docs shell (sidebar / content / toc) ---------- */
 .shell {
-  max-width: var(--mk-container); margin: 0 auto;
+  max-width: var(--mk-container-wide); margin: 0 auto;
   padding: 0 var(--mk-space-6);
   display: grid; grid-template-columns: 232px minmax(0, 1fr) 200px;
   gap: var(--mk-space-8); align-items: start;

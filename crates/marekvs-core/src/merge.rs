@@ -225,6 +225,28 @@ pub fn element_add_ttl(
     )
 }
 
+/// Overwrite: covers the `observed` dots and installs a single fresh add-dot
+/// in ONE record — a SET both replaces the value and prevents resurrection of
+/// the adds it observed (design/16 JSON path assignment).
+pub fn element_set(
+    rtype: RecordType,
+    hlc: u64,
+    origin: NodeId,
+    value: &[u8],
+    observed: &[Dot],
+) -> Vec<u8> {
+    let dot = Dot { hlc, origin };
+    encode_element(
+        rtype,
+        (hlc, origin),
+        0,
+        ElementState {
+            live: vec![(dot, value.to_vec())],
+            covered: observed.to_vec(),
+        },
+    )
+}
+
 /// An element remove covering the `observed` dots.
 pub fn element_remove(rtype: RecordType, hlc: u64, origin: NodeId, observed: &[Dot]) -> Vec<u8> {
     encode_element(
@@ -480,6 +502,79 @@ mod tests {
         assert_eq!(full_merge(&m, &rm), m);
         assert_eq!(full_merge(&m, &a1), m);
         assert_eq!(full_merge(&m, &m), m);
+    }
+
+    #[test]
+    fn set_replaces_observed_add_in_any_order() {
+        let a1 = add(100, 1, b"old");
+        let set = element_set(
+            RecordType::SetMember,
+            150,
+            2,
+            b"new",
+            &[Dot {
+                hlc: 100,
+                origin: 1,
+            }],
+        );
+        let s = full_merge(&a1, &set);
+        let t = full_merge(&set, &a1);
+        assert_eq!(s, t);
+        let (env, pay) = Envelope::decode(&s).unwrap();
+        assert!(!env.is_tombstone());
+        assert_eq!(element_value(pay).unwrap(), b"new");
+        assert_eq!(
+            element_dots(pay),
+            vec![Dot {
+                hlc: 150,
+                origin: 2
+            }]
+        );
+        // the observed add must stay covered even if it re-arrives later
+        assert_eq!(full_merge(&s, &a1), s);
+    }
+
+    #[test]
+    fn set_keeps_unobserved_concurrent_add_alive() {
+        let a1 = add(100, 1, b"old");
+        let concurrent = add(140, 3, b"other");
+        let set = element_set(
+            RecordType::SetMember,
+            150,
+            2,
+            b"new",
+            &[Dot {
+                hlc: 100,
+                origin: 1,
+            }],
+        );
+        let s = full_merge(&full_merge(&a1, &set), &concurrent);
+        let t = full_merge(&full_merge(&concurrent, &a1), &set);
+        assert_eq!(s, t);
+        let (env, pay) = Envelope::decode(&s).unwrap();
+        assert!(!env.is_tombstone());
+        // both survive; the set's dot (150,2) is highest and thus visible
+        assert_eq!(element_value(pay).unwrap(), b"new");
+        assert_eq!(
+            element_dots(pay),
+            vec![
+                Dot {
+                    hlc: 150,
+                    origin: 2
+                },
+                Dot {
+                    hlc: 140,
+                    origin: 3
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn set_with_no_observed_dots_is_plain_add() {
+        let set = element_set(RecordType::HashField, 100, 1, b"v", &[]);
+        let add = element_add(RecordType::HashField, 100, 1, b"v");
+        assert_eq!(set, add);
     }
 
     #[test]

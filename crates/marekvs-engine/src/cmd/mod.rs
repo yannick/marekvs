@@ -6,7 +6,9 @@ pub mod command_docs;
 pub mod generic;
 pub mod hash;
 pub mod hll;
+pub mod json;
 pub mod list;
+pub mod proto;
 pub mod pubsub;
 pub mod script;
 pub mod server;
@@ -81,6 +83,48 @@ pub async fn dispatch(
         "BG.DRAW" => budget::draw(engine, &args).await,
         "BG.INFO" => budget::info(engine, &args).await,
         "BG.RECLAIM" => budget::reclaim(engine, &args).await,
+
+        // --- JSON documents (JSON.*, design/16) ---
+        "JSON.SET" => json::set(engine, &args).await,
+        "JSON.GET" => json::get(engine, &args).await,
+        "JSON.MGET" => json::mget(engine, &args).await,
+        "JSON.MSET" => json::mset(engine, &args).await,
+        "JSON.DEL" | "JSON.FORGET" => json::del(engine, &args).await,
+        "JSON.TYPE" => json::type_cmd(engine, &args).await,
+        "JSON.NUMINCRBY" => json::numop(engine, &args, false).await,
+        "JSON.NUMMULTBY" => json::numop(engine, &args, true).await,
+        "JSON.STRAPPEND" => json::strappend(engine, &args).await,
+        "JSON.STRLEN" => json::strlen(engine, &args).await,
+        "JSON.ARRAPPEND" => json::arrappend(engine, &args).await,
+        "JSON.ARRINDEX" => json::arrindex(engine, &args).await,
+        "JSON.ARRINSERT" => json::arrinsert(engine, &args).await,
+        "JSON.ARRLEN" => json::arrlen(engine, &args).await,
+        "JSON.ARRPOP" => json::arrpop(engine, &args).await,
+        "JSON.ARRTRIM" => json::arrtrim(engine, &args).await,
+        "JSON.OBJKEYS" => json::objkeys(engine, &args).await,
+        "JSON.OBJLEN" => json::objlen(engine, &args).await,
+        "JSON.TOGGLE" => json::toggle(engine, &args).await,
+        "JSON.CLEAR" => json::clear(engine, &args).await,
+        "JSON.MERGE" => json::merge(engine, &args).await,
+        "JSON.RESP" => json::resp(engine, &args).await,
+        "JSON.DEBUG" => json::debug(engine, &args).await,
+        // --- protobuf registry + typed values (PROTO.*, design/17) ---
+        "PROTO.SCHEMA" => proto::schema(engine, &args).await,
+        "PROTO.BIND" => proto::bind(engine, &args).await,
+        "PROTO.UNBIND" => proto::unbind(engine, &args).await,
+        "PROTO.BINDINGS" => proto::bindings_cmd(engine, &args).await,
+        "PROTO.SET" => proto::set(engine, &args).await,
+        "PROTO.GET" => proto::get(engine, &args).await,
+        "PROTO.INFO" => proto::info(engine, &args).await,
+        "PROTO.GETJSON" => proto::getjson(engine, &args).await,
+        "PROTO.SETJSON" => proto::setjson(engine, &args).await,
+        "PROTO.GETFIELD" => proto::getfield(engine, &args).await,
+        "PROTO.SETFIELD" => proto::setfield(engine, &args).await,
+        "PROTO.CLEARFIELD" => proto::clearfield(engine, &args).await,
+        "PROTO.HSET" => proto::hset(engine, &args).await,
+        "PROTO.SADD" => proto::sadd(engine, &args).await,
+        "PROTO.HGETJSON" => proto::hgetjson(engine, &args).await,
+        "PROTO.HGETFIELD" => proto::hgetfield(engine, &args).await,
 
         // --- generic / keyspace ---
         "DEL" | "UNLINK" => generic::del(engine, &args).await,

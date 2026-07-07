@@ -233,6 +233,47 @@ expect "SCRIPT EXISTS" "1" "$($R script exists "$sha")"
 expect "SCRIPT EXISTS miss" "0" "$($R script exists 0000000000000000000000000000000000000000)"
 expect "EVALSHA miss is NOSCRIPT" "yes" "$($R evalsha 0000000000000000000000000000000000000000 0 2>&1 | grep -qi noscript && echo yes)"
 
+# JSON documents (JSON.*, design/16)
+expect "JSON.SET root" "OK" "$($R json.set jd '$' '{"a":1,"tags":["x","y"],"nest":{"n":2}}')"
+expect "JSON.GET root" '{"a":1,"nest":{"n":2},"tags":["x","y"]}' "$($R json.get jd .)"
+expect "JSON.TYPE" "object" "$($R json.type jd)"
+expect "JSON.TYPE path" "integer" "$($R json.type jd .a)"
+expect "TYPE reports module name" "ReJSON-RL" "$($R type jd)"
+expect "JSON.SET path" "OK" "$($R json.set jd '$.a' 5)"
+expect "JSON.NUMINCRBY" "8" "$($R json.numincrby jd .a 3)"
+expect "JSON.ARRAPPEND" "3" "$($R json.arrappend jd .tags '"z"')"
+expect "JSON.ARRLEN" "3" "$($R json.arrlen jd .tags)"
+expect "JSON.ARRPOP" '"z"' "$($R json.arrpop jd .tags)"
+expect "JSON.STRAPPEND" "3" "$($R json.strappend jd '$.tags[0]' '"yz"' | tr -d '\n')"
+expect "JSON.OBJKEYS" "a
+nest
+tags" "$($R json.objkeys jd)"
+expect "JSON.DEL path" "1" "$($R json.del jd '$.nest')"
+expect "JSON.GET after del" '{"a":8,"tags":["xyz","y"]}' "$($R json.get jd .)"
+expect "JSON EXPIRE" "1" "$($R expire jd 100)"
+expect "JSON TTL set" "yes" "$([ "$($R ttl jd)" -gt 0 ] && echo yes)"
+expect "JSON.DEL root" "1" "$($R json.del jd)"
+expect "JSON.GET missing" "" "$($R json.get jd .)"
+
+# Protobuf registry + typed values (PROTO.*, design/17)
+PROTO_SRC='syntax = "proto3"; package acme; message User { string name = 1; int32 age = 2; }'
+expect "PROTO.SCHEMA SET" "1" "$($R proto.schema set acme/user.proto SOURCE "$PROTO_SRC")"
+expect "PROTO.SCHEMA LIST" "acme/user.proto
+1" "$($R proto.schema list)"
+expect "PROTO.SCHEMA TYPES" "acme.User" "$($R proto.schema types acme/user.proto)"
+expect "PROTO.BIND" "OK" "$($R proto.bind user: acme.User)"
+expect "PROTO.SETJSON" "OK" "$($R proto.setjson user:1 '{"name":"ada","age":36}')"
+expect "PROTO.GETJSON" '{"name":"ada","age":36}' "$($R proto.getjson user:1)"
+expect "PROTO.GETFIELD" "ada" "$($R proto.getfield user:1 name)"
+expect "PROTO.SETFIELD" "OK" "$($R proto.setfield user:1 age 37)"
+expect "PROTO.GETFIELD after set" "37" "$($R proto.getfield user:1 age)"
+expect "PROTO TYPE" "proto" "$($R type user:1)"
+expect "PROTO OBJECT ENCODING" "acme.User" "$($R object encoding user:1)"
+expect "PROTO.INFO has type" "yes" "$($R proto.info user:1 | grep -q acme.User && echo yes)"
+expect "PROTO.SET rejects garbage" "yes" "$($R proto.set user:2 not-a-proto 2>&1 | grep -qi 'PROTOVALIDATE\|error' && echo yes)"
+expect "PROTO no binding" "yes" "$($R proto.setjson other:1 '{}' 2>&1 | grep -qi nobinding && echo yes)"
+expect "PROTO.DEL" "1" "$($R del user:1)"
+
 # keyspace ops
 expect "DBSIZE > 0" "yes" "$([ "$($R dbsize)" -gt 0 ] && echo yes)"
 expect "SCAN returns keys" "yes" "$([ -n "$($R scan 0 count 100 | tail +2)" ] && echo yes)"

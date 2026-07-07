@@ -60,7 +60,11 @@ fn nodes_text(t: &Topology) -> String {
     let mut out = String::new();
     for n in &t.nodes {
         let Some(addr) = n.resp_addr else { continue };
-        let flags = if n.id == t.self_id { "myself,master" } else { "master" };
+        let flags = if n.id == t.self_id {
+            "myself,master"
+        } else {
+            "master"
+        };
         let mut line = format!(
             "{} {}:{}@{} {} - 0 0 {} connected",
             node_hex_id(n.id),
@@ -127,8 +131,14 @@ fn shards_reply(t: &Topology) -> Reply {
             nodes.push(Reply::Map(vec![
                 (Reply::bulk_str("id"), Reply::bulk_str(node_hex_id(*id))),
                 (Reply::bulk_str("port"), Reply::Int(addr.port() as i64)),
-                (Reply::bulk_str("ip"), Reply::bulk_str(addr.ip().to_string())),
-                (Reply::bulk_str("endpoint"), Reply::bulk_str(addr.ip().to_string())),
+                (
+                    Reply::bulk_str("ip"),
+                    Reply::bulk_str(addr.ip().to_string()),
+                ),
+                (
+                    Reply::bulk_str("endpoint"),
+                    Reply::bulk_str(addr.ip().to_string()),
+                ),
                 (
                     Reply::bulk_str("role"),
                     Reply::bulk_str(if i == 0 { "master" } else { "replica" }),
@@ -216,10 +226,7 @@ mod tests {
     fn ranges_merge_adjacent_same_owners() {
         // pids 0,1 → slots 0..7 owner [0,1]; pids 2,3 → slots 8..15 [1,0].
         let r = slot_ranges(&topo().pid_owners);
-        assert_eq!(
-            r,
-            vec![(0u16, 7u16, vec![0u16, 1]), (8, 15, vec![1, 0])]
-        );
+        assert_eq!(r, vec![(0u16, 7u16, vec![0u16, 1]), (8, 15, vec![1, 0])]);
     }
 
     #[test]
@@ -268,10 +275,14 @@ mod tests {
             panic!("CLUSTER SLOTS must be an array");
         };
         assert_eq!(entries.len(), 2);
-        let Reply::Array(first) = &entries[0] else { panic!() };
+        let Reply::Array(first) = &entries[0] else {
+            panic!()
+        };
         assert_eq!(first[0], Reply::Int(0));
         assert_eq!(first[1], Reply::Int(7));
-        let Reply::Array(master) = &first[2] else { panic!() };
+        let Reply::Array(master) = &first[2] else {
+            panic!()
+        };
         assert_eq!(master[0], Reply::Bulk(b"10.0.0.1".to_vec()));
         assert_eq!(master[1], Reply::Int(6379));
         // replica entry present (RF2)
@@ -282,7 +293,9 @@ mod tests {
     fn slots_skip_master_without_resp_addr() {
         let mut t = topo();
         t.nodes[0].resp_addr = None;
-        let Reply::Array(entries) = slots_reply(&t) else { panic!() };
+        let Reply::Array(entries) = slots_reply(&t) else {
+            panic!()
+        };
         // ranges mastered by node 0 are dropped; node-1 ranges survive
         assert_eq!(entries.len(), 1);
     }
@@ -291,13 +304,19 @@ mod tests {
     fn shards_skip_master_without_resp_addr() {
         let mut t = topo();
         t.nodes[0].resp_addr = None;
-        let Reply::Array(shards) = shards_reply(&t) else { panic!() };
+        let Reply::Array(shards) = shards_reply(&t) else {
+            panic!()
+        };
         // Node 0 masters slots 0..7: that shard is dropped entirely (a
         // shard whose nodes list has no master breaks client routing);
         // the node-1-mastered shard survives with node 0 absent from it.
         assert_eq!(shards.len(), 1);
-        let Reply::Map(shard) = &shards[0] else { panic!() };
-        let Reply::Array(nodes) = &shard[1].1 else { panic!() };
+        let Reply::Map(shard) = &shards[0] else {
+            panic!()
+        };
+        let Reply::Array(nodes) = &shard[1].1 else {
+            panic!()
+        };
         assert_eq!(nodes.len(), 1); // replica entry for node 0 dropped too
     }
 }
