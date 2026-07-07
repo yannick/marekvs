@@ -42,6 +42,12 @@ pub enum Tag {
     /// record has an empty suffix. A node's key is a strict byte-prefix of
     /// every descendant's key, so subtree = prefix scan.
     Json = b'j',
+    /// Protobuf field records (design/18): one record per field path of a
+    /// decomposed proto value. The suffix is a chain of self-delimiting
+    /// segments (`crate::pdoc::PSeg`, keyed by FIELD NUMBER); the root
+    /// record has an empty suffix. Same parent-is-byte-prefix property as
+    /// `Tag::Json`.
+    ProtoField = b'p',
 }
 
 fn put_varint(out: &mut Vec<u8>, mut v: u64) {
@@ -161,7 +167,7 @@ pub fn collection_prefix(tag: Tag, userkey: &[u8]) -> Vec<u8> {
 /// (FetchCollection read-through, RENAME/COPY) must scan besides the
 /// string/list/head records. ADD NEW ELEMENT TAGS HERE or cluster fetches
 /// will silently miss the type's records.
-pub const ELEMENT_TAGS: [Tag; 8] = [
+pub const ELEMENT_TAGS: [Tag; 9] = [
     Tag::HashField,
     Tag::SetMember,
     Tag::ZsetMember,
@@ -170,6 +176,7 @@ pub const ELEMENT_TAGS: [Tag; 8] = [
     Tag::HllRegister,
     Tag::Budget,
     Tag::Json,
+    Tag::ProtoField,
 ];
 
 /// Budget element kinds — first byte of a `Tag::Budget` suffix. Memcmp order
@@ -234,6 +241,12 @@ pub fn json_node_key(userkey: &[u8], path: &[u8]) -> Vec<u8> {
     prefixed(Tag::Json, userkey, path)
 }
 
+/// Proto field-record key: `[pid][b'p'][klen][userkey][path-bytes]`; the
+/// root record has an empty path (design/18).
+pub fn proto_field_key(userkey: &[u8], path: &[u8]) -> Vec<u8> {
+    prefixed(Tag::ProtoField, userkey, path)
+}
+
 /// Scan prefix covering an entire partition (bootstrap, Merkle, purge).
 pub fn partition_prefix(pid: Pid) -> Vec<u8> {
     pid.to_be_bytes().to_vec()
@@ -264,7 +277,7 @@ pub fn parse(ikey: &[u8]) -> Option<ParsedKey<'_>> {
             userkey: rest,
             suffix: &[],
         }),
-        b'M' | b'h' | b'S' | b'z' | b'Z' | b'q' | b'x' | b'H' | b'b' | b'j' => {
+        b'M' | b'h' | b'S' | b'z' | b'Z' | b'q' | b'x' | b'H' | b'b' | b'j' | b'p' => {
             let (klen, n) = get_varint(rest)?;
             let klen = klen as usize;
             if rest.len() < n + klen {
@@ -349,6 +362,28 @@ mod tests {
             assert_eq!(p.userkey, b"k");
             assert_eq!(p.suffix, b"suffix");
         }
+    }
+
+    #[test]
+    fn proto_field_roundtrip_parse() {
+        let path = b"\x01\x01\x07"; // Field(7)
+        let k = proto_field_key(b"user:1", path);
+        let p = parse(&k).unwrap();
+        assert_eq!(p.tag, b'p');
+        assert_eq!(p.userkey, b"user:1");
+        assert_eq!(p.suffix, path);
+        // root = empty suffix = the whole-value scan prefix
+        let root = proto_field_key(b"user:1", &[]);
+        assert_eq!(root, collection_prefix(Tag::ProtoField, b"user:1"));
+        assert!(k.starts_with(&root));
+    }
+
+    #[test]
+    fn element_tags_include_proto_field() {
+        assert!(
+            ELEMENT_TAGS.contains(&Tag::ProtoField),
+            "cluster fetches would silently miss proto field records"
+        );
     }
 
     #[test]
