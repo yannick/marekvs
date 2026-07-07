@@ -143,6 +143,39 @@ the same `repeated` field converge with both runs present and contiguous
 (RGA); map entries are add-wins per key; `oneof` races resolve to a
 deterministic winner on every node.
 
+### Two clients, two nodes — both edits survive
+
+```sh
+# one-time setup (any node)
+redis-cli -p 6379 PROTO.SCHEMA SET acme/user.proto SOURCE '
+  syntax = "proto3"; package acme;
+  message User { string name = 1; int32 age = 2; repeated string tags = 3; }'
+redis-cli -p 6379 PROTO.BIND "user:" acme.User
+redis-cli -p 6379 PROTO.SETJSON user:1 '{"name":"seed","age":1}'
+
+# client A, connected to node 1 — concurrently with client B on node 2:
+redis-cli -p 6380 PROTO.SETFIELD user:1 name ada    # client A
+redis-cli -p 6381 PROTO.SETFIELD user:1 age 42      # client B
+
+# after replication (or partition heal), on EVERY node:
+redis-cli -p 6379 PROTO.GETJSON user:1
+# {"name":"ada","age":42}
+```
+
+Under whole-message storage one of those writes would have silently erased
+the other (decode → mutate → re-encode races the full message). With
+field-level merge each `SETFIELD` ships one field record, so the writes
+commute. The same holds for repeated fields — two clients appending
+concurrently keep both elements:
+
+```sh
+redis-cli -p 6380 PROTO.SETFIELD user:1 tags.0 alpha   # client A appends
+redis-cli -p 6381 PROTO.SETFIELD user:1 tags.0 beta    # client B appends, concurrently
+# converged: BOTH elements present on every node, in the same deterministic
+# order everywhere (the later hybrid-logical-clock write sorts first);
+# multi-element runs from one client stay contiguous
+```
+
 `PROTO.INFO` reports `format: fields` for a decomposed value (and
 `records`, the field-record count).
 

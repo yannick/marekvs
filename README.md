@@ -36,10 +36,18 @@ in Rust. AP by design (eventually consistent, coordination-free), disk-native
 via the [ondaDB](../ondadb) LSM engine — no in-memory dataset.
 
 - **Redis protocol**: RESP2 + RESP3, strings / hashes / sets / sorted sets /
-  lists / streams / pub-sub ([coverage matrix](design/03-redis-api.md))
+  lists / streams / pub-sub / JSON documents ([coverage matrix](design/03-redis-api.md))
 - **Convergent replication**: hybrid logical clocks + per-element ORSWOT
   merges; concurrent `SADD`s on different nodes both survive, deletes never
   resurrect ([data model](design/02-data-model.md))
+- **JSON documents** (`JSON.*`): the full RedisJSON v2 surface stored as a
+  per-path CRDT — concurrent editors on different nodes merge structurally
+  instead of clobbering whole documents ([JSON](design/16-json.md))
+- **Protobuf schema store** (`PROTO.*`): upload `.proto` schemas (compiled
+  server-side), bind them to key prefixes, store validated messages with
+  server-side field access, JSON projection, and **field-level CRDT merge** —
+  two nodes writing different fields of the same message both win
+  ([protobuf](design/17-protobuf.md), [field merge](design/18-proto-field-crdt.md))
 - **Dynamic replication**: any node serves any key; a node that reads a
   remote key caches it and subscribes to its updates
   ([replication](design/04-replication.md))
@@ -100,6 +108,31 @@ redis-cli get greeting
 redis-cli sadd tags rust distributed redis
 redis-cli smembers tags
 ```
+
+Typed values that **merge instead of clobber** — two clients on two different
+nodes edit the same protobuf message concurrently, and both edits survive:
+
+```sh
+just run-cluster &            # 3 nodes on :6379 / :6380 / :6381
+
+redis-cli -p 6379 proto.schema set acme/user.proto SOURCE '
+  syntax = "proto3"; package acme;
+  message User { string name = 1; int32 age = 2; repeated string tags = 3; }'
+redis-cli -p 6379 proto.bind "user:" acme.User
+redis-cli -p 6379 proto.setjson user:1 '{"name":"seed","age":1}'
+
+# client A on node 1 and client B on node 2, at the same time:
+redis-cli -p 6380 proto.setfield user:1 name ada     # ← client A
+redis-cli -p 6381 proto.setfield user:1 age 42       # ← client B
+
+redis-cli -p 6379 proto.getjson user:1
+# {"name":"ada","age":42}      ← BOTH edits, on every node
+```
+
+Each field is its own CRDT record: same-field races are last-writer-wins,
+concurrent appends to a `repeated` field all survive in contiguous runs, and
+JSON documents (`JSON.SET doc $.a …` vs `JSON.SET doc $.b …`) merge the same
+way. Details: [docs/protobuf.md](docs/protobuf.md), [docs/json.md](docs/json.md).
 
 ## Run from published images (ghcr.io)
 
