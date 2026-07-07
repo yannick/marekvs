@@ -160,7 +160,7 @@ probes (`maxmemory`, `appendonly`, `save`, `databases`, …).
 
 ### Not planned (module territory / conflicts with AP-on-disk)
 
-GEO*, JSON.*, BF./CF./CMS./TOPK.*, BITCOUNT/BITPOS/BITOP/
+GEO*, BF./CF./CMS./TOPK.*, BITCOUNT/BITPOS/BITOP/
 BITFIELD/SETBIT/GETBIT (bitops need byte-addressable in-place mutation —
 possible later as string overlay, not v1), OBJECT tiering commands.
 
