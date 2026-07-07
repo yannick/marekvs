@@ -2039,15 +2039,7 @@ impl ReplEngine {
                         ops.push(ReplOp { ikey: k, value: v });
                     }
                 }
-                for tag in [
-                    ikey::Tag::HashField,
-                    ikey::Tag::SetMember,
-                    ikey::Tag::ZsetMember,
-                    ikey::Tag::ListElem,
-                    ikey::Tag::StreamEntry,
-                    ikey::Tag::HllRegister,
-                    ikey::Tag::Budget,
-                ] {
+                for tag in ikey::ELEMENT_TAGS {
                     store::scan_prefix(ctx, &ikey::collection_prefix(tag, &uk), |k, v| {
                         ops.push(ReplOp {
                             ikey: k.to_vec(),

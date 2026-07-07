@@ -157,6 +157,21 @@ pub fn collection_prefix(tag: Tag, userkey: &[u8]) -> Vec<u8> {
     prefixed(tag, userkey, &[])
 }
 
+/// Every element-bearing prefixed tag — what a whole-user-key transfer
+/// (FetchCollection read-through, RENAME/COPY) must scan besides the
+/// string/list/head records. ADD NEW ELEMENT TAGS HERE or cluster fetches
+/// will silently miss the type's records.
+pub const ELEMENT_TAGS: [Tag; 8] = [
+    Tag::HashField,
+    Tag::SetMember,
+    Tag::ZsetMember,
+    Tag::ListElem,
+    Tag::StreamEntry,
+    Tag::HllRegister,
+    Tag::Budget,
+    Tag::Json,
+];
+
 /// Budget element kinds — first byte of a `Tag::Budget` suffix. Memcmp order
 /// groups all slots before all tokens within one budget's key range.
 pub const BUDGET_SLOT: u8 = b'L';
@@ -321,6 +336,19 @@ mod tests {
         let p = parse(&k).unwrap();
         assert_eq!(p.userkey, b"hello");
         assert_eq!(p.tag, b's');
+    }
+
+    #[test]
+    fn element_tags_all_parse_as_prefixed() {
+        // ELEMENT_TAGS drives whole-key transfers (read-through fetch,
+        // bootstrap): every entry must produce parseable prefixed keys.
+        for tag in ELEMENT_TAGS {
+            let k = prefixed(tag, b"k", b"suffix");
+            let p = parse(&k).unwrap_or_else(|| panic!("{tag:?} must parse"));
+            assert_eq!(p.tag, tag as u8);
+            assert_eq!(p.userkey, b"k");
+            assert_eq!(p.suffix, b"suffix");
+        }
     }
 
     #[test]
