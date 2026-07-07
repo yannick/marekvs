@@ -30,6 +30,7 @@ nodes can briefly observe different values. See [Consistency](../consistency/).
 | `TIME` | Server time. |
 | `REPLICAOF` / `SLAVEOF` | Follow a real Redis master (live migration). |
 | `SHUTDOWN` `DEBUG` | Lifecycle / debug helpers. |
+| `CLUSTER INFO/MYID/KEYSLOT/SLOTS/SHARDS/NODES` | Read-only topology for cluster-aware client routing. See [Cluster protocol](../cluster-protocol/). |
 
 A few settings are live-reconfigurable via `CONFIG SET`: `requirepass`,
 `lua-time-limit`, and `loglevel`.
@@ -201,8 +202,10 @@ notes assume them. Calling one returns an error:
 - **Keyspace:** `SORT`, `DUMP`, `RESTORE`, `MOVE`
 - **Stream:** consumer-group commands (`XGROUP`, `XREADGROUP`, `XACK`,
   `XCLAIM`, `XAUTOCLAIM`, `XPENDING`, `XINFO GROUPS`, `XINFO CONSUMERS`)
-- **Cluster / HA:** `WAIT`, `FAILOVER`, `CLUSTER`, `FUNCTION` (no Redis Cluster
-  protocol, no `MOVED`/`ASK`)
+- **Cluster / HA:** `WAIT`, `FAILOVER`, `FUNCTION`. `CLUSTER SETSLOT`/`FORGET`/
+  `MEET` are also absent — topology is gossip+HRW managed, not client-mutated.
+  (Read-only `CLUSTER` topology commands *are* implemented — see
+  [Cluster protocol](../cluster-protocol/).)
 - **Modules / extras:** `GEO*`, `JSON*`, bitfield/bit ops, `CLIENT TRACKING`
   (client-side caching)
 - **Transport:** no TLS.
@@ -218,9 +221,13 @@ notes assume them. Calling one returns an error:
 - **Counters:** exact under concurrency (PN-counters).
 - **Blocking commands:** implemented via ~50 ms polling that also wakes on a
   replicated push.
+- **Cluster routing:** no `MOVED`/`ASK` redirects, no `CROSSSLOT` errors — any
+  node serves any key, cluster-aware clients just get to skip the extra hop.
+  See [Cluster protocol](../cluster-protocol/).
 
 ## Where to go next
 
 - The structures behind these commands: [Data model](../data-model/).
 - What "eventually consistent" means for reads: [Consistency](../consistency/).
 - Scripting details and caveats: [Lua scripting](../lua-scripting/).
+- Client-side slot routing: [Cluster protocol](../cluster-protocol/).

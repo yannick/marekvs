@@ -111,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
     // resolve it to an IP once at startup.
     let gossip_advertise = resolve(&advertise_ip, gossip_addr.port()).await?;
     let mesh_advertise = resolve(&advertise_ip, mesh_addr.port()).await?;
+    let resp_advertise = resolve(&advertise_ip, resp_addr.port()).await?;
 
     tracing::info!(
         node_id,
@@ -177,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
         gossip_listen: gossip_addr,
         gossip_advertise,
         mesh_advertise,
+        resp_advertise,
         seeds,
         replicas_n,
         gossip_interval: Duration::from_millis(500),
@@ -244,6 +246,44 @@ async fn main() -> anyhow::Result<()> {
                  underreplicated_partitions:{}\r\neffective_rf_min:{}\r\n",
                 s.members, s.degraded as u8, s.underreplicated_partitions, s.effective_rf_min
             )
+        }));
+    }
+
+    // CLUSTER SLOTS/NODES topology provider (design/15).
+    {
+        let cluster = cluster.clone();
+        engine.set_cluster_topology(Arc::new(move || {
+            let view = cluster.view();
+            let n = cluster.replicas_n;
+            let nodes = view
+                .members
+                .iter()
+                .map(|m| marekvs_engine::TopologyNode {
+                    id: m.node,
+                    resp_addr: m.resp_addr,
+                    gossip_port: m.gossip_addr.port(),
+                    generation: m.generation,
+                    state: m.phase.as_str().to_string(),
+                })
+                .collect();
+            let pid_owners = (0..marekvs_core::PARTITIONS)
+                .map(|pid| {
+                    let mut owners = view.owners(pid, n);
+                    // H1 (first Active owner) first — it is the range master.
+                    if let Some(h1) = view.h1(pid, n) {
+                        if let Some(pos) = owners.iter().position(|o| *o == h1) {
+                            owners.swap(0, pos);
+                        }
+                    }
+                    owners
+                })
+                .collect();
+            marekvs_engine::Topology {
+                self_id: node_id,
+                epoch: view.epoch,
+                nodes,
+                pid_owners,
+            }
         }));
     }
 

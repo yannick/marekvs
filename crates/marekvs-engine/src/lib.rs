@@ -6,6 +6,7 @@ pub mod metrics;
 pub mod pubsub;
 pub mod reply;
 pub mod store;
+pub mod topology;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -15,6 +16,8 @@ use marekvs_resp::ReplyBuf;
 use pubsub::{PubMessage, PubSub};
 use store::Store;
 use tokio::sync::mpsc::UnboundedSender;
+
+pub use topology::{Topology, TopologyFn, TopologyNode};
 
 /// Read-through hook installed by the replication layer: fetch `userkey`
 /// (string + collection records) from a home replica into the local store.
@@ -194,6 +197,10 @@ pub struct Engine {
     pub started_at_ms: u64,
     /// INFO-visible cluster stats provider installed by the server.
     pub cluster_info: parking_lot::RwLock<Option<Arc<dyn Fn() -> String + Send + Sync>>>,
+    /// Topology provider for the CLUSTER command family (design/15),
+    /// installed by the server; None in embedded/single-node use — the
+    /// CLUSTER family then answers KEYSLOT only and errors otherwise.
+    pub cluster_topology: parking_lot::RwLock<Option<TopologyFn>>,
     /// Upstream-Redis replication control (REPLICAOF), installed by the server.
     pub replicaof: parking_lot::RwLock<Option<Arc<dyn ReplicaOfCtl>>>,
     /// Actual RESP listen port (INFO tcp_port), set by the server at boot.
@@ -269,6 +276,7 @@ impl Engine {
             log_filter: parking_lot::RwLock::new(String::new()),
             started_at_ms: store::now_ms(),
             cluster_info: parking_lot::RwLock::new(None),
+            cluster_topology: parking_lot::RwLock::new(None),
             replicaof: parking_lot::RwLock::new(None),
             write_stopped: std::sync::atomic::AtomicBool::new(false),
             tcp_port: std::sync::atomic::AtomicU16::new(6379),
@@ -313,6 +321,10 @@ impl Engine {
 
     pub fn set_cluster_info(&self, f: Arc<dyn Fn() -> String + Send + Sync>) {
         *self.cluster_info.write() = Some(f);
+    }
+
+    pub fn set_cluster_topology(&self, f: TopologyFn) {
+        *self.cluster_topology.write() = Some(f);
     }
 
     pub fn set_replicaof(&self, ctl: Arc<dyn ReplicaOfCtl>) {

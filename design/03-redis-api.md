@@ -119,7 +119,7 @@ Streams are at-least-once cross-node in v1.
 | Commands | Tier |
 |---|---|
 | SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBLISH, PUBSUB CHANNELS/NUMSUB/NUMPAT | v1 |
-| SPUBLISH/SSUBSCRIBE (sharded) | ✗ (no cluster slots) |
+| SPUBLISH/SSUBSCRIBE (sharded) | ✗ |
 
 Cluster-wide delivery via the filtered mesh
 ([04-replication.md](04-replication.md#pubsub)); fire-and-forget, matching
@@ -143,7 +143,8 @@ through the pub/sub mesh. One event per logical write cluster-wide.
 | MULTI/EXEC/DISCARD | v1.1 ✓ — per-connection queue, sequential execution; **no atomicity across keys** (queued commands are ordinary commands). WATCH → error (no CAS in AP) |
 | EVAL/EVALSHA, SCRIPT (LOAD/EXISTS/FLUSH) | v1.1 ✓ — sandboxed Lua, effects replication ([design/11](11-lua-scripting.md)) |
 | REPLICAOF/SLAVEOF | v1.1 ✓ — live-migration ingest from an upstream Redis master; node stays writable (AP) |
-| WAIT, FAILOVER, CLUSTER *, FUNCTION, ACL beyond AUTH | ✗ |
+| CLUSTER INFO/MYID/KEYSLOT/SLOTS/SHARDS/NODES | ✓ — read-only topology for cluster-aware clients ([15](15-cluster-protocol.md)); no MOVED/CROSSSLOT — any node serves any key |
+| WAIT, FAILOVER, CLUSTER SETSLOT/FORGET/MEET (topology is gossip-managed), FUNCTION, ACL beyond AUTH | ✗ |
 
 *SELECT 0 only (single logical database; SELECT n>0 → error, like many
 Redis-compatible stores). †`INFO replication` reports marekvs cluster health:

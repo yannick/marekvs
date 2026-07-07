@@ -20,8 +20,44 @@ pub use merge::{merge_values, MergeOutcome};
 /// Cluster-unique node identifier (StatefulSet pod ordinal).
 pub type NodeId = u16;
 
-/// Partition of a user key: top 12 bits of xxh3_64 over the key's hash
-/// slice.
+/// Redis-Cluster CRC16 (XMODEM: poly 0x1021, init 0), table-driven.
+/// Must stay bit-identical to redis `crc16.c` — cluster clients compute
+/// slots with it on their side.
+const CRC16_TAB: [u16; 256] = {
+    let mut tab = [0u16; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = (i as u16) << 8;
+        let mut j = 0;
+        while j < 8 {
+            crc = if crc & 0x8000 != 0 { (crc << 1) ^ 0x1021 } else { crc << 1 };
+            j += 1;
+        }
+        tab[i] = crc;
+        i += 1;
+    }
+    tab
+};
+
+pub fn crc16(data: &[u8]) -> u16 {
+    let mut crc = 0u16;
+    for &b in data {
+        crc = (crc << 8) ^ CRC16_TAB[(((crc >> 8) ^ b as u16) & 0xFF) as usize];
+    }
+    crc
+}
+
+/// Redis Cluster slot of a user key: `crc16(hash_slice(key)) % 16384`.
+/// Identical to redis so cluster-aware clients route to the right node
+/// (design/15).
+pub fn slot_of(userkey: &[u8]) -> u16 {
+    crc16(hash_slice(userkey)) % 16384
+}
+
+/// Partition of a user key: its Redis Cluster slot group — 4 consecutive
+/// slots per pid (16384 slots / 4096 partitions), so every pid is the
+/// contiguous slot range `[pid*4, pid*4+3]` and `CLUSTER SLOTS` can report
+/// exact ranges (design/15).
 ///
 /// Redis Cluster hash tags: when the key contains `{...}` with non-empty
 /// content, ONLY that content is hashed — `rate:{user1}:count` and
@@ -30,7 +66,7 @@ pub type NodeId = u16;
 /// and co-located MULTI possible (design/11). Rule matches Redis exactly:
 /// first `{`, then the first `}` AFTER it; empty `{}` hashes the whole key.
 pub fn pid_of(userkey: &[u8]) -> Pid {
-    (xxhash_rust::xxh3::xxh3_64(hash_slice(userkey)) >> 52) as Pid
+    slot_of(userkey) >> 2
 }
 
 fn hash_slice(key: &[u8]) -> &[u8] {
@@ -45,7 +81,7 @@ fn hash_slice(key: &[u8]) -> &[u8] {
 }
 
 #[cfg(test)]
-mod hash_tag_tests {
+mod partition_tests {
     use super::*;
 
     #[test]
@@ -60,5 +96,29 @@ mod hash_tag_tests {
         assert_ne!(pid_of(b"a{open"), pid_of(b"b{open"));
         // First { and first } after it: "{a}{b}" hashes "a".
         assert_eq!(pid_of(b"{a}{b}"), pid_of(b"{a}{zzz}"));
+    }
+
+    #[test]
+    fn crc16_xmodem_vector() {
+        assert_eq!(crc16(b"123456789"), 0x31C3);
+        assert_eq!(crc16(b""), 0);
+    }
+
+    #[test]
+    fn redis_known_slots() {
+        // Vectors from real redis-server CLUSTER KEYSLOT.
+        assert_eq!(slot_of(b"foo"), 12182);
+        assert_eq!(slot_of(b"bar"), 5061);
+        assert_eq!(slot_of(b"hello"), 866);
+        // Hash tag: slot of the tag content only.
+        assert_eq!(slot_of(b"{user1000}.following"), slot_of(b"user1000"));
+    }
+
+    #[test]
+    fn pid_is_slot_group() {
+        for key in [b"foo".as_slice(), b"bar", b"hello", b"{tag}x"] {
+            assert_eq!(pid_of(key), slot_of(key) >> 2);
+        }
+        assert!(u32::from(slot_of(b"anything")) < 16384);
     }
 }
