@@ -5,7 +5,7 @@
 //! see `crate::proto::registry`); protox compilation always runs in
 //! `tokio::task::spawn_blocking`, never on shard threads.
 
-mod doc;
+pub(crate) mod doc;
 
 use std::sync::Arc;
 

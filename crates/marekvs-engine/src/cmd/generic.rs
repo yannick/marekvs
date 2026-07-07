@@ -830,10 +830,45 @@ fn collect_key_records(ctx: &ShardCtx, key: &[u8]) -> Option<Vec<KeyRecord>> {
                 head::CTYPE_STREAM => ikey::Tag::StreamEntry,
                 head::CTYPE_HLL => ikey::Tag::HllRegister,
                 head::CTYPE_LIST => ikey::Tag::ListElem,
-                // Proto values are head-only (design/17): the head record —
-                // already pushed above with its protohead tail verbatim —
-                // IS the whole value; there are no element records.
-                head::CTYPE_PROTO => return Some(out),
+                // Proto values (design/17/18): the head record — already
+                // pushed above with its protohead tail verbatim — carries the
+                // schema reference. fmt=1 is whole-message (head-only). fmt=2
+                // is decomposed: recompose the field records under fresh
+                // element ids (descriptor-free — works even if the schema was
+                // deleted), so the destination gets clean RGA chains and the
+                // materialize-time winners (oneofs) survive the copy.
+                head::CTYPE_PROTO => {
+                    let is_v2 = marekvs_core::protohead::decode(head_payload.get(9..)?)
+                        .is_some_and(|ph| ph.fmt == marekvs_core::protohead::FMT_V2);
+                    if !is_v2 {
+                        return Some(out);
+                    }
+                    let nodes = crate::cmd::proto::doc::load_pnodes(ctx, key, del);
+                    let mut fresh = || marekvs_core::json::Eid {
+                        hlc: ctx.hlc.now(),
+                        origin: ctx.node_id,
+                    };
+                    for rec in marekvs_core::pdoc::recompose_tree(&nodes, &mut fresh) {
+                        match rec {
+                            marekvs_core::pdoc::PRecord::Node { path, val } => out.push((
+                                b'p',
+                                path,
+                                marekvs_core::merge::element_add(
+                                    RecordType::HashField,
+                                    ctx.hlc.now(),
+                                    ctx.node_id,
+                                    &val.encode(),
+                                ),
+                            )),
+                            marekvs_core::pdoc::PRecord::Elem { path, elem } => out.push((
+                                b'p',
+                                path,
+                                store::new_lww(ctx, RecordType::List, &elem.encode(), 0),
+                            )),
+                        }
+                    }
+                    return Some(out);
+                }
                 _ => return None,
             };
             scan_prefix(ctx, &ikey::collection_prefix(tag, key), |k, v| {
@@ -892,6 +927,7 @@ fn rebuild_ikey(tag: u8, userkey: &[u8], suffix: &[u8]) -> Vec<u8> {
         b'x' => ikey::prefixed(ikey::Tag::StreamEntry, userkey, suffix),
         b'H' => ikey::prefixed(ikey::Tag::HllRegister, userkey, suffix),
         b'j' => ikey::json_node_key(userkey, suffix),
+        b'p' => ikey::proto_field_key(userkey, suffix),
         _ => unreachable!("unknown tag"),
     }
 }
