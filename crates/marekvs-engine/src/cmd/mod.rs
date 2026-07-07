@@ -6,6 +6,7 @@ pub mod command_docs;
 pub mod generic;
 pub mod hash;
 pub mod hll;
+pub mod json;
 pub mod list;
 pub mod pubsub;
 pub mod script;

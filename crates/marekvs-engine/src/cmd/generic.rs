@@ -113,6 +113,8 @@ pub async fn type_cmd(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         Some(head::CTYPE_STREAM) => "stream",
         Some(head::CTYPE_HLL) => "string", // Redis compat: PF keys report as strings
         Some(head::CTYPE_BUDGET) => "budget",
+        // RedisJSON module-type name so type-sniffing clients recognize docs.
+        Some(head::CTYPE_JSON) => "ReJSON-RL",
         Some(_) => "none",
     })
 }
@@ -713,6 +715,7 @@ pub async fn object(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
                     head::CTYPE_LIST => "quicklist",
                     head::CTYPE_STREAM => "stream",
                     head::CTYPE_HLL => "raw",
+                    head::CTYPE_JSON => "json",
                     _ => "raw",
                 }),
                 _ => Reply::err("ERR unknown subcommand"),
@@ -749,6 +752,43 @@ fn collect_key_records(ctx: &ShardCtx, key: &[u8]) -> Option<Vec<KeyRecord>> {
                 Vec::new(),
                 store::new_lww(ctx, RecordType::String, &pay, env.ttl_deadline_ms),
             ));
+        }
+        head::CTYPE_JSON => {
+            // A copy is a new identity (counter-freezing precedent): the doc
+            // is materialized and re-decomposed with fresh element ids, so
+            // the destination gets clean RGA chains and no tombstone baggage.
+            let (head_env, _, del) = get_head(ctx, key)?;
+            let env = Envelope::head(ctx.hlc.now(), ctx.node_id).with_ttl(head_env.ttl_deadline_ms);
+            out.push((
+                b'M',
+                Vec::new(),
+                env.encode_with(&head::encode(head::CTYPE_JSON, 0)),
+            ));
+            let nodes = crate::cmd::json::doc::load_nodes(ctx, key, del);
+            let doc = marekvs_core::json::build_doc(&nodes)?;
+            let mut fresh = || marekvs_core::json::Eid {
+                hlc: ctx.hlc.now(),
+                origin: ctx.node_id,
+            };
+            for rec in marekvs_core::json::decompose(&[], &doc.value, &mut fresh) {
+                match rec {
+                    marekvs_core::json::JsonRecord::Map { path, val } => out.push((
+                        b'j',
+                        path,
+                        marekvs_core::merge::element_add(
+                            RecordType::HashField,
+                            ctx.hlc.now(),
+                            ctx.node_id,
+                            &val.encode(),
+                        ),
+                    )),
+                    marekvs_core::json::JsonRecord::Arr { path, elem } => out.push((
+                        b'j',
+                        path,
+                        store::new_lww(ctx, RecordType::List, &elem.encode(), 0),
+                    )),
+                }
+            }
         }
         ctype => {
             // Collections (hash/set/zset/stream/list) — head + elements.
@@ -824,6 +864,7 @@ fn rebuild_ikey(tag: u8, userkey: &[u8], suffix: &[u8]) -> Vec<u8> {
         b'q' => ikey::prefixed(ikey::Tag::ListElem, userkey, suffix),
         b'x' => ikey::prefixed(ikey::Tag::StreamEntry, userkey, suffix),
         b'H' => ikey::prefixed(ikey::Tag::HllRegister, userkey, suffix),
+        b'j' => ikey::json_node_key(userkey, suffix),
         _ => unreachable!("unknown tag"),
     }
 }

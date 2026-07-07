@@ -523,7 +523,7 @@ pub fn get_raw(ctx: &ShardCtx, ikey: &[u8]) -> Option<Vec<u8>> {
 
 /// Raw put with the ondaDB TTL backstop derived from the record.
 pub fn put_raw(ctx: &ShardCtx, ikey: &[u8], value: &[u8]) {
-    let onda_ttl = onda_ttl_for(value);
+    let onda_ttl = onda_ttl_for_keyed(ikey, value);
     if let Err(e) = ctx.db.put(&ctx.data, ikey, value, onda_ttl) {
         tracing::error!(?e, "ondadb put failed");
     }
@@ -551,6 +551,30 @@ pub(crate) fn onda_ttl_for(value: &[u8]) -> Duration {
     }
 }
 
+/// Like [`onda_ttl_for`] but with the RGA-anchor exception (design/16): a
+/// JSON array-element tombstone must survive physical GC — dropping one
+/// dangles other elements' left refs and reorders the array on rebuild. It
+/// is retained (no backstop TTL) until the doc's records are rewritten.
+/// Map-entry tombstones keep the normal `gc_grace` window: they are pure OR
+/// state with the same resurrection story as hash fields.
+pub(crate) fn onda_ttl_for_keyed(ikey_bytes: &[u8], value: &[u8]) -> Duration {
+    if let Some((env, _)) = Envelope::decode(value) {
+        if env.is_tombstone() && env.ttl_deadline_ms == 0 {
+            if let Some(p) = ikey::parse(ikey_bytes) {
+                if p.tag == Tag::Json as u8
+                    && matches!(
+                        marekvs_core::json::split_last(p.suffix),
+                        Some((_, marekvs_core::json::Seg::Elem(_)))
+                    )
+                {
+                    return Duration::ZERO;
+                }
+            }
+        }
+    }
+    onda_ttl_for(value)
+}
+
 /// Batched blind LWW puts: one ondadb transaction (one WAL group-commit
 /// frame, one commit-hook batch) for many records. ONLY valid for records
 /// where a fresh local write is guaranteed to win the merge — LWW string/
@@ -562,7 +586,7 @@ pub(crate) fn onda_ttl_for(value: &[u8]) -> Duration {
 pub fn put_many_lww(ctx: &ShardCtx, items: &[(Vec<u8>, Vec<u8>)]) {
     let mut txn = ctx.db.begin();
     for (ikey, value) in items {
-        let ttl = onda_ttl_for(value);
+        let ttl = onda_ttl_for_keyed(ikey, value);
         if let Err(e) = txn.put(&ctx.data, ikey, value, ttl) {
             tracing::error!(?e, "batched put failed");
         }
@@ -705,6 +729,8 @@ fn collection_nonempty(ctx: &ShardCtx, ctype: u8, userkey: &[u8], del_hlc: u64) 
         head::CTYPE_STREAM => Tag::StreamEntry,
         head::CTYPE_HLL => Tag::HllRegister,
         head::CTYPE_LIST => Tag::ListElem,
+        // A live JSON doc always has a visible root record (design/16).
+        head::CTYPE_JSON => Tag::Json,
         // A budget exists as long as its head is live — escrow slots and
         // tokens are ledger records, not membership (design/13).
         head::CTYPE_BUDGET => return true,
