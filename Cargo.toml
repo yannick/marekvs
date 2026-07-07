@@ -39,6 +39,11 @@ prometheus = { version = "0.14", default-features = false }
 mlua = { version = "0.10", features = ["lua54", "vendored", "serialize"] }
 sha1_smol = "1"
 serde_json = "1"
+# Protobuf stack (design/17): protox pins the prost/prost-reflect pairing.
+prost = "0.14"
+prost-types = "0.14"
+prost-reflect = { version = "0.16", features = ["serde"] }
+protox = "0.9"
 
 marekvs-core = { path = "crates/marekvs-core" }
 marekvs-resp = { path = "crates/marekvs-resp" }
