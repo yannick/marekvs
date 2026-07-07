@@ -31,7 +31,11 @@ const CRC16_TAB: [u16; 256] = {
         let mut crc = (i as u16) << 8;
         let mut j = 0;
         while j < 8 {
-            crc = if crc & 0x8000 != 0 { (crc << 1) ^ 0x1021 } else { crc << 1 };
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
             j += 1;
         }
         tab[i] = crc;

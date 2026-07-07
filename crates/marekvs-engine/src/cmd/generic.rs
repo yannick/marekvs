@@ -333,8 +333,7 @@ fn set_deadline(ctx: &ShardCtx, key: &[u8], deadline: u64) -> bool {
                     // TTL changes.
                     if let Some(raw) = get_raw(ctx, &ikey::head_key(key)) {
                         if let Some((_, pay)) = Envelope::decode(&raw) {
-                            let env =
-                                Envelope::head(ctx.hlc.now(), ctx.node_id).with_ttl(deadline);
+                            let env = Envelope::head(ctx.hlc.now(), ctx.node_id).with_ttl(deadline);
                             let val = env.encode_with(pay);
                             write_merged(ctx, &ikey::head_key(key), &val);
                             return true;

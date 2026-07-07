@@ -57,7 +57,14 @@ fn simple(r: Reply) -> String {
 
 /// Write a raw proto head record directly (plumbing tests run below the
 /// command layer, before the PROTO.* handlers exist).
-async fn write_raw_proto(e: &Arc<Engine>, key: &[u8], schema: &str, ver: u32, tname: &str, msg: &[u8]) {
+async fn write_raw_proto(
+    e: &Arc<Engine>,
+    key: &[u8],
+    schema: &str,
+    ver: u32,
+    tname: &str,
+    msg: &[u8],
+) {
     let key = key.to_vec();
     let (schema, tname, msg) = (schema.to_string(), tname.to_string(), msg.to_vec());
     e.store
@@ -78,7 +85,10 @@ async fn write_raw_proto(e: &Arc<Engine>, key: &[u8], schema: &str, ver: u32, tn
 async fn type_reports_proto() {
     let (_d, e) = engine();
     write_raw_proto(&e, b"k", "orders", 1, "shop.v1.Order", b"\x08\x2a").await;
-    assert_eq!(simple(generic::type_cmd(&e, &a(&[b"TYPE", b"k"])).await), "proto");
+    assert_eq!(
+        simple(generic::type_cmd(&e, &a(&[b"TYPE", b"k"])).await),
+        "proto"
+    );
     assert_eq!(int(generic::exists(&e, &a(&[b"EXISTS", b"k"])).await), 1);
 }
 
@@ -95,7 +105,10 @@ async fn del_removes_proto_value() {
     let (_d, e) = engine();
     write_raw_proto(&e, b"k", "s", 1, "pkg.T", b"x").await;
     assert_eq!(int(generic::del(&e, &a(&[b"DEL", b"k"])).await), 1);
-    assert_eq!(simple(generic::type_cmd(&e, &a(&[b"TYPE", b"k"])).await), "none");
+    assert_eq!(
+        simple(generic::type_cmd(&e, &a(&[b"TYPE", b"k"])).await),
+        "none"
+    );
 }
 
 #[tokio::test]
@@ -103,14 +116,23 @@ async fn rename_and_copy_preserve_proto_tail() {
     let (_d, e) = engine();
     write_raw_proto(&e, b"src", "s", 4, "pkg.T", b"body").await;
     generic::rename(&e, &a(&[b"RENAME", b"src", b"dst"]), false).await;
-    assert_eq!(simple(generic::type_cmd(&e, &a(&[b"TYPE", b"dst"])).await), "proto");
+    assert_eq!(
+        simple(generic::type_cmd(&e, &a(&[b"TYPE", b"dst"])).await),
+        "proto"
+    );
     assert_eq!(
         bulk(generic::object(&e, &a(&[b"OBJECT", b"ENCODING", b"dst"])).await),
         b"pkg.T"
     );
-    assert_eq!(simple(generic::type_cmd(&e, &a(&[b"TYPE", b"src"])).await), "none");
+    assert_eq!(
+        simple(generic::type_cmd(&e, &a(&[b"TYPE", b"src"])).await),
+        "none"
+    );
 
-    assert_eq!(int(generic::copy(&e, &a(&[b"COPY", b"dst", b"c2"])).await), 1);
+    assert_eq!(
+        int(generic::copy(&e, &a(&[b"COPY", b"dst", b"c2"])).await),
+        1
+    );
     assert_eq!(
         bulk(generic::object(&e, &a(&[b"OBJECT", b"ENCODING", b"c2"])).await),
         b"pkg.T"
@@ -188,7 +210,10 @@ async fn schema_set_versioning_increments() {
     assert_eq!(map_get(&g, "version"), Reply::Int(2));
     assert_eq!(map_get(&g, "kind"), Reply::bulk_str("source"));
     let types = array(map_get(&g, "types"));
-    assert!(types.contains(&Reply::bulk_str("shop.v1.Order")), "{types:?}");
+    assert!(
+        types.contains(&Reply::bulk_str("shop.v1.Order")),
+        "{types:?}"
+    );
 
     // Old version stays addressable.
     let g1 = proto_cmd::schema(
@@ -199,11 +224,7 @@ async fn schema_set_versioning_increments() {
     assert_eq!(map_get(&g1, "version"), Reply::Int(1));
 
     // GET ... SOURCE returns the original text.
-    let src = proto_cmd::schema(
-        &e,
-        &a(&[b"PROTO.SCHEMA", b"GET", b"orders", b"SOURCE"]),
-    )
-    .await;
+    let src = proto_cmd::schema(&e, &a(&[b"PROTO.SCHEMA", b"GET", b"orders", b"SOURCE"])).await;
     assert_eq!(bulk(src), ORDER_SRC.as_bytes());
 }
 
@@ -211,9 +232,7 @@ async fn schema_set_versioning_increments() {
 async fn schema_types_and_del_retains_versions() {
     let (_d, e) = engine();
     assert_eq!(int(schema_set_source(&e, b"orders", ORDER_SRC).await), 1);
-    let types = array(
-        proto_cmd::schema(&e, &a(&[b"PROTO.SCHEMA", b"TYPES", b"orders"])).await,
-    );
+    let types = array(proto_cmd::schema(&e, &a(&[b"PROTO.SCHEMA", b"TYPES", b"orders"])).await);
     assert_eq!(
         types,
         vec![
@@ -247,7 +266,13 @@ async fn schema_compile_is_dry_run() {
     let (_d, e) = engine();
     let r = proto_cmd::schema(
         &e,
-        &a(&[b"PROTO.SCHEMA", b"COMPILE", b"x", b"SOURCE", ORDER_SRC.as_bytes()]),
+        &a(&[
+            b"PROTO.SCHEMA",
+            b"COMPILE",
+            b"x",
+            b"SOURCE",
+            ORDER_SRC.as_bytes(),
+        ]),
     )
     .await;
     let types = array(r);
@@ -291,9 +316,7 @@ async fn schema_import_chain_resolves_from_registry() {
         message Invoice { shop.common.Money total = 1; }
     "#;
     assert_eq!(int(schema_set_source(&e, b"invoices", main).await), 1);
-    let types = array(
-        proto_cmd::schema(&e, &a(&[b"PROTO.SCHEMA", b"TYPES", b"invoices"])).await,
-    );
+    let types = array(proto_cmd::schema(&e, &a(&[b"PROTO.SCHEMA", b"TYPES", b"invoices"])).await);
     assert!(types.contains(&Reply::bulk_str("shop.v1.Invoice")));
     // Self-contained: imported type is in the stored set too.
     assert!(types.contains(&Reply::bulk_str("shop.common.Money")));
@@ -319,17 +342,19 @@ async fn schema_descriptor_upload() {
     let g = proto_cmd::schema(&e, &a(&[b"PROTO.SCHEMA", b"GET", b"orders"])).await;
     assert_eq!(map_get(&g, "kind"), Reply::bulk_str("descriptor"));
     // GET ... DESCRIPTOR round-trips the bytes.
-    let fds = proto_cmd::schema(
-        &e,
-        &a(&[b"PROTO.SCHEMA", b"GET", b"orders", b"DESCRIPTOR"]),
-    )
-    .await;
+    let fds = proto_cmd::schema(&e, &a(&[b"PROTO.SCHEMA", b"GET", b"orders", b"DESCRIPTOR"])).await;
     assert_eq!(bulk(fds), out.fds);
     // Garbage rejected.
     assert_err_contains(
         proto_cmd::schema(
             &e,
-            &a(&[b"PROTO.SCHEMA", b"SET", b"junk", b"DESCRIPTOR", b"\xff\xffgarbage"]),
+            &a(&[
+                b"PROTO.SCHEMA",
+                b"SET",
+                b"junk",
+                b"DESCRIPTOR",
+                b"\xff\xffgarbage",
+            ]),
         )
         .await,
         "SCHEMAERR",
@@ -359,18 +384,27 @@ async fn bind_longest_prefix_and_unbind() {
     ok(proto_cmd::bind(&e, &a(&[b"PROTO.BIND", b"user:", b"shop.v1.Customer"])).await);
     ok(proto_cmd::bind(
         &e,
-        &a(&[b"PROTO.BIND", b"user:order:", b"shop.v1.Order", b"SCHEMA", b"orders"]),
+        &a(&[
+            b"PROTO.BIND",
+            b"user:order:",
+            b"shop.v1.Order",
+            b"SCHEMA",
+            b"orders",
+        ]),
     )
     .await);
 
-    let b = registry::binding_for_key(&e, b"user:order:1").await.unwrap();
+    let b = registry::binding_for_key(&e, b"user:order:1")
+        .await
+        .unwrap();
     assert_eq!(b.type_name, "shop.v1.Order");
     let b = registry::binding_for_key(&e, b"user:1").await.unwrap();
     assert_eq!(b.type_name, "shop.v1.Customer");
     assert!(registry::binding_for_key(&e, b"other:1").await.is_none());
 
     // MATCH filter on BINDINGS
-    let filtered = proto_cmd::bindings_cmd(&e, &a(&[b"PROTO.BINDINGS", b"MATCH", b"user:order*"])).await;
+    let filtered =
+        proto_cmd::bindings_cmd(&e, &a(&[b"PROTO.BINDINGS", b"MATCH", b"user:order*"])).await;
     match &filtered {
         Reply::Map(pairs) => assert_eq!(pairs.len(), 1, "{filtered:?}"),
         other => panic!("expected Map, got {other:?}"),
@@ -384,7 +418,9 @@ async fn bind_longest_prefix_and_unbind() {
         int(proto_cmd::unbind(&e, &a(&[b"PROTO.UNBIND", b"user:order:"])).await),
         0
     );
-    let b = registry::binding_for_key(&e, b"user:order:1").await.unwrap();
+    let b = registry::binding_for_key(&e, b"user:order:1")
+        .await
+        .unwrap();
     assert_eq!(b.type_name, "shop.v1.Customer"); // falls back to shorter prefix
 }
 
@@ -467,8 +503,14 @@ async fn proto_set_get_info_via_binding() {
     let (_d, e) = bound_engine().await;
     let msg = order_bytes("o-1", 995);
     ok(proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:1", &msg])).await);
-    assert_eq!(bulk(proto_cmd::get(&e, &a(&[b"PROTO.GET", b"order:1"])).await), msg);
-    assert_eq!(simple(generic::type_cmd(&e, &a(&[b"TYPE", b"order:1"])).await), "proto");
+    assert_eq!(
+        bulk(proto_cmd::get(&e, &a(&[b"PROTO.GET", b"order:1"])).await),
+        msg
+    );
+    assert_eq!(
+        simple(generic::type_cmd(&e, &a(&[b"TYPE", b"order:1"])).await),
+        "proto"
+    );
     assert_eq!(
         bulk(generic::object(&e, &a(&[b"OBJECT", b"ENCODING", b"order:1"])).await),
         b"shop.v1.Order"
@@ -479,7 +521,10 @@ async fn proto_set_get_info_via_binding() {
     assert_eq!(map_get(&info, "type"), Reply::bulk_str("shop.v1.Order"));
     assert_eq!(map_get(&info, "bytes"), Reply::Int(msg.len() as i64));
     // Absent keys → Null / err
-    assert_eq!(proto_cmd::get(&e, &a(&[b"PROTO.GET", b"order:none"])).await, Reply::Null);
+    assert_eq!(
+        proto_cmd::get(&e, &a(&[b"PROTO.GET", b"order:none"])).await,
+        Reply::Null
+    );
     assert_err_contains(
         proto_cmd::info(&e, &a(&[b"PROTO.INFO", b"order:none"])).await,
         "no such key",
@@ -506,7 +551,11 @@ async fn proto_set_type_arg_overrides_and_nobinding_errors() {
     );
     // Unknown TYPE errors.
     assert_err_contains(
-        proto_cmd::set(&e, &a(&[b"PROTO.SET", b"free:2", &msg, b"TYPE", b"no.Type"])).await,
+        proto_cmd::set(
+            &e,
+            &a(&[b"PROTO.SET", b"free:2", &msg, b"TYPE", b"no.Type"]),
+        )
+        .await,
         "NOSCHEMA",
     );
 }
@@ -518,7 +567,10 @@ async fn proto_set_validates_bytes() {
         proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:1", b"\xff\xff\xff\xff\xff"])).await,
         "PROTOVALIDATE",
     );
-    assert_eq!(proto_cmd::get(&e, &a(&[b"PROTO.GET", b"order:1"])).await, Reply::Null);
+    assert_eq!(
+        proto_cmd::get(&e, &a(&[b"PROTO.GET", b"order:1"])).await,
+        Reply::Null
+    );
 }
 
 #[tokio::test]
@@ -549,7 +601,10 @@ async fn proto_wrongtype_and_plain_set_shadowing() {
     // Plain SET shadows an existing proto value (standard Redis semantics).
     ok(proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:p", &msg])).await);
     ok(string_cmd::set(&e, &a(&[b"SET", b"order:p", b"shadow"])).await);
-    assert_eq!(simple(generic::type_cmd(&e, &a(&[b"TYPE", b"order:p"])).await), "string");
+    assert_eq!(
+        simple(generic::type_cmd(&e, &a(&[b"TYPE", b"order:p"])).await),
+        "string"
+    );
     assert_err_contains(
         proto_cmd::get(&e, &a(&[b"PROTO.GET", b"order:p"])).await,
         "WRONGTYPE",
@@ -586,7 +641,10 @@ async fn proto_set_ttl_options() {
     assert!(ttl > 90 && ttl <= 100, "ttl {ttl}");
     // Overwrite without KEEPTTL clears the TTL…
     ok(proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:t", &msg])).await);
-    assert_eq!(int(generic::ttl(&e, &a(&[b"TTL", b"order:t"]), false).await), -1);
+    assert_eq!(
+        int(generic::ttl(&e, &a(&[b"TTL", b"order:t"]), false).await),
+        -1
+    );
     // …and KEEPTTL retains it.
     ok(proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:t", &msg, b"PX", b"90000"])).await);
     ok(proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:t", &msg, b"KEEPTTL"])).await);
@@ -680,7 +738,10 @@ async fn proto_del_recreate_keeps_delete_clock() {
     assert_eq!(int(generic::del(&e, &a(&[b"DEL", b"order:d"])).await), 1);
     let msg2 = order_bytes("o2", 2);
     ok(proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:d", &msg2])).await);
-    assert_eq!(bulk(proto_cmd::get(&e, &a(&[b"PROTO.GET", b"order:d"])).await), msg2);
+    assert_eq!(
+        bulk(proto_cmd::get(&e, &a(&[b"PROTO.GET", b"order:d"])).await),
+        msg2
+    );
     // The re-created head must carry a non-zero delete clock (design/02
     // carry-forward: stale pre-delete records may not resurrect).
     let raw = e
@@ -741,11 +802,7 @@ async fn getfield_native_types() {
     assert_eq!(gf(b"tags.9").await, Reply::Null);
     assert_eq!(gf(b"scores.nobody").await, Reply::Null);
     // multiple paths → Array
-    let r = proto_cmd::getfield(
-        &e,
-        &a(&[b"PROTO.GETFIELD", b"order:f", b"id", b"paid"]),
-    )
-    .await;
+    let r = proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:f", b"id", b"paid"])).await;
     assert_eq!(
         r,
         Reply::Array(vec![Reply::Bulk(b"o-1".to_vec()), Reply::Bool(true)])
@@ -834,7 +891,12 @@ async fn setfield_rmw_preserves_untouched_fields() {
     assert_err_contains(
         proto_cmd::setfield(
             &e,
-            &a(&[b"PROTO.SETFIELD", b"order:rm", b"customer.tier", b"notanint"]),
+            &a(&[
+                b"PROTO.SETFIELD",
+                b"order:rm",
+                b"customer.tier",
+                b"notanint",
+            ]),
         )
         .await,
         "PROTOPATH",
@@ -852,7 +914,10 @@ async fn setfield_keeps_ttl_and_lww_stamps() {
     ok(proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:st", &msg, b"EX", b"100"])).await);
     ok(proto_cmd::setfield(&e, &a(&[b"PROTO.SETFIELD", b"order:st", b"id", b"new-id"])).await);
     let ttl = int(generic::ttl(&e, &a(&[b"TTL", b"order:st"]), false).await);
-    assert!(ttl > 90 && ttl <= 100, "SETFIELD must keep the TTL, got {ttl}");
+    assert!(
+        ttl > 90 && ttl <= 100,
+        "SETFIELD must keep the TTL, got {ttl}"
+    );
     assert_eq!(
         proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:st", b"id"])).await,
         Reply::Bulk(b"new-id".to_vec())
@@ -864,19 +929,17 @@ async fn clearfield_scalars_lists_maps() {
     let (_d, e) = bound_engine().await;
     seed_order(&e, b"order:cl").await;
     // clear a scalar, a list element and a map key: 3 cleared
-    let n = int(
-        proto_cmd::clearfield(
-            &e,
-            &a(&[
-                b"PROTO.CLEARFIELD",
-                b"order:cl",
-                b"paid",
-                b"tags.0",
-                b"scores.alice",
-            ]),
-        )
-        .await,
-    );
+    let n = int(proto_cmd::clearfield(
+        &e,
+        &a(&[
+            b"PROTO.CLEARFIELD",
+            b"order:cl",
+            b"paid",
+            b"tags.0",
+            b"scores.alice",
+        ]),
+    )
+    .await);
     assert_eq!(n, 3);
     assert_eq!(
         proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:cl", b"paid"])).await,
@@ -892,7 +955,10 @@ async fn clearfield_scalars_lists_maps() {
     );
     // clearing something already absent counts 0
     assert_eq!(
-        int(proto_cmd::clearfield(&e, &a(&[b"PROTO.CLEARFIELD", b"order:cl", b"scores.alice"])).await),
+        int(
+            proto_cmd::clearfield(&e, &a(&[b"PROTO.CLEARFIELD", b"order:cl", b"scores.alice"]))
+                .await
+        ),
         0
     );
     // message field clears to unset (Null)
@@ -920,6 +986,179 @@ async fn setjson_getjson_roundtrip_after_field_edits() {
     ok(proto_cmd::setjson(&e, &a(&[b"PROTO.SETJSON", b"order:rt2", &out])).await);
     let out2 = bulk(proto_cmd::getjson(&e, &a(&[b"PROTO.GETJSON", b"order:rt2"])).await);
     assert_eq!(out, out2);
+}
+
+// ---------------------------------------------------------------------------
+// B6 — validated collection elements: PROTO.HSET/SADD/HGETJSON/HGETFIELD
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn proto_hset_validates_then_delegates() {
+    let (_d, e) = bound_engine().await;
+    use marekvs_engine::cmd::hash as hash_cmd;
+    let m1 = order_bytes("h-1", 11);
+    let m2 = order_bytes("h-2", 22);
+    assert_eq!(
+        int(proto_cmd::hset(&e, &a(&[b"PROTO.HSET", b"order:h", b"f1", &m1, b"f2", &m2])).await),
+        2
+    );
+    // Element payloads stay raw proto bytes: plain HGET returns them.
+    assert_eq!(
+        bulk(hash_cmd::hget(&e, &a(&[b"HGET", b"order:h", b"f1"])).await),
+        m1
+    );
+    assert_eq!(
+        simple(generic::type_cmd(&e, &a(&[b"TYPE", b"order:h"])).await),
+        "hash"
+    );
+
+    // One invalid value → PROTOVALIDATE, and NOTHING is written.
+    assert_err_contains(
+        proto_cmd::hset(
+            &e,
+            &a(&[
+                b"PROTO.HSET",
+                b"order:h2",
+                b"good",
+                &m1,
+                b"bad",
+                b"\xff\xff\xff\xff\xff",
+            ]),
+        )
+        .await,
+        "PROTOVALIDATE",
+    );
+    assert_eq!(
+        hash_cmd::hget(&e, &a(&[b"HGET", b"order:h2", b"good"])).await,
+        Reply::Null
+    );
+
+    // No binding and no TYPE → NOBINDING; TYPE clause right after the key.
+    assert_err_contains(
+        proto_cmd::hset(&e, &a(&[b"PROTO.HSET", b"free:h", b"f", &m1])).await,
+        "NOBINDING",
+    );
+    assert_eq!(
+        int(proto_cmd::hset(
+            &e,
+            &a(&[
+                b"PROTO.HSET",
+                b"free:h",
+                b"TYPE",
+                b"shop.v1.Order",
+                b"f",
+                &m1
+            ]),
+        )
+        .await),
+        1
+    );
+}
+
+#[tokio::test]
+async fn proto_sadd_validates_then_delegates() {
+    let (_d, e) = bound_engine().await;
+    use marekvs_engine::cmd::set as set_cmd;
+    let m1 = order_bytes("s-1", 1);
+    let m2 = order_bytes("s-2", 2);
+    assert_eq!(
+        int(proto_cmd::sadd(&e, &a(&[b"PROTO.SADD", b"order:set", &m1, &m2])).await),
+        2
+    );
+    // duplicate re-add counts 0
+    assert_eq!(
+        int(proto_cmd::sadd(&e, &a(&[b"PROTO.SADD", b"order:set", &m1])).await),
+        0
+    );
+    assert_eq!(
+        int(set_cmd::scard(&e, &a(&[b"SCARD", b"order:set"])).await),
+        2
+    );
+    assert_eq!(
+        simple(generic::type_cmd(&e, &a(&[b"TYPE", b"order:set"])).await),
+        "set"
+    );
+    assert_err_contains(
+        proto_cmd::sadd(
+            &e,
+            &a(&[b"PROTO.SADD", b"order:set", b"\xff\xff\xff\xff\xff"]),
+        )
+        .await,
+        "PROTOVALIDATE",
+    );
+}
+
+#[tokio::test]
+async fn proto_hgetjson_and_hgetfield() {
+    let (_d, e) = bound_engine().await;
+    let m = order_bytes("hj-1", 777);
+    assert_eq!(
+        int(proto_cmd::hset(&e, &a(&[b"PROTO.HSET", b"order:hj", b"f", &m])).await),
+        1
+    );
+    let out = bulk(proto_cmd::hgetjson(&e, &a(&[b"PROTO.HGETJSON", b"order:hj", b"f"])).await);
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["id"], "hj-1");
+    assert_eq!(v["totalCents"], "777");
+    // Missing field → Null.
+    assert_eq!(
+        proto_cmd::hgetjson(&e, &a(&[b"PROTO.HGETJSON", b"order:hj", b"none"])).await,
+        Reply::Null
+    );
+    // Field path into the element.
+    assert_eq!(
+        proto_cmd::hgetfield(&e, &a(&[b"PROTO.HGETFIELD", b"order:hj", b"f", b"id"])).await,
+        Reply::Bulk(b"hj-1".to_vec())
+    );
+    assert_eq!(
+        proto_cmd::hgetfield(
+            &e,
+            &a(&[b"PROTO.HGETFIELD", b"order:hj", b"f", b"total_cents"]),
+        )
+        .await,
+        Reply::Int(777)
+    );
+    assert_err_contains(
+        proto_cmd::hgetfield(&e, &a(&[b"PROTO.HGETFIELD", b"order:hj", b"f", b"nosuch"])).await,
+        "PROTOPATH",
+    );
+
+    // TYPE arg resolution for keys without a binding.
+    let m2 = order_bytes("hj-2", 2);
+    assert_eq!(
+        int(proto_cmd::hset(
+            &e,
+            &a(&[
+                b"PROTO.HSET",
+                b"free:hj",
+                b"TYPE",
+                b"shop.v1.Order",
+                b"f",
+                &m2
+            ]),
+        )
+        .await),
+        1
+    );
+    assert_err_contains(
+        proto_cmd::hgetjson(&e, &a(&[b"PROTO.HGETJSON", b"free:hj", b"f"])).await,
+        "NOBINDING",
+    );
+    let out = bulk(
+        proto_cmd::hgetjson(
+            &e,
+            &a(&[
+                b"PROTO.HGETJSON",
+                b"free:hj",
+                b"f",
+                b"TYPE",
+                b"shop.v1.Order",
+            ]),
+        )
+        .await,
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["id"], "hj-2");
 }
 
 #[tokio::test]

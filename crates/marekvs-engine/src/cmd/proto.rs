@@ -23,8 +23,8 @@ use marekvs_core::{ikey, protohead};
 const MAX_NAME: usize = 255;
 
 fn parse_name(raw: &[u8]) -> Result<String, Reply> {
-    let s = std::str::from_utf8(raw)
-        .map_err(|_| Reply::err("SCHEMAERR schema name must be utf-8"))?;
+    let s =
+        std::str::from_utf8(raw).map_err(|_| Reply::err("SCHEMAERR schema name must be utf-8"))?;
     if s.is_empty() || s.len() > MAX_NAME || s.contains('\0') {
         return Err(Reply::err("SCHEMAERR invalid schema name"));
     }
@@ -113,7 +113,12 @@ async fn schema_set(engine: &Arc<Engine>, args: &[Vec<u8>], dry_run: bool) -> Re
     };
 
     if dry_run {
-        return Reply::Array(out.types.iter().map(|t| Reply::bulk_str(t.clone())).collect());
+        return Reply::Array(
+            out.types
+                .iter()
+                .map(|t| Reply::bulk_str(t.clone()))
+                .collect(),
+        );
     }
 
     // Monotonic per-name version. Concurrent same-name SET is LWW on the
@@ -456,7 +461,9 @@ async fn write_value(
             });
             let ttl = match (o.ttl, o.keepttl) {
                 (Some(t), _) => t,
-                (None, true) => existing.as_ref().map_or(0, |(env, _, _)| env.ttl_deadline_ms),
+                (None, true) => existing
+                    .as_ref()
+                    .map_or(0, |(env, _, _)| env.ttl_deadline_ms),
                 (None, false) => 0,
             };
             let mut payload = head::encode(head::CTYPE_PROTO, prev_del);
@@ -816,6 +823,189 @@ pub async fn getjson(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         Ok(Some((m, _))) => match serde_json::to_string(&m) {
             Ok(s) => Reply::Bulk(s.into_bytes()),
             Err(e) => Reply::err(format!("ERR json render failed: {e}")),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// validated collection elements: PROTO.HSET / SADD / HGETJSON / HGETFIELD
+// ---------------------------------------------------------------------------
+
+/// Parse the optional `TYPE t` clause at `args[at]`, returning the type and
+/// the index of the first argument after the clause.
+fn parse_type_clause(args: &[Vec<u8>], at: usize) -> Result<(Option<String>, usize), Reply> {
+    if args.len() > at && eq_ignore_case(&args[at], "TYPE") {
+        let Some(t) = args.get(at + 1) else {
+            return Err(Reply::syntax());
+        };
+        let Ok(t) = String::from_utf8(t.clone()) else {
+            return Err(Reply::err("ERR type name must be utf-8"));
+        };
+        return Ok((Some(t), at + 2));
+    }
+    Ok((None, at))
+}
+
+/// Validate `raw` decodes as the resolved type (with the value size bound).
+fn validate_element(
+    engine: &Arc<Engine>,
+    resolved: &registry::ResolvedType,
+    raw: &[u8],
+) -> Result<(), Reply> {
+    if raw.len() > engine.proto.limits.max_value {
+        return Err(ProtoErr::Validate(format!(
+            "value too large ({} bytes, limit {})",
+            raw.len(),
+            engine.proto.limits.max_value
+        ))
+        .reply());
+    }
+    DynamicMessage::decode(resolved.desc.clone(), raw)
+        .map(|_| ())
+        .map_err(|e| ProtoErr::Validate(format!("{}: {e}", resolved.type_name)).reply())
+}
+
+/// `PROTO.HSET key [TYPE t] field value [field value…]` — validate every
+/// value against the resolved type, then DELEGATE to `hash::hset` verbatim
+/// (element payloads stay raw proto bytes; OR-merge machinery untouched).
+pub async fn hset(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 4 {
+        return Reply::wrong_args("proto.hset");
+    }
+    let key = args[1].clone();
+    let (type_name, rest_at) = match parse_type_clause(args, 2) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let rest = &args[rest_at..];
+    if rest.is_empty() || rest.len() % 2 != 0 {
+        return Reply::wrong_args("proto.hset");
+    }
+    let resolved =
+        match registry::resolve_for_key(engine, &key, type_name.as_deref(), None, 0).await {
+            Ok(r) => r,
+            Err(e) => return e.reply(),
+        };
+    for pair in rest.chunks(2) {
+        if let Err(r) = validate_element(engine, &resolved, &pair[1]) {
+            return r; // nothing written: all values validate up front
+        }
+    }
+    let mut delegate: Vec<Vec<u8>> = Vec::with_capacity(2 + rest.len());
+    delegate.push(b"HSET".to_vec());
+    delegate.push(key);
+    delegate.extend(rest.iter().cloned());
+    super::hash::hset(engine, &delegate, false).await
+}
+
+/// `PROTO.SADD key [TYPE t] member [member…]` — validate, then delegate to
+/// `set::sadd`.
+pub async fn sadd(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() < 3 {
+        return Reply::wrong_args("proto.sadd");
+    }
+    let key = args[1].clone();
+    let (type_name, rest_at) = match parse_type_clause(args, 2) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let rest = &args[rest_at..];
+    if rest.is_empty() {
+        return Reply::wrong_args("proto.sadd");
+    }
+    let resolved =
+        match registry::resolve_for_key(engine, &key, type_name.as_deref(), None, 0).await {
+            Ok(r) => r,
+            Err(e) => return e.reply(),
+        };
+    for member in rest {
+        if let Err(r) = validate_element(engine, &resolved, member) {
+            return r;
+        }
+    }
+    let mut delegate: Vec<Vec<u8>> = Vec::with_capacity(2 + rest.len());
+    delegate.push(b"SADD".to_vec());
+    delegate.push(key);
+    delegate.extend(rest.iter().cloned());
+    super::set::sadd(engine, &delegate).await
+}
+
+/// Read one hash element and decode it against the resolved type. The type
+/// is resolved at READ time (explicit TYPE > binding) — rebinding a prefix
+/// changes interpretation, not the stored bytes (documented caveat).
+async fn load_hash_element(
+    engine: &Arc<Engine>,
+    key: &[u8],
+    field: &[u8],
+    type_name: Option<&str>,
+) -> Result<Option<DynamicMessage>, Reply> {
+    let resolved = match registry::resolve_for_key(engine, key, type_name, None, 0).await {
+        Ok(r) => r,
+        Err(e) => return Err(e.reply()),
+    };
+    let raw =
+        match super::hash::hget(engine, &[b"HGET".to_vec(), key.to_vec(), field.to_vec()]).await {
+            Reply::Bulk(b) => b,
+            Reply::Null => return Ok(None),
+            other => return Err(other), // WRONGTYPE etc.
+        };
+    match DynamicMessage::decode(resolved.desc.clone(), &raw[..]) {
+        Ok(m) => Ok(Some(m)),
+        Err(e) => Err(ProtoErr::Validate(format!(
+            "stored element does not decode as {}: {e}",
+            resolved.type_name
+        ))
+        .reply()),
+    }
+}
+
+/// `PROTO.HGETJSON key field [TYPE t]` → canonical protobuf-JSON of one
+/// hash element.
+pub async fn hgetjson(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() != 3 && args.len() != 5 {
+        return Reply::wrong_args("proto.hgetjson");
+    }
+    let (type_name, rest_at) = match parse_type_clause(args, 3) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if rest_at != args.len() {
+        return Reply::syntax();
+    }
+    match load_hash_element(engine, &args[1], &args[2], type_name.as_deref()).await {
+        Err(r) => r,
+        Ok(None) => Reply::Null,
+        Ok(Some(m)) => match serde_json::to_string(&m) {
+            Ok(s) => Reply::Bulk(s.into_bytes()),
+            Err(e) => Reply::err(format!("ERR json render failed: {e}")),
+        },
+    }
+}
+
+/// `PROTO.HGETFIELD key field path [TYPE t]` → one field of one hash
+/// element (GETFIELD rendering rules).
+pub async fn hgetfield(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if args.len() != 4 && args.len() != 6 {
+        return Reply::wrong_args("proto.hgetfield");
+    }
+    let (type_name, rest_at) = match parse_type_clause(args, 4) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if rest_at != args.len() {
+        return Reply::syntax();
+    }
+    let segs = match path::parse_path(&args[3]) {
+        Ok(p) => p,
+        Err(e) => return e.reply(),
+    };
+    match load_hash_element(engine, &args[1], &args[2], type_name.as_deref()).await {
+        Err(r) => r,
+        Ok(None) => Reply::Null,
+        Ok(Some(m)) => match path::get_path(&m, &segs) {
+            Ok(Some(r)) => path::render(&r),
+            Ok(None) => Reply::Null,
+            Err(e) => e.reply(),
         },
     }
 }

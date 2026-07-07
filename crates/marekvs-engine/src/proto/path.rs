@@ -17,8 +17,8 @@ pub const MAX_SEGMENTS: usize = 32;
 
 /// Parse a raw path argument into segments.
 pub fn parse_path(raw: &[u8]) -> Result<Vec<String>, ProtoErr> {
-    let s = std::str::from_utf8(raw)
-        .map_err(|_| ProtoErr::Path("path is not valid utf-8".into()))?;
+    let s =
+        std::str::from_utf8(raw).map_err(|_| ProtoErr::Path("path is not valid utf-8".into()))?;
     if s.is_empty() {
         return Err(ProtoErr::Path("empty path".into()));
     }
@@ -69,15 +69,15 @@ fn parse_map_key(seg: &str, key_kind: &Kind) -> Result<MapKey, ProtoErr> {
             "false" | "0" => false,
             _ => return Err(bad()),
         }),
-        Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => {
-            MapKey::I32(seg.parse().map_err(|_| bad())?)
-        }
-        Kind::Int64 | Kind::Sint64 | Kind::Sfixed64 => {
-            MapKey::I64(seg.parse().map_err(|_| bad())?)
-        }
+        Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => MapKey::I32(seg.parse().map_err(|_| bad())?),
+        Kind::Int64 | Kind::Sint64 | Kind::Sfixed64 => MapKey::I64(seg.parse().map_err(|_| bad())?),
         Kind::Uint32 | Kind::Fixed32 => MapKey::U32(seg.parse().map_err(|_| bad())?),
         Kind::Uint64 | Kind::Fixed64 => MapKey::U64(seg.parse().map_err(|_| bad())?),
-        other => return Err(ProtoErr::Path(format!("unsupported map key kind {other:?}"))),
+        other => {
+            return Err(ProtoErr::Path(format!(
+                "unsupported map key kind {other:?}"
+            )))
+        }
     })
 }
 
@@ -121,12 +121,18 @@ fn descend(
     segs: &[String],
 ) -> Result<Option<Resolved>, ProtoErr> {
     let Some(seg) = segs.first() else {
-        return Ok(Some(Resolved { value, field: fd, element }));
+        return Ok(Some(Resolved {
+            value,
+            field: fd,
+            element,
+        }));
     };
     let rest = &segs[1..];
     if !element && fd.is_list() {
         let Value::List(items) = value else {
-            return Err(ProtoErr::Path("internal: repeated field is not a list".into()));
+            return Err(ProtoErr::Path(
+                "internal: repeated field is not a list".into(),
+            ));
         };
         let idx = parse_index(seg)?;
         return match items.into_iter().nth(idx) {
@@ -235,7 +241,10 @@ pub fn value_to_json(value: &Value, field: &FieldDescriptor, element: bool) -> s
     if !element && field.is_list() {
         if let Value::List(items) = value {
             return serde_json::Value::Array(
-                items.iter().map(|v| value_to_json(v, field, true)).collect(),
+                items
+                    .iter()
+                    .map(|v| value_to_json(v, field, true))
+                    .collect(),
             );
         }
         return serde_json::Value::Null;
@@ -295,7 +304,11 @@ pub fn base64(data: &[u8]) -> String {
     const AL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         out.push(AL[(n >> 18) as usize & 63] as char);
         out.push(AL[(n >> 12) as usize & 63] as char);
@@ -321,8 +334,9 @@ pub fn base64(data: &[u8]) -> String {
 /// string form, message/repeated/map from JSON.
 pub fn parse_value(raw: &[u8], field: &FieldDescriptor, element: bool) -> Result<Value, ProtoErr> {
     if !element && (field.is_list() || field.is_map()) {
-        let json: serde_json::Value = serde_json::from_slice(raw)
-            .map_err(|e| ProtoErr::Path(format!("value for '{}' is not JSON: {e}", field.name())))?;
+        let json: serde_json::Value = serde_json::from_slice(raw).map_err(|e| {
+            ProtoErr::Path(format!("value for '{}' is not JSON: {e}", field.name()))
+        })?;
         return json_to_value(&json, field, false);
     }
     let kind = field.kind();
@@ -414,7 +428,10 @@ fn json_to_value(
         let vfd = entry.map_entry_value_field();
         let mut map = std::collections::HashMap::new();
         for (k, v) in obj {
-            map.insert(parse_map_key(k, &kfd.kind())?, json_to_value(v, &vfd, false)?);
+            map.insert(
+                parse_map_key(k, &kfd.kind())?,
+                json_to_value(v, &vfd, false)?,
+            );
         }
         return Ok(Value::Map(map));
     }
@@ -593,7 +610,9 @@ fn set_in_value(
     let rest = &segs[1..];
     if !element && fd.is_list() {
         let Value::List(items) = val else {
-            return Err(ProtoErr::Path("internal: repeated field is not a list".into()));
+            return Err(ProtoErr::Path(
+                "internal: repeated field is not a list".into(),
+            ));
         };
         let idx = parse_index(seg)?;
         if idx < items.len() {
@@ -674,7 +693,9 @@ fn clear_in_value(
     let rest = &segs[1..];
     if !element && fd.is_list() {
         let Value::List(items) = val else {
-            return Err(ProtoErr::Path("internal: repeated field is not a list".into()));
+            return Err(ProtoErr::Path(
+                "internal: repeated field is not a list".into(),
+            ));
         };
         let idx = parse_index(seg)?;
         if idx >= items.len() {
@@ -867,7 +888,11 @@ mod tests {
     fn repeated_message_paths() {
         let p = pool();
         let mut m = outer(&p);
-        set(&mut m, "items", br#"[{"note":"n0"},{"note":"n1","big":"7"}]"#);
+        set(
+            &mut m,
+            "items",
+            br#"[{"note":"n0"},{"note":"n1","big":"7"}]"#,
+        );
         assert_eq!(get(&m, "items.1.note"), Reply::Bulk(b"n1".to_vec()));
         assert_eq!(get(&m, "items.1.big"), Reply::Int(7));
         set(&mut m, "items.0.note", b"patched");
@@ -966,7 +991,10 @@ mod tests {
         set(&mut m, "blob", &[0xDE, 0xAD, 0xBE, 0xEF]);
         assert_eq!(get(&m, "blob"), Reply::Bulk(vec![0xDE, 0xAD, 0xBE, 0xEF]));
         assert_eq!(base64(&[0xDE, 0xAD, 0xBE, 0xEF]), "3q2+7w==");
-        assert_eq!(base64_decode("3q2+7w==").unwrap(), vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(
+            base64_decode("3q2+7w==").unwrap(),
+            vec![0xDE, 0xAD, 0xBE, 0xEF]
+        );
         assert_eq!(base64(b"a"), "YQ==");
         assert_eq!(base64_decode("YQ==").unwrap(), b"a".to_vec());
         assert_eq!(base64(b""), "");

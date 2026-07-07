@@ -131,7 +131,7 @@ impl ProtoState {
         Self {
             limits: ProtoLimits::from_env(),
             pools: parking_lot::Mutex::new(PoolLru::new(
-                env_u64("MAREKVS_PROTO_POOL_CACHE", 128) as usize,
+                env_u64("MAREKVS_PROTO_POOL_CACHE", 128) as usize
             )),
             bindings: parking_lot::Mutex::new(None),
             bind_ttl_ms: env_u64("MAREKVS_PROTO_BIND_TTL_MS", 2000),

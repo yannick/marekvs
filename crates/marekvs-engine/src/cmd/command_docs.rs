@@ -998,6 +998,20 @@ static TABLE: &[CommandDoc] = &[
         &[A_KEY, Arg { multiple: true, name: "path-value", typ: "block", args: &[arg("path", "string"), arg("value", "string")], ..arg("path-value", "block") }]),
     with_args(cmd("proto.clearfield", -3, CW, 1, 1, 1, "Clears message fields / list elements / map keys by dot-path.", "1.3.0", "proto"),
         &[A_KEY, Arg { multiple: true, ..arg("path", "string") }]),
+    with_args(cmd("proto.hset", -4, CW, 1, 1, 1, "Validates protobuf values then stores them as ordinary hash fields (raw bytes).", "1.3.0", "proto"),
+        &[A_KEY,
+          Arg { token: Some("TYPE"), optional: true, ..arg("type", "string") },
+          Arg { multiple: true, name: "field-value", typ: "block", args: &[arg("field", "string"), arg("value", "string")], ..arg("field-value", "block") }]),
+    with_args(cmd("proto.sadd", -3, CW, 1, 1, 1, "Validates protobuf values then adds them as ordinary set members (raw bytes).", "1.3.0", "proto"),
+        &[A_KEY,
+          Arg { token: Some("TYPE"), optional: true, ..arg("type", "string") },
+          Arg { multiple: true, ..arg("member", "string") }]),
+    with_args(cmd("proto.hgetjson", -3, CRO, 1, 1, 1, "Returns one hash element decoded to canonical protobuf-JSON.", "1.3.0", "proto"),
+        &[A_KEY, arg("field", "string"),
+          Arg { token: Some("TYPE"), optional: true, ..arg("type", "string") }]),
+    with_args(cmd("proto.hgetfield", -4, CRO, 1, 1, 1, "Returns one field of one hash element by dot-path.", "1.3.0", "proto"),
+        &[A_KEY, arg("field", "string"), arg("path", "string"),
+          Arg { token: Some("TYPE"), optional: true, ..arg("type", "string") }]),
 ];
 
 /// The full command catalog.
