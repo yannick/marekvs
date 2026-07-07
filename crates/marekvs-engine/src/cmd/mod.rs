@@ -1,6 +1,7 @@
 //! Command dispatch: one match arm per command, grouped in family modules
 
 pub mod budget;
+pub mod cluster;
 pub mod command_docs;
 pub mod generic;
 pub mod hash;
@@ -67,6 +68,9 @@ pub async fn dispatch(
             std::process::exit(0)
         }
         "DEBUG" => server::debug(engine, &args).await,
+
+        // --- cluster topology, read-only (design/15) ---
+        "CLUSTER" => cluster::cluster(engine, sess, &args),
 
         // --- budgets (BG.*, design/13) ---
         "BG.CREATE" => budget::create(engine, &args).await,
