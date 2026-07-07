@@ -10,6 +10,7 @@ pub mod envelope;
 pub mod hlc;
 pub mod ikey;
 pub mod merge;
+pub mod protohead;
 pub mod score;
 
 pub use envelope::{Envelope, RecordType, COLLECTION_HEAD, ENVELOPE_LEN, TOMBSTONE};

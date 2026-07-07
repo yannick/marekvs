@@ -708,6 +708,9 @@ fn collection_nonempty(ctx: &ShardCtx, ctype: u8, userkey: &[u8], del_hlc: u64) 
         // A budget exists as long as its head is live — escrow slots and
         // tokens are ledger records, not membership (design/13).
         head::CTYPE_BUDGET => return true,
+        // A proto value is HEAD-ONLY (design/17): the message lives in the
+        // head tail, so a live head IS the value.
+        head::CTYPE_PROTO => return true,
         _ => return false,
     };
     let now = now_ms();
