@@ -7,7 +7,8 @@ and the merge rules that make replication convergent.
 ## Partitioning
 
 ```
-pid: u16 = (xxh3_64(userkey) >> 52) as u16     // top 12 bits → 0..4095
+slot: u16 = crc16(userkey) % 16384             // Redis Cluster slot (design/15)
+pid:  u16 = slot >> 2                          // 4 slots per pid → 0..4095
 ```
 
 `P = 4096` fixed partitions, chosen at cluster creation and never changed.
