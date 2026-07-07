@@ -19,7 +19,7 @@ SCENARIOS=("$@")
 [ ${#SCENARIOS[@]} -gt 0 ] || {
   SCENARIOS=(crash_restart freeze_thaw rolling_churn wipe_replace membership_churn join_empty_reads interest_flood bank budget_no_overspend budget_pvc_wipe)
   [ "$BACKEND" = docker ] && SCENARIOS+=(disk_guard gc_grace_rejoin)
-  [ "$BACKEND" = docker ] && SCENARIOS+=(partition_divergence partition_no_resurrect budget_partition json_convergence)
+  [ "$BACKEND" = docker ] && SCENARIOS+=(partition_divergence partition_no_resurrect budget_partition json_convergence proto_partition)
 }
 
 trap cluster_down EXIT
@@ -599,6 +599,44 @@ json_convergence() {
     *'"i1","i2"'*) chk 0 "island append run contiguous" ;;
     *) chk 1 "island append run" "doc [$d]" ;;
   esac
+  check_replication_healed 60
+}
+
+# ── scenario: proto_partition (docker) ───────────────────────────────────
+# Protobuf registry (design/17): a schema uploaded on one side of a
+# partition must decode values on nodes that never saw the upload (hidden-key
+# read-through), and concurrent PROTO.SET of the same key resolves LWW to one
+# whole message everywhere.
+proto_partition() {
+  fresh_cluster
+  local SRC='syntax = "proto3"; package chaos; message V { string who = 1; }'
+  rcli 0 proto.schema set chaos/v.proto SOURCE "$SRC" >/dev/null
+  rcli 0 proto.bind pv: chaos.V >/dev/null
+  rcli 0 proto.setjson pv:k '{"who":"seed"}' >/dev/null
+  check_converged "proto value seeded" 30 proto.getjson pv:k
+  partition 1
+  sleep 2
+  rcli 0 proto.setjson pv:k '{"who":"majority"}' >/dev/null
+  sleep 1
+  rcli 1 proto.setjson pv:k '{"who":"island"}' >/dev/null   # later write wins LWW
+  sleep 3
+  heal 1
+  check_converged "post-heal proto value" 75 proto.getjson pv:k
+  local d; d=$(rcli 2 proto.getjson pv:k)
+  case "$d" in
+    *'"who":"island"'*) chk 0 "LWW winner is the later write" ;;
+    *) chk 1 "proto LWW" "expected island write, got [$d]" ;;
+  esac
+  # schema uploaded during partition decodes everywhere after heal
+  partition 2
+  sleep 2
+  local SRC2='syntax = "proto3"; package chaos; message W { int32 n = 1; }'
+  rcli 0 proto.schema set chaos/w.proto SOURCE "$SRC2" >/dev/null
+  rcli 0 proto.bind pw: chaos.W >/dev/null
+  rcli 0 proto.setjson pw:k '{"n":7}' >/dev/null
+  sleep 2
+  heal 2
+  check_converged "partition-born schema decodes on all nodes" 75 proto.getjson pw:k
   check_replication_healed 60
 }
 

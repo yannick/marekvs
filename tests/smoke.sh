@@ -255,6 +255,25 @@ expect "JSON TTL set" "yes" "$([ "$($R ttl jd)" -gt 0 ] && echo yes)"
 expect "JSON.DEL root" "1" "$($R json.del jd)"
 expect "JSON.GET missing" "" "$($R json.get jd .)"
 
+# Protobuf registry + typed values (PROTO.*, design/17)
+PROTO_SRC='syntax = "proto3"; package acme; message User { string name = 1; int32 age = 2; }'
+expect "PROTO.SCHEMA SET" "1" "$($R proto.schema set acme/user.proto SOURCE "$PROTO_SRC")"
+expect "PROTO.SCHEMA LIST" "acme/user.proto
+1" "$($R proto.schema list)"
+expect "PROTO.SCHEMA TYPES" "acme.User" "$($R proto.schema types acme/user.proto)"
+expect "PROTO.BIND" "OK" "$($R proto.bind user: acme.User)"
+expect "PROTO.SETJSON" "OK" "$($R proto.setjson user:1 '{"name":"ada","age":36}')"
+expect "PROTO.GETJSON" '{"name":"ada","age":36}' "$($R proto.getjson user:1)"
+expect "PROTO.GETFIELD" "ada" "$($R proto.getfield user:1 name)"
+expect "PROTO.SETFIELD" "OK" "$($R proto.setfield user:1 age 37)"
+expect "PROTO.GETFIELD after set" "37" "$($R proto.getfield user:1 age)"
+expect "PROTO TYPE" "proto" "$($R type user:1)"
+expect "PROTO OBJECT ENCODING" "acme.User" "$($R object encoding user:1)"
+expect "PROTO.INFO has type" "yes" "$($R proto.info user:1 | grep -q acme.User && echo yes)"
+expect "PROTO.SET rejects garbage" "yes" "$($R proto.set user:2 not-a-proto 2>&1 | grep -qi 'PROTOVALIDATE\|error' && echo yes)"
+expect "PROTO no binding" "yes" "$($R proto.setjson other:1 '{}' 2>&1 | grep -qi nobinding && echo yes)"
+expect "PROTO.DEL" "1" "$($R del user:1)"
+
 # keyspace ops
 expect "DBSIZE > 0" "yes" "$([ "$($R dbsize)" -gt 0 ] && echo yes)"
 expect "SCAN returns keys" "yes" "$([ -n "$($R scan 0 count 100 | tail +2)" ] && echo yes)"
