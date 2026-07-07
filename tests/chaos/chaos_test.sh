@@ -618,7 +618,11 @@ proto_partition() {
   sleep 2
   rcli 0 proto.setjson pv:k '{"who":"majority"}' >/dev/null
   sleep 1
-  rcli 1 proto.setjson pv:k '{"who":"island"}' >/dev/null   # later write wins LWW
+  local iw; iw=$(rcli 1 proto.setjson pv:k '{"who":"island"}')   # later write wins LWW
+  case "$iw" in
+    OK) chk 0 "island write accepted during partition" ;;
+    *) chk 1 "island write during partition" "reply [$iw]" ;;
+  esac
   sleep 3
   heal 1
   check_converged "post-heal proto value" 75 proto.getjson pv:k

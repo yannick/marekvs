@@ -149,6 +149,18 @@ async fn hdel_sys(engine: &Arc<Engine>, syskey: Vec<u8>, field: Vec<u8>) -> bool
 }
 
 async fn hgetall_sys(engine: &Arc<Engine>, syskey: Vec<u8>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    hgetall_sys_traced(engine, syskey).await.0
+}
+
+/// Like `hgetall_sys`, additionally reporting whether ANY record bytes for
+/// the hash exist locally (live or tombstoned). "Empty with a trace" is an
+/// authoritative empty (everything was removed); "empty with no trace" means
+/// this node simply does not hold the data — a partitioned non-owner cannot
+/// tell absence from ignorance.
+async fn hgetall_sys_traced(
+    engine: &Arc<Engine>,
+    syskey: Vec<u8>,
+) -> (Vec<(Vec<u8>, Vec<u8>)>, bool) {
     engine.ensure_local(&syskey).await;
     let k = syskey.clone();
     engine
@@ -156,10 +168,12 @@ async fn hgetall_sys(engine: &Arc<Engine>, syskey: Vec<u8>) -> Vec<(Vec<u8>, Vec
         .run_key(&syskey, move |ctx| {
             let now = now_ms();
             let mut out = Vec::new();
+            let mut saw_record = false;
             scan_prefix(
                 ctx,
                 &ikey::collection_prefix(ikey::Tag::HashField, &k),
                 |ik, v| {
+                    saw_record = true;
                     if let (Some(p), Some((env, pay))) = (ikey::parse(ik), Envelope::decode(v)) {
                         if store::visible(&env, pay, 0, now).is_some() {
                             if let Some(val) = element_value(pay) {
@@ -170,7 +184,7 @@ async fn hgetall_sys(engine: &Arc<Engine>, syskey: Vec<u8>) -> Vec<(Vec<u8>, Vec
                     true
                 },
             );
-            out
+            (out, saw_record)
         })
         .await
 }
@@ -301,6 +315,16 @@ pub async fn find_type(engine: &Arc<Engine>, type_name: &str) -> Result<(String,
 // bindings
 // ---------------------------------------------------------------------------
 
+/// Should a refresh that came back EMPTY replace a non-empty cached table?
+/// Only when the emptiness is authoritative (this node holds the hash's
+/// records — live or tombstoned — so "no live entries" is a fact). With no
+/// local trace, the node cannot tell "all unbound" from "I never got the
+/// data / the mesh is cut" — keep serving the stale table (AP: bounded
+/// staleness beats spurious NOBINDING during partitions).
+fn accept_empty_refresh(saw_local_trace: bool) -> bool {
+    saw_local_trace
+}
+
 /// Current binding table, longest-prefix-first. Node-locally cached for
 /// `bind_ttl_ms` (refreshed immediately after local BIND/UNBIND).
 pub async fn bindings(engine: &Arc<Engine>) -> Vec<(Vec<u8>, BindingRecord)> {
@@ -313,11 +337,26 @@ pub async fn bindings(engine: &Arc<Engine>) -> Vec<(Vec<u8>, BindingRecord)> {
             }
         }
     }
-    let mut entries: Vec<(Vec<u8>, BindingRecord)> = hgetall_sys(engine, SYS_BIND_KEY.to_vec())
-        .await
+    refresh_bindings(engine).await
+}
+
+/// Bypass the TTL and refresh the binding cache now (warmer + post-BIND).
+pub async fn refresh_bindings(engine: &Arc<Engine>) -> Vec<(Vec<u8>, BindingRecord)> {
+    let now = now_ms();
+    let (raw_entries, saw_trace) = hgetall_sys_traced(engine, SYS_BIND_KEY.to_vec()).await;
+    let mut entries: Vec<(Vec<u8>, BindingRecord)> = raw_entries
         .into_iter()
         .filter_map(|(prefix, raw)| Some((prefix, postcard::from_bytes(&raw).ok()?)))
         .collect();
+    if entries.is_empty() && !accept_empty_refresh(saw_trace) {
+        let cache = engine.proto.bindings.lock();
+        if let Some(c) = cache.as_ref() {
+            if !c.entries.is_empty() {
+                // stale-serve; loaded_ms untouched so the next call retries
+                return c.entries.clone();
+            }
+        }
+    }
     // Longest prefix first; ties break lexicographically for determinism.
     entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.0.cmp(&b.0)));
     *engine.proto.bindings.lock() = Some(BindCache {
@@ -325,6 +364,33 @@ pub async fn bindings(engine: &Arc<Engine>) -> Vec<(Vec<u8>, BindingRecord)> {
         entries: entries.clone(),
     });
     entries
+}
+
+/// Background binding/descriptor warmer: refreshes the binding table and
+/// resolves every bound `(schema, version)` into the descriptor-pool LRU.
+/// The read-throughs this triggers pull the hidden registry records onto
+/// THIS node (with an interest subscription) while the mesh is healthy — so
+/// a later partition finds bindings and pools already local, and typed
+/// writes keep working on every node (design/17 availability note).
+/// `MAREKVS_PROTO_WARM_SECS` tunes the cadence; 0 disables.
+pub fn spawn_warmer(engine: Arc<Engine>) -> Option<tokio::task::JoinHandle<()>> {
+    let secs = super::env_u64("MAREKVS_PROTO_WARM_SECS", 30);
+    if secs == 0 {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let table = refresh_bindings(&engine).await;
+            for (_, rec) in &table {
+                // version 0 tracks latest: resolving it re-reads the latest
+                // pointer and warms that version's pool
+                let _ = pool_for(&engine, &rec.schema, rec.version).await;
+            }
+        }
+    }))
 }
 
 pub async fn set_binding(engine: &Arc<Engine>, prefix: &[u8], rec: &BindingRecord) {

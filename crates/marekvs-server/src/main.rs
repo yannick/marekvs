@@ -163,6 +163,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let engine = Engine::new(store.clone());
+    // Binding/descriptor warmer (design/17 availability): pull the hidden
+    // registry records + compiled pools onto THIS node while the mesh is
+    // healthy, so typed writes keep working here through partitions.
+    marekvs_engine::proto::registry::spawn_warmer(engine.clone());
     engine.set_log_reload(
         log_spec,
         Arc::new(move |spec: &str| {
