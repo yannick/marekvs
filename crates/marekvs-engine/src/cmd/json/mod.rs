@@ -2,3 +2,4 @@
 //! per-path CRDT document model in `marekvs_core::json`.
 
 pub(crate) mod doc;
+pub(crate) mod path;
