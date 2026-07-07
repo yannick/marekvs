@@ -123,6 +123,7 @@ node_run() { # <i> — create + start node i
       --network "$EDGE_NET" --ip "$(edge_ip "$i")" \
       -p "$(resp_port "$i"):6379" -p "$(metrics_port "$i"):9121" \
       -e MAREKVS_NODE_ID="$i" -e MAREKVS_REPLICAS_N=2 \
+      -e MAREKVS_PROTO_WARM_SECS=2 \
       -e MAREKVS_DATA_DIR=/data -e MAREKVS_ADVERTISE_IP="$(mesh_ip "$i")" \
       -e MAREKVS_SEEDS="$(seeds)" -e RUST_LOG=${CHAOS_LOG:-info},chitchat=warn \
       "$IMAGE" >/dev/null
@@ -133,6 +134,7 @@ node_run() { # <i> — create + start node i
     [ "$CHAOS_DEBUG" = 1 ] && caps=(--cap-add CAP_SYS_TIME --cap-add CAP_NET_ADMIN)
     container run -d --name "chaos-$i" "${caps[@]}" "${extra[@]}" \
       -e MAREKVS_NODE_ID="$i" -e MAREKVS_REPLICAS_N=2 \
+      -e MAREKVS_PROTO_WARM_SECS=2 \
       -e MAREKVS_DATA_DIR=/data -e MAREKVS_ADVERTISE_IP=auto \
       -e MAREKVS_SEEDS="$aseeds" -e RUST_LOG=${CHAOS_LOG:-info},chitchat=warn \
       "$IMAGE" >/dev/null
@@ -241,8 +243,24 @@ graceful_restart() { # <i> — SIGTERM drain, then start again
   wait_ready "$1"
 }
 
-partition() { # <i> — cut node i's mesh link; clients still reach it (docker)
-  [ "$BACKEND" = docker ] || { echo "partition: docker only" >&2; return 1; }
+partition() { # <i> — cut node i's mesh link; clients still reach it.
+  # docker: disconnect the mesh network. apple: each node is a VM on one
+  # shared network, so realize the cut as in-VM iptables DROPs against every
+  # peer's address (debug image; host/client traffic is unaffected because
+  # clients are not peers).
+  if [ "$BACKEND" = apple ]; then
+    require_debug "partition (apple backend uses in-VM iptables)"
+    echo "  nemesis: partition node $1 from the mesh (iptables)"
+    local j ip
+    for j in $(seq 0 $((N - 1))); do
+      [ "$j" = "$1" ] && continue
+      ip=$(apple_ip "chaos-$j")
+      [ -n "$ip" ] || continue
+      nexec "$1" iptables -A INPUT  -s "$ip" -j DROP 2>/dev/null || true
+      nexec "$1" iptables -A OUTPUT -d "$ip" -j DROP 2>/dev/null || true
+    done
+    return 0
+  fi
   echo "  nemesis: partition node $1 from the mesh"
   docker network disconnect "$MESH_NET" "chaos-$1"
   # verify it actually took effect (docker desktop can lag)
@@ -255,6 +273,11 @@ partition() { # <i> — cut node i's mesh link; clients still reach it (docker)
 
 heal() { # <i> — idempotent: docker's disconnect can lag, so tolerate an
   # endpoint that never left and retry once on transient connect errors.
+  if [ "$BACKEND" = apple ]; then
+    echo "  nemesis: heal partition of node $1 (iptables flush)"
+    nexec "$1" iptables -F 2>/dev/null || true
+    return 0
+  fi
   echo "  nemesis: heal partition of node $1"
   if docker network inspect "$MESH_NET" 2>/dev/null | grep -q "\"chaos-$1\""; then
     return 0

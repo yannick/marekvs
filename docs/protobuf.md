@@ -201,7 +201,11 @@ whole-message (`format: whole`). They stay readable, and the **first**
   partition: the latest pointer is last-writer-wins (version numbers can
   collide across the partition). Do schema administration from one place.
 - Rebinding a prefix changes how stored **collection elements** are
-  interpreted at read time; the stored bytes never change.
+  interpreted at read time; the stored bytes never change. Binding changes
+  reach other nodes within a few seconds (each node re-reads the table at
+  most every 2 s and a background warmer pulls bindings **and** compiled
+  descriptors onto every node) — so typed writes keep working on every node
+  even through a network partition, serving the last table it saw.
 - `PROTO.*` cannot be called from Lua scripts in v1.
 - Limits (env-tunable): source ≤ 1 MiB, descriptor set ≤ 4 MiB, value
   ≤ 4 MiB, ≤ 64 files per compile, import depth ≤ 16.

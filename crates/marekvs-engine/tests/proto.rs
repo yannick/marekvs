@@ -1385,3 +1385,44 @@ async fn expire_preserves_proto_tail() {
         b"pkg.T"
     );
 }
+
+/// A partitioned node with a warmed binding cache but NO local copy of the
+/// binding hash must keep serving the stale table when a TTL refresh comes
+/// back empty-with-no-trace — "I never got the data" is not "all unbound"
+/// (design/17 availability; the proto_partition chaos regression).
+#[tokio::test]
+async fn binding_cache_serves_stale_when_refresh_finds_no_trace() {
+    let (_d, e) = engine();
+    // warmed cache, as the background warmer would have left it
+    let entries = vec![(
+        b"user:".to_vec(),
+        marekvs_engine::proto::registry::BindingRecord {
+            schema: "s".into(),
+            version: 1,
+            type_name: "pkg.T".into(),
+        },
+    )];
+    *e.proto.bindings.lock() = Some(marekvs_engine::proto::BindCache {
+        loaded_ms: 0, // long expired: the next lookup MUST attempt a refresh
+        entries: entries.clone(),
+    });
+    // no \x00proto:bind records exist locally and there is no read-through
+    // (single engine == unreachable owners): refresh is empty with no trace
+    let got = marekvs_engine::proto::registry::bindings(&e).await;
+    assert_eq!(got, entries, "stale table must keep serving");
+    // an authoritative empty (records exist locally, all removed) DOES clear:
+    marekvs_engine::proto::registry::set_binding(
+        &e,
+        b"user:",
+        &marekvs_engine::proto::registry::BindingRecord {
+            schema: "s".into(),
+            version: 1,
+            type_name: "pkg.T".into(),
+        },
+    )
+    .await;
+    marekvs_engine::proto::registry::remove_binding(&e, b"user:").await;
+    // remove_binding invalidated the cache: the next call refreshes
+    let got = marekvs_engine::proto::registry::bindings(&e).await;
+    assert!(got.is_empty(), "empty WITH a local trace is authoritative");
+}
