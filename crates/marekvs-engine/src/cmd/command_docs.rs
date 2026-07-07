@@ -621,6 +621,8 @@ static TABLE: &[CommandDoc] = &[
         &[Arg { optional: true, ..arg("subcommand", "string") }]),
     with_args(cmd("config", -2, &["admin", "noscript", "loading", "stale"], 0, 0, 0, "A container for server configuration commands.", "2.0.0", "server"),
         &[arg("subcommand", "string")]),
+    with_args(cmd("cluster", -2, &["loading", "stale"], 0, 0, 0, "Topology introspection for cluster-aware clients (read-only; design/15).", "3.0.0", "server"),
+        &[arg("subcommand", "string")]),
     with_args(cmd("info", -1, &["loading", "stale"], 0, 0, 0, "Returns information and statistics about the server.", "1.0.0", "server"),
         &[Arg { optional: true, multiple: true, ..arg("section", "string") }]),
     cmd("dbsize", 1, &["readonly", "fast"], 0, 0, 0, "Returns the number of keys in the database.", "1.0.0", "server"),
@@ -1177,6 +1179,7 @@ mod tests {
             "bg.draw",
             "bg.info",
             "bg.reclaim",
+            "cluster",
         ] {
             let doc = find(name).unwrap_or_else(|| panic!("missing COMMAND DOCS entry for {name}"));
             assert!(!doc.args.is_empty(), "{name} should document its arguments");
