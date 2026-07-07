@@ -194,6 +194,27 @@ budgets](../budget/).
 `TYPE` reports `budget`; `EXPIRE`, `RENAME`, and `COPY` are rejected on budget
 keys; `DEL` starts a fresh generation (outstanding tokens die with the old one).
 
+## Protobuf values (marekvs extension)
+
+Not a Redis family — `PROTO.*` is marekvs-native: a server-side protobuf
+schema registry with prefix bindings, validated typed values, field access
+and JSON projection. Full guide: [Protobuf values](../protobuf/).
+
+| Command | Notes |
+|---|---|
+| `PROTO.SCHEMA SET/COMPILE/GET/LIST/TYPES/DEL` | Registry: upload `.proto` source (server-compiled, imports resolve from the registry) or a compiled descriptor set; versioned; `DEL` keeps old versions so stored values always decode. |
+| `PROTO.BIND` `PROTO.UNBIND` `PROTO.BINDINGS` | Bind key prefixes to message types; longest prefix wins; explicit `TYPE` argument overrides. |
+| `PROTO.SET` `PROTO.GET` `PROTO.INFO` | Validated whole-message values (LWW); `GET` returns raw bytes, `INFO` the stored `{schema, version, type, bytes}`. |
+| `PROTO.GETJSON` `PROTO.SETJSON` | Canonical protobuf-JSON projection in/out. |
+| `PROTO.GETFIELD` `PROTO.SETFIELD` `PROTO.CLEARFIELD` | Dot-path field access; `SETFIELD`/`CLEARFIELD` are atomic per-key read-modify-writes. |
+| `PROTO.HSET` `PROTO.SADD` | Validate values, then store as ordinary hash fields / set members (raw bytes; plain `HGET`/`SMEMBERS` unchanged). |
+| `PROTO.HGETJSON` `PROTO.HGETFIELD` | Decode one hash element at read time. |
+
+`TYPE` reports `proto`; `OBJECT ENCODING` reports the fq message type; plain
+`SET` overwrites a proto value (standard Redis semantics). Errors are raw
+codes: `-NOSCHEMA`, `-SCHEMAERR`, `-PROTOVALIDATE`, `-NOBINDING`,
+`-PROTOPATH`. `PROTO.*` is not callable from Lua scripts in v1.
+
 ## Not implemented
 
 These are **not** in the dispatch table, even though some clients or older design
