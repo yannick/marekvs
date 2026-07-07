@@ -120,7 +120,8 @@
         <h3>Protobuf schema store</h3>
         <p>Upload <code>.proto</code> schemas, bind them to key prefixes, and
         every value written there is validated protobuf — with server-side
-        field access and JSON projection. No client codegen.</p>
+        field access, JSON projection, and <strong>field-level CRDT merge</strong>:
+        concurrent writes to different fields both survive.</p>
       </div>
       <div class="feat card">
         <div class="feat-ico">☸</div>

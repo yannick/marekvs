@@ -5,19 +5,26 @@
 //! see `crate::proto::registry`); protox compilation always runs in
 //! `tokio::task::spawn_blocking`, never on shard threads.
 
+pub(crate) mod doc;
+
 use std::sync::Arc;
 
 use prost::Message;
-use prost_reflect::DynamicMessage;
+use prost_reflect::{DynamicMessage, FieldDescriptor, Kind, MessageDescriptor, Value};
 
 use crate::cmd::{eq_ignore_case, parse_u64};
+use crate::proto::fields::{self, build_msg, decompose_msg, resolve_path, PDoc, Resolved};
 use crate::proto::{compile, path, registry, ProtoErr};
 use crate::pubsub::glob_match;
 use crate::reply::Reply;
 use crate::store::{get_head, get_raw, now_ms, read_lww, write_merged, ShardCtx};
 use crate::Engine;
 use marekvs_core::envelope::{head, Envelope};
+use marekvs_core::merge::Dot;
+use marekvs_core::pdoc::{push_seg, PNodeIn, PRecord, PSeg, PVal};
 use marekvs_core::{ikey, protohead};
+
+use doc::Slot;
 
 /// Reasonable cap on registry schema names.
 const MAX_NAME: usize = 255;
@@ -414,20 +421,21 @@ fn read_proto_head(ctx: &ShardCtx, key: &[u8]) -> Result<Option<(Envelope, u64, 
     Ok(Some((env, del, pay.get(9..).unwrap_or(&[]).to_vec())))
 }
 
-/// Resolve the message type for `key`, validate `msg` decodes against it,
-/// then LWW-write the head record (del-clock carry-forward, NX/XX, TTL).
+/// Root-set a decomposed proto value (design/18): cover every stored `'p'`
+/// record, write the fresh field records, and stamp a fmt=2 head. Carries the
+/// delete clock forward, honours NX/XX + TTL exactly like the legacy path.
 async fn write_value(
     engine: &Arc<Engine>,
     key: Vec<u8>,
-    msg: Vec<u8>,
+    msg: DynamicMessage,
     o: SetOpts,
     resolved: registry::ResolvedType,
 ) -> Reply {
-    if msg.len() > engine.proto.limits.max_value {
+    let encoded_len = msg.encoded_len();
+    if encoded_len > engine.proto.limits.max_value {
         return ProtoErr::Validate(format!(
             "value too large ({} bytes, limit {})",
-            msg.len(),
-            engine.proto.limits.max_value
+            encoded_len, engine.proto.limits.max_value
         ))
         .reply();
     }
@@ -466,8 +474,26 @@ async fn write_value(
                     .map_or(0, |(env, _, _)| env.ttl_deadline_ms),
                 (None, false) => 0,
             };
+            // Root SET: cover all prior descendants, then write the fresh
+            // decomposition. The root marker covers the previous root's dots.
+            let observed = doc::node_observed(ctx, &key, &[]);
+            doc::cover_descendants(ctx, &key, &[], prev_del);
+            let mut fresh = |_: &[u8], _: u32| doc::fresh_eid(ctx);
+            for rec in decompose_msg(&[], &msg, &mut fresh) {
+                match rec {
+                    marekvs_core::pdoc::PRecord::Node { path, val } if path.is_empty() => {
+                        doc::write_node(ctx, &key, &[], &val, &observed)
+                    }
+                    marekvs_core::pdoc::PRecord::Node { path, val } => {
+                        doc::write_node(ctx, &key, &path, &val, &[])
+                    }
+                    marekvs_core::pdoc::PRecord::Elem { path, elem } => {
+                        doc::write_elem(ctx, &key, &path, &elem)
+                    }
+                }
+            }
             let mut payload = head::encode(head::CTYPE_PROTO, prev_del);
-            payload.extend_from_slice(&protohead::encode(&schema, version, &type_name, &msg));
+            payload.extend_from_slice(&protohead::encode_v2(&schema, version, &type_name));
             let env = Envelope::head(ctx.hlc.now(), ctx.node_id).with_ttl(ttl);
             write_merged(ctx, &ikey::head_key(&key), &env.encode_with(&payload));
             Reply::ok()
@@ -491,10 +517,11 @@ pub async fn set(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             Err(e) => return e.reply(),
         };
     // Validate: the bytes must decode against the resolved message type.
-    if let Err(e) = DynamicMessage::decode(resolved.desc.clone(), &msg[..]) {
-        return ProtoErr::Validate(format!("{}: {e}", resolved.type_name)).reply();
-    }
-    write_value(engine, key, msg, o, resolved).await
+    let m = match DynamicMessage::decode(resolved.desc.clone(), &msg[..]) {
+        Ok(m) => m,
+        Err(e) => return ProtoErr::Validate(format!("{}: {e}", resolved.type_name)).reply(),
+    };
+    write_value(engine, key, m, o, resolved).await
 }
 
 /// `PROTO.SETJSON key json [TYPE t] [NX|XX] [ttl opts]` — canonical
@@ -518,55 +545,86 @@ pub async fn setjson(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         Ok(m) => m,
         Err(e) => return ProtoErr::Validate(format!("{}: {e}", resolved.type_name)).reply(),
     };
-    write_value(engine, key, msg.encode_to_vec(), o, resolved).await
+    write_value(engine, key, msg, o, resolved).await
 }
 
-/// `PROTO.GET key` → the raw message bytes (no schema needed).
+/// `PROTO.GET key` → the message bytes (fmt=1: verbatim; fmt=2: materialized
+/// from field records). Byte-unstable across calls for map-bearing messages
+/// (spec-legal; design/18).
 pub async fn get(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     if args.len() != 2 {
         return Reply::wrong_args("proto.get");
     }
-    let key = args[1].clone();
-    engine.ensure_local(&key).await;
-    engine
-        .store
-        .run_key(&args[1], move |ctx| match read_proto_head(ctx, &key) {
-            Err(()) => Reply::wrongtype(),
-            Ok(None) => Reply::Null,
-            Ok(Some((_, _, tail))) => match protohead::decode(&tail) {
-                Some(ph) => Reply::Bulk(ph.msg.to_vec()),
-                None => Reply::err("ERR corrupt proto value"),
-            },
-        })
-        .await
+    match load_message(engine, &args[1]).await {
+        Err(r) => r,
+        Ok(None) => Reply::Null,
+        Ok(Some((m, _))) => Reply::Bulk(m.encode_to_vec()),
+    }
 }
 
-/// `PROTO.INFO key` → Map {schema, version, type, bytes}.
+/// `PROTO.INFO key` → Map {schema, version, type, format, [records,] bytes}.
+/// `format` is `whole` (fmt=1) or `fields` (fmt=2, with a `records` count).
 pub async fn info(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     if args.len() != 2 {
         return Reply::wrong_args("proto.info");
     }
     let key = args[1].clone();
     engine.ensure_local(&key).await;
-    engine
+    let k = key.clone();
+    let tail = engine
         .store
-        .run_key(&args[1], move |ctx| match read_proto_head(ctx, &key) {
-            Err(()) => Reply::wrongtype(),
-            Ok(None) => Reply::err("ERR no such key"),
-            Ok(Some((_, _, tail))) => match protohead::decode(&tail) {
-                Some(ph) => Reply::Map(vec![
-                    (Reply::bulk_str("schema"), Reply::bulk_str(ph.schema)),
-                    (
-                        Reply::bulk_str("version"),
-                        Reply::Int(ph.schema_version as i64),
-                    ),
-                    (Reply::bulk_str("type"), Reply::bulk_str(ph.type_name)),
-                    (Reply::bulk_str("bytes"), Reply::Int(ph.msg.len() as i64)),
-                ]),
-                None => Reply::err("ERR corrupt proto value"),
-            },
+        .run_key(&key, move |ctx| read_proto_head(ctx, &k))
+        .await;
+    let (del, tail) = match tail {
+        Err(()) => return Reply::wrongtype(),
+        Ok(None) => return Reply::err("ERR no such key"),
+        Ok(Some((_, del, t))) => (del, t),
+    };
+    let Some(ph) = protohead::decode(&tail) else {
+        return Reply::err("ERR corrupt proto value");
+    };
+    let (schema, version, tname) = (
+        ph.schema.to_string(),
+        ph.schema_version,
+        ph.type_name.to_string(),
+    );
+    if ph.fmt == protohead::FMT_V1 {
+        return Reply::Map(vec![
+            (Reply::bulk_str("schema"), Reply::bulk_str(schema)),
+            (Reply::bulk_str("version"), Reply::Int(version as i64)),
+            (Reply::bulk_str("type"), Reply::bulk_str(tname)),
+            (Reply::bulk_str("format"), Reply::bulk_str("whole")),
+            (Reply::bulk_str("bytes"), Reply::Int(ph.msg.len() as i64)),
+        ]);
+    }
+    let (version, pool) = match registry::pool_for(engine, &schema, version).await {
+        Ok(v) => v,
+        Err(e) => return e.reply(),
+    };
+    let Some(desc) = pool.get_message_by_name(&tname) else {
+        return ProtoErr::NoSchema(format!(
+            "schema '{schema}' version {version} does not define type '{tname}'"
+        ))
+        .reply();
+    };
+    let k = key.clone();
+    let (records, bytes) = engine
+        .store
+        .run_key(&key, move |ctx| {
+            let nodes = doc::load_pnodes(ctx, &k, del);
+            let n = nodes.len();
+            let bytes = build_msg(&desc, &nodes).map_or(0, |d| d.msg.encoded_len());
+            (n, bytes)
         })
-        .await
+        .await;
+    Reply::Map(vec![
+        (Reply::bulk_str("schema"), Reply::bulk_str(schema)),
+        (Reply::bulk_str("version"), Reply::Int(version as i64)),
+        (Reply::bulk_str("type"), Reply::bulk_str(tname)),
+        (Reply::bulk_str("format"), Reply::bulk_str("fields")),
+        (Reply::bulk_str("records"), Reply::Int(records as i64)),
+        (Reply::bulk_str("bytes"), Reply::Int(bytes as i64)),
+    ])
 }
 
 /// Read + decode a stored proto value into a DynamicMessage (resolves the
@@ -582,18 +640,19 @@ async fn load_message(
         .store
         .run_key(key, move |ctx| read_proto_head(ctx, &k))
         .await;
-    let tail = match tail {
+    let (del, tail) = match tail {
         Err(()) => return Err(Reply::wrongtype()),
         Ok(None) => return Ok(None),
-        Ok(Some((_, _, t))) => t,
+        Ok(Some((_, del, t))) => (del, t),
     };
     let Some(ph) = protohead::decode(&tail) else {
         return Err(Reply::err("ERR corrupt proto value"));
     };
-    let (schema, version, type_name, msg) = (
+    let (schema, version, type_name, fmt, msg) = (
         ph.schema.to_string(),
         ph.schema_version,
         ph.type_name.to_string(),
+        ph.fmt,
         ph.msg.to_vec(),
     );
     let (version, pool) = match registry::pool_for(engine, &schema, version).await {
@@ -606,9 +665,23 @@ async fn load_message(
         ))
         .reply());
     };
-    let m = match DynamicMessage::decode(desc.clone(), &msg[..]) {
-        Ok(m) => m,
-        Err(e) => return Err(Reply::err(format!("ERR stored value does not decode: {e}"))),
+    let m = if fmt == protohead::FMT_V1 {
+        match DynamicMessage::decode(desc.clone(), &msg[..]) {
+            Ok(m) => m,
+            Err(e) => return Err(Reply::err(format!("ERR stored value does not decode: {e}"))),
+        }
+    } else {
+        // fmt=2: materialize the field records against the winning descriptor.
+        let (k, d) = (key.to_vec(), desc.clone());
+        engine
+            .store
+            .run_key(key, move |ctx| {
+                let nodes = doc::load_pnodes(ctx, &k, del);
+                build_msg(&d, &nodes)
+                    .map(|doc| doc.msg)
+                    .unwrap_or_else(|| DynamicMessage::new(d.clone()))
+            })
+            .await
     };
     Ok(Some((
         m,
@@ -659,24 +732,287 @@ pub async fn getfield(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     }
 }
 
-/// The mutation a PROTO.SETFIELD/CLEARFIELD RMW applies on the shard thread.
-type RmwApply = Arc<dyn Fn(&mut DynamicMessage) -> Result<Reply, ProtoErr> + Send + Sync>;
-
 enum RmwOut {
     Done(Reply),
     /// The stored (schema, version, type) changed between the identity read
-    /// and the shard RMW — re-resolve the descriptor and try again.
+    /// and the shard RMW — re-resolve the descriptor and try again. A
+    /// concurrent fmt flip does NOT retry (both fmts materialize the same
+    /// message).
     Retry,
 }
 
-/// Atomic read-modify-write of a stored proto value ON ITS SHARD THREAD:
-/// decode → `apply` → re-encode → LWW head write (same schema/version/
-/// type tail, TTL preserved, delete clock verbatim). The descriptor pool is
-/// resolved asynchronously first; a concurrent type change is detected on
-/// the shard and retried.
-async fn rmw_message(engine: &Arc<Engine>, key: &[u8], apply: RmwApply) -> Reply {
+/// A field-level operation applied by [`field_rmw`].
+enum FieldOp {
+    Set(Vec<(Vec<String>, Vec<u8>)>),
+    Clear(Vec<Vec<String>>),
+}
+
+/// A resolved SETFIELD write, execution-ready (parsed value + record path).
+enum SetWrite {
+    Node {
+        intermediates: Vec<(Vec<u8>, PVal)>,
+        node_path: Vec<u8>,
+        observed: Vec<Dot>,
+        oneof_siblings: Vec<Vec<u8>>,
+        value: Value,
+        fd: FieldDescriptor,
+        remove_default: bool,
+    },
+    ElemReplace {
+        intermediates: Vec<(Vec<u8>, PVal)>,
+        elem_path: Vec<u8>,
+        value: Value,
+        fd: FieldDescriptor,
+    },
+    Append {
+        intermediates: Vec<(Vec<u8>, PVal)>,
+        list_path: Vec<u8>,
+        left: marekvs_core::json::Eid,
+        value: Value,
+        fd: FieldDescriptor,
+    },
+}
+
+/// A resolved CLEARFIELD target.
+enum ClearWrite {
+    Node {
+        node_path: Vec<u8>,
+        observed: Vec<Dot>,
+    },
+    Elem {
+        elem_path: Vec<u8>,
+    },
+    Nothing,
+}
+
+/// A proto3 non-presence scalar written at its default value decomposes to
+/// *no record* (wire-format parity), so we remove instead of writing it.
+fn is_scalar_kind(fd: &FieldDescriptor) -> bool {
+    !fd.is_list() && !fd.is_map() && !matches!(fd.kind(), Kind::Message(_))
+}
+
+fn is_default_scalar(v: &Value) -> bool {
+    match v {
+        Value::Bool(b) => !*b,
+        Value::I32(x) => *x == 0,
+        Value::I64(x) => *x == 0,
+        Value::U32(x) => *x == 0,
+        Value::U64(x) => *x == 0,
+        Value::F32(x) => *x == 0.0,
+        Value::F64(x) => *x == 0.0,
+        Value::EnumNumber(n) => *n == 0,
+        Value::String(s) => s.is_empty(),
+        Value::Bytes(b) => b.is_empty(),
+        _ => false,
+    }
+}
+
+/// Resolve + parse every SETFIELD op against the materialized value (pure —
+/// no writes). Errors abort the whole command before anything is written.
+fn plan_set(
+    desc: &MessageDescriptor,
+    pdoc: &PDoc,
+    ops: &[(Vec<String>, Vec<u8>)],
+    max_value: usize,
+) -> Result<Vec<SetWrite>, ProtoErr> {
+    let mut out = Vec::with_capacity(ops.len());
+    for (segs, raw) in ops {
+        if raw.len() > max_value {
+            return Err(ProtoErr::Validate(format!(
+                "value too large ({} bytes, limit {max_value})",
+                raw.len()
+            )));
+        }
+        let wp = resolve_path(desc, segs, &pdoc.index)?;
+        match wp.target {
+            Resolved::OutOfRange => return Err(ProtoErr::Path("list index out of range".into())),
+            Resolved::Node {
+                node_path,
+                fd,
+                oneof_siblings,
+            } => {
+                let value = path::parse_value(raw, &fd, false)?;
+                let observed = pdoc
+                    .index
+                    .node_dots
+                    .get(&node_path)
+                    .cloned()
+                    .unwrap_or_default();
+                let remove_default =
+                    is_scalar_kind(&fd) && !fd.supports_presence() && is_default_scalar(&value);
+                out.push(SetWrite::Node {
+                    intermediates: wp.intermediates,
+                    node_path,
+                    observed,
+                    oneof_siblings,
+                    value,
+                    fd,
+                    remove_default,
+                });
+            }
+            Resolved::Elem { elem_path, fd } => {
+                let value = path::parse_value(raw, &fd, true)?;
+                out.push(SetWrite::ElemReplace {
+                    intermediates: wp.intermediates,
+                    elem_path,
+                    value,
+                    fd,
+                });
+            }
+            Resolved::Append {
+                list_path,
+                left,
+                fd,
+            } => {
+                let value = path::parse_value(raw, &fd, true)?;
+                out.push(SetWrite::Append {
+                    intermediates: wp.intermediates,
+                    list_path,
+                    left,
+                    value,
+                    fd,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn execute_set(ctx: &ShardCtx, key: &[u8], del: u64, writes: Vec<SetWrite>) {
+    for w in writes {
+        match w {
+            SetWrite::Node {
+                intermediates,
+                node_path,
+                observed,
+                oneof_siblings,
+                value,
+                fd,
+                remove_default,
+            } => {
+                for (p, marker) in &intermediates {
+                    doc::write_node(ctx, key, p, marker, &[]);
+                }
+                for sib in &oneof_siblings {
+                    doc::remove_stored_node(ctx, key, sib, del);
+                }
+                if remove_default {
+                    doc::delete_node(ctx, key, &node_path, &observed, del);
+                } else {
+                    doc::write_value_at(
+                        ctx,
+                        key,
+                        &node_path,
+                        Slot::Node(observed),
+                        &value,
+                        &fd,
+                        false,
+                        del,
+                    );
+                }
+            }
+            SetWrite::ElemReplace {
+                intermediates,
+                elem_path,
+                value,
+                fd,
+            } => {
+                for (p, marker) in &intermediates {
+                    doc::write_node(ctx, key, p, marker, &[]);
+                }
+                doc::write_value_at(
+                    ctx,
+                    key,
+                    &elem_path,
+                    Slot::ElemReplace,
+                    &value,
+                    &fd,
+                    true,
+                    del,
+                );
+            }
+            SetWrite::Append {
+                intermediates,
+                list_path,
+                left,
+                value,
+                fd,
+            } => {
+                for (p, marker) in &intermediates {
+                    doc::write_node(ctx, key, p, marker, &[]);
+                }
+                let e = doc::fresh_eid(ctx);
+                let mut ep = list_path;
+                push_seg(&mut ep, &PSeg::Elem(e));
+                doc::write_value_at(
+                    ctx,
+                    key,
+                    &ep,
+                    Slot::ElemAppend(left),
+                    &value,
+                    &fd,
+                    true,
+                    del,
+                );
+            }
+        }
+    }
+}
+
+/// Resolve every CLEARFIELD path (pure). Unknown fields error (PROTOPATH);
+/// absent targets clear nothing.
+fn plan_clear(
+    desc: &MessageDescriptor,
+    pdoc: &PDoc,
+    paths: &[Vec<String>],
+) -> Result<Vec<ClearWrite>, ProtoErr> {
+    let mut out = Vec::with_capacity(paths.len());
+    for segs in paths {
+        let wp = resolve_path(desc, segs, &pdoc.index)?;
+        out.push(match wp.target {
+            Resolved::Node { node_path, .. } => match pdoc.index.node_dots.get(&node_path) {
+                Some(dots) => ClearWrite::Node {
+                    node_path,
+                    observed: dots.clone(),
+                },
+                None => ClearWrite::Nothing,
+            },
+            Resolved::Elem { elem_path, .. } => ClearWrite::Elem { elem_path },
+            Resolved::Append { .. } | Resolved::OutOfRange => ClearWrite::Nothing,
+        });
+    }
+    Ok(out)
+}
+
+fn execute_clear(ctx: &ShardCtx, key: &[u8], del: u64, clears: Vec<ClearWrite>) -> i64 {
+    let mut n = 0i64;
+    for c in clears {
+        match c {
+            ClearWrite::Node {
+                node_path,
+                observed,
+            } => {
+                doc::delete_node(ctx, key, &node_path, &observed, del);
+                n += 1;
+            }
+            ClearWrite::Elem { elem_path } => {
+                doc::delete_elem(ctx, key, &elem_path, del);
+                n += 1;
+            }
+            ClearWrite::Nothing => {}
+        }
+    }
+    n
+}
+
+/// One field-level RMW (design/18): identity read → async descriptor resolve
+/// → shard RMW writing per-record deltas. fmt=1 values upgrade-on-write
+/// (transcription stamped with the original head version) before the edit,
+/// then the head is restamped fmt=2 (fresh HLC, delete clock + TTL preserved).
+async fn field_rmw(engine: &Arc<Engine>, key: &[u8], op: FieldOp) -> Reply {
     engine.ensure_local(key).await;
     let max_value = engine.proto.limits.max_value;
+    let op = Arc::new(op);
     for _ in 0..3 {
         // 1. identity read: which (schema, version, type) is stored now?
         let k = key.to_vec();
@@ -696,8 +1032,7 @@ async fn rmw_message(engine: &Arc<Engine>, key: &[u8], apply: RmwApply) -> Reply
                 None => return Reply::err("ERR corrupt proto value"),
             },
         };
-        // 2. resolve the descriptor (async: registry may live on another
-        //    shard / node — never from inside the shard job).
+        // 2. resolve the descriptor (async — never from inside the shard job).
         let (_, pool) = match registry::pool_for(engine, &schema, version).await {
             Ok(v) => v,
             Err(e) => return e.reply(),
@@ -709,7 +1044,8 @@ async fn rmw_message(engine: &Arc<Engine>, key: &[u8], apply: RmwApply) -> Reply
             .reply();
         };
         // 3. shard-thread RMW.
-        let (k, apply2) = (key.to_vec(), apply.clone());
+        let (k, op2) = (key.to_vec(), op.clone());
+        let (schema_c, tname_c) = (schema.clone(), tname.clone());
         let out = engine
             .store
             .run_key(key, move |ctx| {
@@ -725,33 +1061,81 @@ async fn rmw_message(engine: &Arc<Engine>, key: &[u8], apply: RmwApply) -> Reply
                 let Some(ph) = protohead::decode(&tail) else {
                     return RmwOut::Done(Reply::err("ERR corrupt proto value"));
                 };
-                if ph.schema != schema || ph.schema_version != version || ph.type_name != tname {
+                if ph.schema != schema_c || ph.schema_version != version || ph.type_name != tname_c
+                {
                     return RmwOut::Retry;
                 }
-                let mut m = match DynamicMessage::decode(desc.clone(), ph.msg) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        return RmwOut::Done(Reply::err(format!(
-                            "ERR stored value does not decode: {e}"
-                        )))
-                    }
+                // Materialize. fmt=1: from the decoded legacy message via
+                // transcription (no writes yet — planning is pure). fmt=2:
+                // from the stored field records.
+                let legacy: Option<DynamicMessage>;
+                let pdoc = if ph.fmt == protohead::FMT_V1 {
+                    let msg = match DynamicMessage::decode(desc.clone(), ph.msg) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            return RmwOut::Done(Reply::err(format!(
+                                "ERR stored value does not decode: {e}"
+                            )))
+                        }
+                    };
+                    let dot = Dot {
+                        hlc: env.hlc,
+                        origin: env.origin,
+                    };
+                    let nodes: Vec<(Vec<u8>, PNodeIn)> =
+                        fields::transcribe_records(&msg, env.hlc, env.origin)
+                            .into_iter()
+                            .map(|r| match r {
+                                PRecord::Node { path, val } => (
+                                    path,
+                                    PNodeIn::Node {
+                                        val,
+                                        dots: vec![dot],
+                                    },
+                                ),
+                                PRecord::Elem { path, elem } => {
+                                    (path, PNodeIn::Elem { elem, live: true })
+                                }
+                            })
+                            .collect();
+                    let Some(pdoc) = build_msg(&desc, &nodes) else {
+                        return RmwOut::Done(Reply::err("ERR corrupt proto value"));
+                    };
+                    legacy = Some(msg);
+                    pdoc
+                } else {
+                    let nodes = doc::load_pnodes(ctx, &k, del);
+                    let Some(pdoc) = build_msg(&desc, &nodes) else {
+                        return RmwOut::Done(Reply::err("ERR no such key"));
+                    };
+                    legacy = None;
+                    pdoc
                 };
-                let reply = match apply2(&mut m) {
-                    Ok(r) => r,
-                    Err(e) => return RmwOut::Done(e.reply()),
+                // Plan (pure): errors abort before any write.
+                let reply = match &*op2 {
+                    FieldOp::Set(ops) => match plan_set(&desc, &pdoc, ops, max_value) {
+                        Ok(writes) => {
+                            if let Some(m) = &legacy {
+                                doc::transcribe_v1(ctx, &k, env.hlc, env.origin, m);
+                            }
+                            execute_set(ctx, &k, del, writes);
+                            Reply::ok()
+                        }
+                        Err(e) => return RmwOut::Done(e.reply()),
+                    },
+                    FieldOp::Clear(paths) => match plan_clear(&desc, &pdoc, paths) {
+                        Ok(clears) => {
+                            if let Some(m) = &legacy {
+                                doc::transcribe_v1(ctx, &k, env.hlc, env.origin, m);
+                            }
+                            Reply::Int(execute_clear(ctx, &k, del, clears))
+                        }
+                        Err(e) => return RmwOut::Done(e.reply()),
+                    },
                 };
-                let msg = m.encode_to_vec();
-                if msg.len() > max_value {
-                    return RmwOut::Done(
-                        ProtoErr::Validate(format!(
-                            "value too large after edit ({} bytes, limit {max_value})",
-                            msg.len()
-                        ))
-                        .reply(),
-                    );
-                }
+                // Restamp the head fmt=2 (fresh HLC, delete clock + TTL kept).
                 let mut payload = head::encode(head::CTYPE_PROTO, del);
-                payload.extend_from_slice(&protohead::encode(&schema, version, &tname, &msg));
+                payload.extend_from_slice(&protohead::encode_v2(&schema_c, version, &tname_c));
                 let env2 = Envelope::head(ctx.hlc.now(), ctx.node_id).with_ttl(env.ttl_deadline_ms);
                 write_merged(ctx, &ikey::head_key(&k), &env2.encode_with(&payload));
                 RmwOut::Done(reply)
@@ -765,8 +1149,8 @@ async fn rmw_message(engine: &Arc<Engine>, key: &[u8], apply: RmwApply) -> Reply
     Reply::err("TRYAGAIN concurrent type change on the key; retry")
 }
 
-/// `PROTO.SETFIELD key path value [path value…]` — one atomic RMW; scalar
-/// values from strings, message/repeated/map values from JSON.
+/// `PROTO.SETFIELD key path value [path value…]` — per-field CRDT writes;
+/// scalar values from strings, message/repeated/map values from JSON.
 pub async fn setfield(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     if args.len() < 4 || (args.len() - 2) % 2 != 0 {
         return Reply::wrong_args("proto.setfield");
@@ -778,13 +1162,7 @@ pub async fn setfield(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             Err(e) => return e.reply(),
         }
     }
-    let apply = Arc::new(move |m: &mut DynamicMessage| {
-        for (p, raw) in &ops {
-            path::set_path(m, p, raw)?;
-        }
-        Ok(Reply::ok())
-    });
-    rmw_message(engine, &args[1], apply).await
+    field_rmw(engine, &args[1], FieldOp::Set(ops)).await
 }
 
 /// `PROTO.CLEARFIELD key path [path…]` → Int: how many paths had something
@@ -800,16 +1178,7 @@ pub async fn clearfield(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             Err(e) => return e.reply(),
         }
     }
-    let apply = Arc::new(move |m: &mut DynamicMessage| {
-        let mut n = 0i64;
-        for p in &paths {
-            if path::clear_path(m, p)? {
-                n += 1;
-            }
-        }
-        Ok(Reply::Int(n))
-    });
-    rmw_message(engine, &args[1], apply).await
+    field_rmw(engine, &args[1], FieldOp::Clear(paths)).await
 }
 
 /// `PROTO.GETJSON key` → canonical protobuf-JSON of the stored message.

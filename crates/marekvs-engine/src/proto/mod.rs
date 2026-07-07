@@ -11,6 +11,7 @@
 
 pub mod compile;
 pub mod err;
+pub mod fields;
 pub mod path;
 pub mod registry;
 

@@ -11,6 +11,7 @@ pub mod hlc;
 pub mod ikey;
 pub mod json;
 pub mod merge;
+pub mod pdoc;
 pub mod protohead;
 pub mod score;
 

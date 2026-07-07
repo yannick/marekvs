@@ -36,7 +36,7 @@ pub fn parse_path(raw: &[u8]) -> Result<Vec<String>, ProtoErr> {
 
 /// Resolve one segment to a field of `msg`'s descriptor: by name, or — for
 /// an all-digits segment — by field number.
-fn resolve_field(
+pub(crate) fn resolve_field(
     msg: &prost_reflect::MessageDescriptor,
     seg: &str,
 ) -> Result<FieldDescriptor, ProtoErr> {
@@ -55,12 +55,12 @@ fn resolve_field(
     )))
 }
 
-fn parse_index(seg: &str) -> Result<usize, ProtoErr> {
+pub(crate) fn parse_index(seg: &str) -> Result<usize, ProtoErr> {
     seg.parse::<usize>()
         .map_err(|_| ProtoErr::Path(format!("'{seg}' is not a list index")))
 }
 
-fn parse_map_key(seg: &str, key_kind: &Kind) -> Result<MapKey, ProtoErr> {
+pub(crate) fn parse_map_key(seg: &str, key_kind: &Kind) -> Result<MapKey, ProtoErr> {
     let bad = || ProtoErr::Path(format!("map key '{seg}' does not parse as {key_kind:?}"));
     Ok(match key_kind {
         Kind::String => MapKey::String(seg.to_string()),

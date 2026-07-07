@@ -270,6 +270,11 @@ expect "PROTO.GETFIELD after set" "37" "$($R proto.getfield user:1 age)"
 expect "PROTO TYPE" "proto" "$($R type user:1)"
 expect "PROTO OBJECT ENCODING" "acme.User" "$($R object encoding user:1)"
 expect "PROTO.INFO has type" "yes" "$($R proto.info user:1 | grep -q acme.User && echo yes)"
+# design/18: a decomposed value reports the field-level storage format…
+expect "PROTO.INFO format fields" "yes" "$($R proto.info user:1 | grep -q fields && echo yes)"
+# …and field-level edits leave the rest of the message intact.
+expect "PROTO.SETFIELD other field" "OK" "$($R proto.setfield user:1 name grace)"
+expect "PROTO.GETJSON intact" '{"name":"grace","age":37}' "$($R proto.getjson user:1)"
 expect "PROTO.SET rejects garbage" "yes" "$($R proto.set user:2 not-a-proto 2>&1 | grep -qi 'PROTOVALIDATE\|error' && echo yes)"
 expect "PROTO no binding" "yes" "$($R proto.setjson other:1 '{}' 2>&1 | grep -qi nobinding && echo yes)"
 expect "PROTO.DEL" "1" "$($R del user:1)"

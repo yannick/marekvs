@@ -18,18 +18,25 @@
 //! bytes — no protobuf dependency (compilation/reflection live in the
 //! engine's `proto` module).
 
+/// Whole-message layout (legacy since design/18): the tail carries the
+/// encoded message bytes. Read-only — new writes always use FMT_V2.
 pub const FMT_V1: u8 = 1;
+/// Field-decomposed layout (design/18): the tail carries only the schema
+/// reference; the value lives in per-field records under `Tag::ProtoField`.
+pub const FMT_V2: u8 = 2;
 
 /// Decoded view of a proto head tail (borrows from the payload).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtoHead<'a> {
+    /// Tail layout: [`FMT_V1`] (inline message) or [`FMT_V2`] (decomposed).
+    pub fmt: u8,
     /// Registry version of the schema the message was validated against.
     pub schema_version: u32,
     /// Registry schema name.
     pub schema: &'a str,
     /// Fully-qualified protobuf message type name (no leading dot).
     pub type_name: &'a str,
-    /// The encoded protobuf message.
+    /// The encoded protobuf message (always empty for [`FMT_V2`]).
     pub msg: &'a [u8],
 }
 
@@ -74,12 +81,25 @@ pub fn encode(schema: &str, schema_version: u32, type_name: &str, msg: &[u8]) ->
     out
 }
 
-/// Decode a proto head tail. `None` on unknown fmt, truncation, or non-utf8
-/// names.
+/// Encode a field-decomposed (FMT_V2) proto head tail — no message bytes.
+pub fn encode_v2(schema: &str, schema_version: u32, type_name: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 4 + 2 + schema.len() + 2 + type_name.len());
+    out.push(FMT_V2);
+    out.extend_from_slice(&schema_version.to_be_bytes());
+    put_varint(&mut out, schema.len() as u64);
+    out.extend_from_slice(schema.as_bytes());
+    put_varint(&mut out, type_name.len() as u64);
+    out.extend_from_slice(type_name.as_bytes());
+    out
+}
+
+/// Decode a proto head tail (either fmt). `None` on unknown fmt, truncation,
+/// trailing bytes after a v2 tail, or non-utf8 names.
 pub fn decode(tail: &[u8]) -> Option<ProtoHead<'_>> {
-    if tail.len() < 5 || tail[0] != FMT_V1 {
+    if tail.len() < 5 || !matches!(tail[0], FMT_V1 | FMT_V2) {
         return None;
     }
+    let fmt = tail[0];
     let schema_version = u32::from_be_bytes(tail[1..5].try_into().unwrap());
     let rest = &tail[5..];
     let (nlen, n) = get_varint(rest)?;
@@ -92,7 +112,11 @@ pub fn decode(tail: &[u8]) -> Option<ProtoHead<'_>> {
     let rest = rest.get(n..)?;
     let type_name = std::str::from_utf8(rest.get(..tlen)?).ok()?;
     let msg = &rest[tlen..];
+    if fmt == FMT_V2 && !msg.is_empty() {
+        return None; // v2 carries no message; trailing bytes are corruption
+    }
     Some(ProtoHead {
+        fmt,
         schema_version,
         schema,
         type_name,
@@ -137,10 +161,44 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_fmt() {
+    fn rejects_unknown_fmt() {
         let mut tail = encode("s", 1, "T", b"x");
-        tail[0] = 2;
+        tail[0] = 3;
         assert!(decode(&tail).is_none());
+    }
+
+    #[test]
+    fn v2_roundtrip() {
+        let tail = encode_v2("orders", 5, "shop.v1.Order");
+        let h = decode(&tail).unwrap();
+        assert_eq!(h.fmt, FMT_V2);
+        assert_eq!(h.schema_version, 5);
+        assert_eq!(h.schema, "orders");
+        assert_eq!(h.type_name, "shop.v1.Order");
+        assert_eq!(h.msg, b"");
+    }
+
+    #[test]
+    fn v1_reports_fmt() {
+        let tail = encode("s", 1, "T", b"x");
+        assert_eq!(decode(&tail).unwrap().fmt, FMT_V1);
+    }
+
+    #[test]
+    fn v2_rejects_trailing_bytes() {
+        // A v2 tail carries no message; stray bytes after the type name are
+        // corruption, not payload.
+        let mut tail = encode_v2("s", 1, "T");
+        tail.extend_from_slice(b"stray");
+        assert!(decode(&tail).is_none());
+    }
+
+    #[test]
+    fn v2_rejects_truncation() {
+        let tail = encode_v2("orders", 7, "shop.v1.Order");
+        for cut in 0..tail.len() {
+            assert!(decode(&tail[..cut]).is_none(), "cut at {cut} must fail");
+        }
     }
 
     #[test]

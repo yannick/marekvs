@@ -19,7 +19,7 @@ SCENARIOS=("$@")
 [ ${#SCENARIOS[@]} -gt 0 ] || {
   SCENARIOS=(crash_restart freeze_thaw rolling_churn wipe_replace membership_churn join_empty_reads interest_flood bank budget_no_overspend budget_pvc_wipe)
   [ "$BACKEND" = docker ] && SCENARIOS+=(disk_guard gc_grace_rejoin)
-  [ "$BACKEND" = docker ] && SCENARIOS+=(partition_divergence partition_no_resurrect budget_partition json_convergence proto_partition)
+  [ "$BACKEND" = docker ] && SCENARIOS+=(partition_divergence partition_no_resurrect budget_partition json_convergence proto_partition proto_field_partition)
 }
 
 trap cluster_down EXIT
@@ -637,6 +637,49 @@ proto_partition() {
   sleep 2
   heal 2
   check_converged "partition-born schema decodes on all nodes" 75 proto.getjson pw:k
+  check_replication_healed 60
+}
+
+# ── scenario: proto_field_partition (docker) ─────────────────────────────
+# Field-level proto CRDT (design/18): PROTO.SETFIELD of DIFFERENT fields on
+# both sides of a partition must both survive the heal (the whole-message-LWW
+# data-loss case), and concurrent appends to the same repeated field converge
+# with both runs present.
+proto_field_partition() {
+  fresh_cluster
+  local SRC='syntax = "proto3"; package chaos; message R { string a = 1; int32 b = 2; repeated string tags = 3; }'
+  rcli 0 proto.schema set chaos/r.proto SOURCE "$SRC" >/dev/null
+  rcli 0 proto.bind pr: chaos.R >/dev/null
+  rcli 0 proto.setjson pr:k '{"a":"seed","tags":["s"]}' >/dev/null
+  check_converged "proto field value seeded" 30 proto.getjson pr:k
+  partition 1
+  sleep 2
+  # majority edits field a + appends to tags; island edits field b + appends
+  # to tags. Both fields and both appends must survive the heal.
+  rcli 0 proto.setfield pr:k a majority >/dev/null
+  rcli 0 proto.setfield pr:k tags.1 m1 >/dev/null
+  rcli 1 proto.setfield pr:k b 99 >/dev/null
+  rcli 1 proto.setfield pr:k tags.1 i1 >/dev/null
+  sleep 3
+  heal 1
+  check_converged "post-heal proto field value" 75 proto.getjson pr:k
+  local d; d=$(rcli 2 proto.getjson pr:k)
+  case "$d" in
+    *'"a":"majority"'*) chk 0 "majority field a survived" ;;
+    *) chk 1 "majority field a" "value [$d]" ;;
+  esac
+  case "$d" in
+    *'"b":99'*) chk 0 "island field b survived" ;;
+    *) chk 1 "island field b" "value [$d]" ;;
+  esac
+  case "$d" in
+    *m1*) chk 0 "majority append survived" ;;
+    *) chk 1 "majority append" "value [$d]" ;;
+  esac
+  case "$d" in
+    *i1*) chk 0 "island append survived" ;;
+    *) chk 1 "island append" "value [$d]" ;;
+  esac
   check_replication_healed 60
 }
 

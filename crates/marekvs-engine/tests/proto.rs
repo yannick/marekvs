@@ -988,6 +988,208 @@ async fn setjson_getjson_roundtrip_after_field_edits() {
     assert_eq!(out, out2);
 }
 
+#[tokio::test]
+async fn proto_set_decomposes_to_fmt2() {
+    let (_d, e) = bound_engine().await;
+    let msg = order_bytes("o-1", 995);
+    ok(proto_cmd::set(&e, &a(&[b"PROTO.SET", b"order:1", &msg])).await);
+    let info = proto_cmd::info(&e, &a(&[b"PROTO.INFO", b"order:1"])).await;
+    assert_eq!(map_get(&info, "format"), Reply::bulk_str("fields"));
+    // root marker + id + total_cents = 3 records
+    assert_eq!(map_get(&info, "records"), Reply::Int(3));
+    // GET materializes the field records back to the identical wire bytes.
+    assert_eq!(
+        bulk(proto_cmd::get(&e, &a(&[b"PROTO.GET", b"order:1"])).await),
+        msg
+    );
+}
+
+#[tokio::test]
+async fn legacy_fmt1_upgrades_on_setfield() {
+    let (_d, e) = bound_engine().await;
+    let msg = order_bytes("legacy", 42);
+    // A pre-design/18 whole-message (fmt=1) value written directly.
+    write_raw_proto(&e, b"order:leg", "orders", 1, "shop.v1.Order", &msg).await;
+    let info = proto_cmd::info(&e, &a(&[b"PROTO.INFO", b"order:leg"])).await;
+    assert_eq!(map_get(&info, "format"), Reply::bulk_str("whole"));
+    // Readable before any upgrade.
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:leg", b"id"])).await,
+        Reply::Bulk(b"legacy".to_vec())
+    );
+    // One SETFIELD upgrades it to fmt=2 in place.
+    ok(proto_cmd::setfield(&e, &a(&[b"PROTO.SETFIELD", b"order:leg", b"id", b"new"])).await);
+    let info = proto_cmd::info(&e, &a(&[b"PROTO.INFO", b"order:leg"])).await;
+    assert_eq!(map_get(&info, "format"), Reply::bulk_str("fields"));
+    // Edited field changed, untouched field preserved through the upgrade.
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:leg", b"id"])).await,
+        Reply::Bulk(b"new".to_vec())
+    );
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:leg", b"total_cents"])).await,
+        Reply::Int(42)
+    );
+}
+
+#[tokio::test]
+async fn setfield_appends_and_replaces_repeated() {
+    let (_d, e) = bound_engine().await;
+    seed_order(&e, b"order:ap").await; // tags = ["a","b"]
+                                       // index == len appends
+    ok(proto_cmd::setfield(&e, &a(&[b"PROTO.SETFIELD", b"order:ap", b"tags.2", b"c"])).await);
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:ap", b"tags"])).await,
+        Reply::Bulk(br#"["a","b","c"]"#.to_vec())
+    );
+    // index < len replaces in place (RGA order preserved)
+    ok(proto_cmd::setfield(&e, &a(&[b"PROTO.SETFIELD", b"order:ap", b"tags.1", b"B"])).await);
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:ap", b"tags"])).await,
+        Reply::Bulk(br#"["a","B","c"]"#.to_vec())
+    );
+    // index past the end errors
+    assert_err_contains(
+        proto_cmd::setfield(&e, &a(&[b"PROTO.SETFIELD", b"order:ap", b"tags.9", b"x"])).await,
+        "range",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// cross-cutting: RENAME/COPY/EXPIRE/restart of a decomposed (fmt=2) value
+// ---------------------------------------------------------------------------
+
+const PICK_SRC: &str = r#"
+    syntax = "proto3";
+    package pick.v1;
+    message Pick {
+        repeated string items = 1;
+        oneof choice { string label = 2; int32 code = 3; }
+    }
+"#;
+
+#[tokio::test]
+async fn rename_copy_preserve_decomposed_value() {
+    let (_d, e) = bound_engine().await;
+    seed_order(&e, b"order:src").await; // tags ["a","b"], scores, customer
+    generic::rename(&e, &a(&[b"RENAME", b"order:src", b"order:dst"]), false).await;
+    assert_eq!(
+        simple(generic::type_cmd(&e, &a(&[b"TYPE", b"order:src"])).await),
+        "none"
+    );
+    // field values, repeated ORDER and map entries all survive the copy
+    let gf = |key: &'static [u8], p: &'static [u8]| {
+        let e = e.clone();
+        async move { proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", key, p])).await }
+    };
+    assert_eq!(gf(b"order:dst", b"id").await, Reply::Bulk(b"o-1".to_vec()));
+    assert_eq!(
+        gf(b"order:dst", b"customer.name").await,
+        Reply::Bulk(b"Ada".to_vec())
+    );
+    assert_eq!(
+        gf(b"order:dst", b"tags").await,
+        Reply::Bulk(br#"["a","b"]"#.to_vec())
+    );
+    assert_eq!(gf(b"order:dst", b"scores.alice").await, Reply::Int(10));
+    // still a decomposed value at the destination
+    let info = proto_cmd::info(&e, &a(&[b"PROTO.INFO", b"order:dst"])).await;
+    assert_eq!(map_get(&info, "format"), Reply::bulk_str("fields"));
+    // COPY preserves it too, and editing the copy does not touch the source
+    assert_eq!(
+        int(generic::copy(&e, &a(&[b"COPY", b"order:dst", b"order:c2"])).await),
+        1
+    );
+    ok(proto_cmd::setfield(&e, &a(&[b"PROTO.SETFIELD", b"order:c2", b"id", b"copy"])).await);
+    assert_eq!(gf(b"order:c2", b"id").await, Reply::Bulk(b"copy".to_vec()));
+    assert_eq!(gf(b"order:dst", b"id").await, Reply::Bulk(b"o-1".to_vec()));
+}
+
+#[tokio::test]
+async fn rename_preserves_oneof_winner_and_repeated_order() {
+    let (_d, e) = engine();
+    assert_eq!(int(schema_set_source(&e, b"pick", PICK_SRC).await), 1);
+    ok(proto_cmd::bind(&e, &a(&[b"PROTO.BIND", b"pick:", b"pick.v1.Pick"])).await);
+    ok(proto_cmd::setjson(
+        &e,
+        &a(&[
+            b"PROTO.SETJSON",
+            b"pick:1",
+            br#"{"items":["x","y","z"],"label":"chosen"}"#,
+        ]),
+    )
+    .await);
+    generic::rename(&e, &a(&[b"RENAME", b"pick:1", b"pick:2"]), false).await;
+    let out = bulk(proto_cmd::getjson(&e, &a(&[b"PROTO.GETJSON", b"pick:2"])).await);
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    // repeated RGA order preserved through the re-chain
+    assert_eq!(v["items"], serde_json::json!(["x", "y", "z"]));
+    // oneof winner (label) survives; the losing member (code) stays unset
+    assert_eq!(v["label"], "chosen");
+    assert_eq!(v.get("code"), None);
+}
+
+#[tokio::test]
+async fn expire_and_object_preserve_v2_tail() {
+    let (_d, e) = bound_engine().await;
+    seed_order(&e, b"order:x").await;
+    assert_eq!(
+        int(generic::expire(&e, &a(&[b"EXPIRE", b"order:x", b"100"]), 1000, false).await),
+        1
+    );
+    let ttl = int(generic::ttl(&e, &a(&[b"TTL", b"order:x"]), false).await);
+    assert!(ttl > 90 && ttl <= 100, "ttl {ttl}");
+    // the v2 head tail (fq type) survives the expire re-stamp…
+    assert_eq!(
+        bulk(generic::object(&e, &a(&[b"OBJECT", b"ENCODING", b"order:x"])).await),
+        b"shop.v1.Order"
+    );
+    // …and the field records are still readable
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:x", b"id"])).await,
+        Reply::Bulk(b"o-1".to_vec())
+    );
+    assert_eq!(
+        int(generic::persist(&e, &a(&[b"PERSIST", b"order:x"])).await),
+        1
+    );
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:x", b"customer.name"])).await,
+        Reply::Bulk(b"Ada".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn decomposed_value_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let e = open(&dir, 7);
+        assert_eq!(int(schema_set_source(&e, b"orders", ORDER_SRC).await), 1);
+        ok(proto_cmd::bind(&e, &a(&[b"PROTO.BIND", b"order:", b"shop.v1.Order"])).await);
+        seed_order(&e, b"order:persist").await;
+    } // drop → store closed
+    let e = open(&dir, 7);
+    let info = proto_cmd::info(&e, &a(&[b"PROTO.INFO", b"order:persist"])).await;
+    assert_eq!(map_get(&info, "format"), Reply::bulk_str("fields"));
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:persist", b"id"])).await,
+        Reply::Bulk(b"o-1".to_vec())
+    );
+    assert_eq!(
+        proto_cmd::getfield(&e, &a(&[b"PROTO.GETFIELD", b"order:persist", b"tags"])).await,
+        Reply::Bulk(br#"["a","b"]"#.to_vec())
+    );
+}
+
+#[tokio::test]
+async fn decomposed_value_appears_once_in_keys() {
+    let (_d, e) = bound_engine().await;
+    seed_order(&e, b"order:1").await; // writes many internal 'p' field records
+                                      // KEYS enumerates user keys, not the internal field records.
+    let keys = array(generic::keys(&e, &a(&[b"KEYS", b"*"])).await);
+    assert_eq!(keys, vec![Reply::Bulk(b"order:1".to_vec())]);
+}
+
 // ---------------------------------------------------------------------------
 // B6 — validated collection elements: PROTO.HSET/SADD/HGETJSON/HGETFIELD
 // ---------------------------------------------------------------------------

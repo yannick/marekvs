@@ -23,6 +23,8 @@ Kubernetes-native, built for performance.
 | [13-budget.md](13-budget.md) | `BG.*` distributed budgets: escrow protocol, never-overspend invariant, tokens |
 | [15-cluster-protocol.md](15-cluster-protocol.md) | Redis Cluster client-side routing: CRC16 slot mapping, read-only `CLUSTER` family, no MOVED/CROSSSLOT |
 | [16-json.md](16-json.md) | `JSON.*` documents as per-path CRDTs: OR-map fields, RGA arrays, stable-id addressing |
+| [17-protobuf.md](17-protobuf.md) | `PROTO.*` schema registry, prefix bindings, validated typed values, dot-path field access |
+| [18-proto-field-crdt.md](18-proto-field-crdt.md) | `PROTO.*` field-level CRDT: one record per field-number path, fmt=2 upgrade-on-write, oneof/skip rules |
 
 Reading order for newcomers: 00 → 01 → 02 → 04 → 05. The single source of
 truth for all tunables is the defaults table in
