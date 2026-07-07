@@ -33,7 +33,7 @@
 
 A distributed key-value database server with a Redis-compatible API, written
 in Rust. AP by design (eventually consistent, coordination-free), disk-native
-via the [ondaDB](../ondadb) LSM engine — no in-memory dataset.
+via the [ondaDB](https://github.com/yannick/ondadb) LSM engine — no in-memory dataset.
 
 - **Redis protocol**: RESP2 + RESP3, strings / hashes / sets / sorted sets /
   lists / streams / pub-sub / JSON documents ([coverage matrix](design/03-redis-api.md))
@@ -82,7 +82,7 @@ just run            # single local node on :6379
 
 just run-cluster    # local 3-node cluster on :6379/:6380/:6381
 
-just docker-build   # FROM-scratch image (needs ../ondadb sibling checkout)
+just docker-build   # FROM-scratch image
                     # plain cargo builds fall back to the ondadb git dep
                     # (github.com/yannick/ondadb)
 just docker-test    # 3-node compose cluster + convergence tests
