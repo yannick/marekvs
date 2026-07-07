@@ -109,6 +109,17 @@ fn slots_reply(t: &Topology) -> Reply {
 fn shards_reply(t: &Topology) -> Reply {
     let mut shards = Vec::new();
     for (start, end, owners) in slot_ranges(&t.pid_owners) {
+        // Same fail-safe as slots_reply: without an addressable master (H1)
+        // the whole range is omitted — a shard whose nodes list has no
+        // "master" role breaks cluster clients' routing.
+        let has_master = owners
+            .first()
+            .and_then(|id| node_of(t, *id))
+            .and_then(|n| n.resp_addr)
+            .is_some();
+        if !has_master {
+            continue;
+        }
         let mut nodes = Vec::new();
         for (i, id) in owners.iter().enumerate() {
             let Some(n) = node_of(t, *id) else { continue };
@@ -274,5 +285,19 @@ mod tests {
         let Reply::Array(entries) = slots_reply(&t) else { panic!() };
         // ranges mastered by node 0 are dropped; node-1 ranges survive
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn shards_skip_master_without_resp_addr() {
+        let mut t = topo();
+        t.nodes[0].resp_addr = None;
+        let Reply::Array(shards) = shards_reply(&t) else { panic!() };
+        // Node 0 masters slots 0..7: that shard is dropped entirely (a
+        // shard whose nodes list has no master breaks client routing);
+        // the node-1-mastered shard survives with node 0 absent from it.
+        assert_eq!(shards.len(), 1);
+        let Reply::Map(shard) = &shards[0] else { panic!() };
+        let Reply::Array(nodes) = &shard[1].1 else { panic!() };
+        assert_eq!(nodes.len(), 1); // replica entry for node 0 dropped too
     }
 }
