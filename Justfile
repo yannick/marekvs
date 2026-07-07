@@ -394,11 +394,20 @@ docs:
     cargo run --manifest-path crates/docsgen/Cargo.toml --release
     @printf '{{bold}}{{green}}✓ open _site/index.html (or `just docs-serve`){{reset}}\n'
 
-# build the docs site and serve it at http://localhost:8791
+# build the docs site and serve it (default http://localhost:8791; override
+# with `just docs-serve 9000`)
 [group('docs')]
-docs-serve: docs
-    @printf '{{bold}}{{blue}}▸ serving _site on http://localhost:8791{{reset}}\n'
-    python3 -m http.server 8791 --directory _site --bind 127.0.0.1
+docs-serve port="8791": docs
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if holder=$(lsof -nP -iTCP:{{port}} -sTCP:LISTEN -t 2>/dev/null) && [ -n "$holder" ]; then
+        echo "docs-serve: port {{port}} is already in use by:" >&2
+        ps -p "$holder" -o pid,command | tail -n +2 >&2
+        echo "docs-serve: kill it or pick another port: just docs-serve <port>" >&2
+        exit 1
+    fi
+    printf '▸ serving _site on http://localhost:{{port}}\n'
+    python3 -m http.server {{port}} --directory _site --bind 127.0.0.1
 
 # ══ housekeeping ═════════════════════════════════════════════════════════
 
