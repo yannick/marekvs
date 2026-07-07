@@ -21,6 +21,7 @@ Kubernetes-native, built for performance.
 | [11-lua-scripting.md](11-lua-scripting.md) | EVAL/EVALSHA: atomic same-pid scripts, distributed caveats + solutions |
 | [12-operator.md](12-operator.md) | Kubernetes operator: MarekvsCluster CRD, safe scaling, ops/s autoscaling |
 | [13-budget.md](13-budget.md) | `BG.*` distributed budgets: escrow protocol, never-overspend invariant, tokens |
+| [15-cluster-protocol.md](15-cluster-protocol.md) | Redis Cluster client-side routing: CRC16 slot mapping, read-only `CLUSTER` family, no MOVED/CROSSSLOT |
 
 Reading order for newcomers: 00 → 01 → 02 → 04 → 05. The single source of
 truth for all tunables is the defaults table in

@@ -12,7 +12,8 @@ the merge rules that make replication converge — the machinery behind the
 ## Partitioning
 
 ```text
-pid: u16 = (xxh3_64(userkey) >> 52) as u16     // top 12 bits → 0..4095
+slot: u16 = crc16_xmodem(userkey) % 16384      // Redis Cluster slot
+pid:  u16 = slot >> 2                          // 4 slots per pid → 0..4095
 ```
 
 `P = 4096` fixed partitions, chosen at cluster creation and never changed. Every
@@ -21,6 +22,13 @@ contiguous ondaDB key range — which makes bootstrap streaming, Merkle digestin
 and handoff cheap prefix operations. For collections, `pid` derives from the
 **user key only** (not the field or member), so a whole collection lives in one
 partition and on one shard thread.
+
+The slot function is the same CRC16 hash Redis Cluster clients compute
+locally, so a cluster-aware client's `slot = CRC16(key) % 16384` and marekvs'
+own placement agree — see [Cluster protocol](../cluster-protocol/). This is a
+data-format change from the earlier `xxh3`-based partitioning: a cluster
+migrates through the same upstream-replication path used for Redis→marekvs
+moves ([Cluster protocol](../cluster-protocol/#compatibility)).
 
 Redis **hash tags** are implemented and match Redis exactly: if a key contains
 `{...}`, only the bytes inside the first non-empty brace pair are hashed — so
