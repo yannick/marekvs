@@ -762,3 +762,172 @@ async fn obj_ops_mget_mset_merge_resp_debug() {
         other => panic!("expected Array, got {other:?}"),
     }
 }
+
+// ===========================================================================
+// Phase A5: restart persistence + foreign-origin merge simulations
+// ===========================================================================
+
+fn open_engine(dir: &tempfile::TempDir, node_id: u16) -> Arc<Engine> {
+    let store = Store::open(&StoreConfig {
+        data_dir: dir.path().to_string_lossy().into_owned(),
+        node_id,
+        shard_threads: 2,
+        ..StoreConfig::default()
+    })
+    .unwrap();
+    Engine::new(store)
+}
+
+#[tokio::test]
+async fn restart_persistence() {
+    let dir = tempfile::tempdir().unwrap();
+    let v = serde_json::json!({"a": {"b": [1, "x", null]}, "n": 3.5});
+    {
+        let e = open_engine(&dir, 7);
+        jset(&e, b"p", b"$", serde_json::to_string(&v).unwrap().as_bytes()).await;
+        json::arrappend(&e, &a(&[b"JSON.ARRAPPEND", b"p", b".a.b", b"9"])).await;
+        json::del(&e, &a(&[b"JSON.DEL", b"p", b"$.a.b[0]"])).await;
+        drop(e); // Store::drop closes ondadb cleanly
+    }
+    let e = open_engine(&dir, 7);
+    assert_eq!(
+        jval(&jget(&e, b"p", b".").await),
+        serde_json::json!({"a": {"b": ["x", null, 9]}, "n": 3.5})
+    );
+}
+
+/// Copy every JSON record of `key` from `src` to `dst` in the given order
+/// (simulating replication delivery order).
+async fn replicate_json(src: &Arc<Engine>, dst: &Arc<Engine>, key: &[u8], reverse: bool) {
+    let k = key.to_vec();
+    let mut records: Vec<(Vec<u8>, Vec<u8>)> = src
+        .store
+        .run_key(&k.clone(), move |ctx| {
+            let mut out = Vec::new();
+            if let Some(h) = store::get_raw(ctx, &ikey::head_key(&k)) {
+                out.push((ikey::head_key(&k), h));
+            }
+            store::scan_prefix(ctx, &ikey::collection_prefix(ikey::Tag::Json, &k), |ik, v| {
+                out.push((ik.to_vec(), v.to_vec()));
+                true
+            });
+            out
+        })
+        .await;
+    if reverse {
+        records.reverse();
+    }
+    let key = key.to_vec();
+    dst.store
+        .run_key(&key, move |ctx| {
+            for (ik, v) in records {
+                store::write_merged(ctx, &ik, &v);
+            }
+        })
+        .await;
+}
+
+/// Two nodes edit the same doc concurrently; both replicate to the other in
+/// opposite delivery orders; both must materialize the identical document.
+#[tokio::test]
+async fn concurrent_editors_converge() {
+    let (_d1, e1) = {
+        let dir = tempfile::tempdir().unwrap();
+        let e = open_engine(&dir, 1);
+        (dir, e)
+    };
+    let (_d2, e2) = {
+        let dir = tempfile::tempdir().unwrap();
+        let e = open_engine(&dir, 2);
+        (dir, e)
+    };
+    // node 1 creates the doc; ship it to node 2
+    jset(&e1, b"c", b"$", br#"{"title":"x","tags":["a"],"meta":{"k":1}}"#).await;
+    replicate_json(&e1, &e2, b"c", false).await;
+    assert_eq!(jval(&jget(&e2, b"c", b".").await), jval(&jget(&e1, b"c", b".").await));
+
+    // concurrent edits: disjoint fields, same-array appends, subtree delete
+    jset(&e1, b"c", b"$.title", br#""from-1""#).await;
+    json::arrappend(&e1, &a(&[b"JSON.ARRAPPEND", b"c", b".tags", br#""n1""#])).await;
+    json::del(&e1, &a(&[b"JSON.DEL", b"c", b"$.meta"])).await;
+
+    jset(&e2, b"c", b"$.other", b"42").await;
+    json::arrappend(&e2, &a(&[b"JSON.ARRAPPEND", b"c", b".tags", br#""n2a""#, br#""n2b""#])).await;
+    // concurrent write INTO the subtree node 1 deletes: the delete wins —
+    // a leaf write does not re-assert its ancestors' presence (documented)
+    jset(&e2, b"c", b"$.meta.fresh", b"true").await;
+
+    // exchange in opposite orders
+    replicate_json(&e1, &e2, b"c", false).await;
+    replicate_json(&e2, &e1, b"c", true).await;
+    // (e1 now has everything; ship e1's merged state back so both saw all)
+    replicate_json(&e1, &e2, b"c", false).await;
+
+    let v1 = jval(&jget(&e1, b"c", b".").await);
+    let v2 = jval(&jget(&e2, b"c", b".").await);
+    assert_eq!(v1, v2, "replicas diverged");
+
+    // invariants: disjoint fields both present
+    assert_eq!(v1["title"], serde_json::json!("from-1"));
+    assert_eq!(v1["other"], serde_json::json!(42));
+    // both append runs present and contiguous
+    let tags: Vec<String> = v1["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(tags.len(), 4, "tags: {tags:?}");
+    assert!(tags.contains(&"n1".to_string()));
+    let p2a = tags.iter().position(|t| t == "n2a").unwrap();
+    assert_eq!(tags[p2a + 1], "n2b", "run n2a/n2b interleaved: {tags:?}");
+    // delete vs concurrent-leaf-create: the subtree delete wins; only
+    // re-creating the branch node itself would resurrect it (documented)
+    assert!(v1.get("meta").is_none(), "meta should be gone: {v1}");
+}
+
+/// The same element popped on both sides concurrently: converges, element
+/// gone once, no error.
+#[tokio::test]
+async fn double_arrpop_converges() {
+    let d1 = tempfile::tempdir().unwrap();
+    let d2 = tempfile::tempdir().unwrap();
+    let e1 = open_engine(&d1, 1);
+    let e2 = open_engine(&d2, 2);
+    jset(&e1, b"q", b"$", br#"[10,20,30]"#).await;
+    replicate_json(&e1, &e2, b"q", false).await;
+
+    let p1 = bulk(&json::arrpop(&e1, &a(&[b"JSON.ARRPOP", b"q"])).await);
+    let p2 = bulk(&json::arrpop(&e2, &a(&[b"JSON.ARRPOP", b"q"])).await);
+    assert_eq!(p1, "30");
+    assert_eq!(p2, "30", "both nodes popped the same tail concurrently");
+
+    replicate_json(&e1, &e2, b"q", false).await;
+    replicate_json(&e2, &e1, b"q", true).await;
+    assert_eq!(jval(&jget(&e1, b"q", b".").await), serde_json::json!([10, 20]));
+    assert_eq!(jval(&jget(&e2, b"q", b".").await), serde_json::json!([10, 20]));
+}
+
+/// Field set racing a field delete: the set's unobserved dot survives
+/// (add-wins), in both delivery orders.
+#[tokio::test]
+async fn set_vs_del_add_wins() {
+    let d1 = tempfile::tempdir().unwrap();
+    let d2 = tempfile::tempdir().unwrap();
+    let e1 = open_engine(&d1, 1);
+    let e2 = open_engine(&d2, 2);
+    jset(&e1, b"r", b"$", br#"{"f":1}"#).await;
+    replicate_json(&e1, &e2, b"r", false).await;
+
+    json::del(&e1, &a(&[b"JSON.DEL", b"r", b"$.f"])).await;
+    jset(&e2, b"r", b"$.f", b"2").await; // observed the old dot, sets fresh
+
+    replicate_json(&e1, &e2, b"r", false).await;
+    replicate_json(&e2, &e1, b"r", true).await;
+    let v1 = jval(&jget(&e1, b"r", b".").await);
+    let v2 = jval(&jget(&e2, b"r", b".").await);
+    assert_eq!(v1, v2);
+    // e2's SET covered the same dot e1's DEL covered, but installed a fresh
+    // one the delete never observed → the new value survives
+    assert_eq!(v1, serde_json::json!({"f": 2}));
+}

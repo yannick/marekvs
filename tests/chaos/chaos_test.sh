@@ -19,7 +19,7 @@ SCENARIOS=("$@")
 [ ${#SCENARIOS[@]} -gt 0 ] || {
   SCENARIOS=(crash_restart freeze_thaw rolling_churn wipe_replace membership_churn join_empty_reads interest_flood bank budget_no_overspend budget_pvc_wipe)
   [ "$BACKEND" = docker ] && SCENARIOS+=(disk_guard gc_grace_rejoin)
-  [ "$BACKEND" = docker ] && SCENARIOS+=(partition_divergence partition_no_resurrect budget_partition)
+  [ "$BACKEND" = docker ] && SCENARIOS+=(partition_divergence partition_no_resurrect budget_partition json_convergence)
 }
 
 trap cluster_down EXIT
@@ -555,6 +555,51 @@ budget_oracle() { # <journal>
     *BUDGETEXHAUSTED*|*"exceeds budget maximum"*) chk 0 "oversized reserve fails closed" ;;
     *) chk 1 "oversized reserve" "unexpected: $big" ;;
   esac
+}
+
+# ── scenario: json_convergence (docker) ──────────────────────────────────
+# Per-path CRDT JSON docs (design/16): concurrent field writes, same-array
+# appends, and a subtree delete across a partition must converge to the
+# byte-identical document on every node, with each append run contiguous.
+json_convergence() {
+  fresh_cluster
+  rcli 0 json.set jc:doc '$' '{"title":"seed","tags":["a"],"meta":{"k":1}}' >/dev/null
+  check_converged "json doc seeded" 30 json.get jc:doc .
+  partition 1
+  sleep 2
+  # majority side: field update, append run, subtree delete
+  rcli 0 json.set jc:doc '$.title' '"from-majority"' >/dev/null
+  rcli 0 json.arrappend jc:doc .tags '"m1"' '"m2"' >/dev/null
+  rcli 0 json.del jc:doc '$.meta' >/dev/null
+  # island side: fresh field, its own append run
+  rcli 1 json.set jc:doc '$.island' 42 >/dev/null
+  rcli 1 json.arrappend jc:doc .tags '"i1"' '"i2"' >/dev/null
+  sleep 3
+  heal 1
+  # 75 s > the 60 s interest lease (see partition_no_resurrect)
+  check_converged "post-heal json doc" 75 json.get jc:doc .
+  local d; d=$(rcli 0 json.get jc:doc .)
+  case "$d" in
+    *'"title":"from-majority"'*) chk 0 "majority field survived" ;;
+    *) chk 1 "majority field" "doc [$d]" ;;
+  esac
+  case "$d" in
+    *'"island":42'*) chk 0 "island field survived" ;;
+    *) chk 1 "island field" "doc [$d]" ;;
+  esac
+  case "$d" in
+    *'"meta"'*) chk 1 "json subtree delete" "meta resurrected [$d]" ;;
+    *) chk 0 "json subtree delete held everywhere" ;;
+  esac
+  case "$d" in
+    *'"m1","m2"'*) chk 0 "majority append run contiguous" ;;
+    *) chk 1 "majority append run" "doc [$d]" ;;
+  esac
+  case "$d" in
+    *'"i1","i2"'*) chk 0 "island append run contiguous" ;;
+    *) chk 1 "island append run" "doc [$d]" ;;
+  esac
+  check_replication_healed 60
 }
 
 # ── scenario: budget_no_overspend — SIGKILL rounds ───────────────────────
