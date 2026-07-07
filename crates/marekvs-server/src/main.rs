@@ -249,6 +249,44 @@ async fn main() -> anyhow::Result<()> {
         }));
     }
 
+    // CLUSTER SLOTS/NODES topology provider (design/15).
+    {
+        let cluster = cluster.clone();
+        engine.set_cluster_topology(Arc::new(move || {
+            let view = cluster.view();
+            let n = cluster.replicas_n;
+            let nodes = view
+                .members
+                .iter()
+                .map(|m| marekvs_engine::TopologyNode {
+                    id: m.node,
+                    resp_addr: m.resp_addr,
+                    gossip_port: m.gossip_addr.port(),
+                    generation: m.generation,
+                    state: m.phase.as_str().to_string(),
+                })
+                .collect();
+            let pid_owners = (0..marekvs_core::PARTITIONS)
+                .map(|pid| {
+                    let mut owners = view.owners(pid, n);
+                    // H1 (first Active owner) first — it is the range master.
+                    if let Some(h1) = view.h1(pid, n) {
+                        if let Some(pos) = owners.iter().position(|o| *o == h1) {
+                            owners.swap(0, pos);
+                        }
+                    }
+                    owners
+                })
+                .collect();
+            marekvs_engine::Topology {
+                self_id: node_id,
+                epoch: view.epoch,
+                nodes,
+                pid_owners,
+            }
+        }));
+    }
+
     // Upstream-Redis replication (REPLICAOF live-migration path). Install the
     // control hook, then bootstrap from MAREKVS_REPLICAOF="host:port" if set.
     {
