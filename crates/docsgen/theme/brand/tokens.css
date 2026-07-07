@@ -122,6 +122,9 @@
   /* ---------- Layout ---------- */
   --mk-container:   1120px;
   --mk-container-narrow: 760px;
+  /* Docs shell: sidebar 232 + toc 200 + 2×32 gap + 48 padding + article.
+     1744 caps the article column at ~1200px on wide screens. */
+  --mk-container-wide: 1744px;
   --mk-gutter:      var(--mk-space-6);
 
   /* ---------- Motion ---------- */
