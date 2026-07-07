@@ -473,6 +473,14 @@ impl Engine {
                 | "BG.RELEASE"
                 | "BG.DRAW"
                 | "BG.RECLAIM"
+                | "PROTO.BIND"
+                | "PROTO.UNBIND"
+                | "PROTO.SET"
+                | "PROTO.SETFIELD"
+                | "PROTO.CLEARFIELD"
+                | "PROTO.SETJSON"
+                | "PROTO.HSET"
+                | "PROTO.SADD"
         )
     }
 
@@ -634,6 +642,14 @@ impl Engine {
                 | "BG.RELEASE"
                 | "BG.DRAW"
                 | "BG.INFO"
+                | "PROTO.BIND"
+                | "PROTO.UNBIND"
+                | "PROTO.SET"
+                | "PROTO.SETFIELD"
+                | "PROTO.CLEARFIELD"
+                | "PROTO.SETJSON"
+                | "PROTO.HSET"
+                | "PROTO.SADD"
                 | "PING"
                 | "ECHO"
         )
@@ -791,6 +807,14 @@ mod write_command_tests {
             "BG.COMMIT",
             "BG.RELEASE",
             "BG.DRAW",
+            "PROTO.BIND",
+            "PROTO.UNBIND",
+            "PROTO.SET",
+            "PROTO.SETFIELD",
+            "PROTO.CLEARFIELD",
+            "PROTO.SETJSON",
+            "PROTO.HSET",
+            "PROTO.SADD",
         ] {
             assert!(Engine::is_write_command(c), "{c} must be write-gated");
         }
@@ -828,6 +852,14 @@ mod write_command_tests {
             "SHUTDOWN",
             "REPLICAOF",
             "BG.INFO",
+            "PROTO.SCHEMA",
+            "PROTO.BINDINGS",
+            "PROTO.GET",
+            "PROTO.INFO",
+            "PROTO.GETFIELD",
+            "PROTO.GETJSON",
+            "PROTO.HGETJSON",
+            "PROTO.HGETFIELD",
         ] {
             assert!(!Engine::is_write_command(c), "{c} must not be write-gated");
         }

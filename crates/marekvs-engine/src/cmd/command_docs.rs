@@ -966,6 +966,18 @@ static TABLE: &[CommandDoc] = &[
     with_args(cmd("bg.reclaim", -3, &["write", "admin"], 1, 1, 1, "Fences a permanently dead node and redistributes its unconsumed escrow (admin; see design/13 preconditions).", "1.2.0", "budget"),
         &[A_KEY, arg("node", "integer"),
           Arg { token: Some("SEQ"), optional: true, ..arg("op-seq", "integer") }]),
+
+    // --- protobuf registry + typed values (PROTO.*, marekvs extension, design/17) ---
+    with_args(cmd("proto.schema", -2, &["admin"], 0, 0, 0, "A container for protobuf schema registry commands (SET, COMPILE, GET, LIST, TYPES, DEL).", "1.3.0", "proto"),
+        &[arg("subcommand", "string")]),
+    with_args(cmd("proto.bind", -3, CW, 0, 0, 0, "Binds a key prefix to a protobuf message type (longest prefix wins at resolution).", "1.3.0", "proto"),
+        &[arg("prefix", "string"), arg("type", "string"),
+          Arg { token: Some("SCHEMA"), optional: true, ..arg("schema", "string") },
+          Arg { token: Some("VERSION"), optional: true, ..arg("version", "integer") }]),
+    with_args(cmd("proto.unbind", 2, CW, 0, 0, 0, "Removes a protobuf prefix binding.", "1.3.0", "proto"),
+        &[arg("prefix", "string")]),
+    with_args(cmd("proto.bindings", -1, CRO, 0, 0, 0, "Lists protobuf prefix bindings.", "1.3.0", "proto"),
+        &[Arg { token: Some("MATCH"), optional: true, ..arg("pattern", "pattern") }]),
 ];
 
 /// The full command catalog.

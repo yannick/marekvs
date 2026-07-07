@@ -260,10 +260,11 @@ pub fn pool_from_fds(fds: &[u8]) -> Result<DescriptorPool, ProtoErr> {
 }
 
 /// Message type names a pool defines, excluding the bundled well-known
-/// `google/protobuf/*` files.
+/// `google/protobuf/*` files and synthetic map-entry messages.
 pub fn pool_types(pool: &DescriptorPool) -> Vec<String> {
     let mut types: Vec<String> = pool
         .all_messages()
+        .filter(|m| !m.is_map_entry())
         .filter(|m| !m.parent_file().name().starts_with("google/protobuf/"))
         .map(|m| m.full_name().to_string())
         .collect();

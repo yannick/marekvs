@@ -7,6 +7,7 @@ pub mod generic;
 pub mod hash;
 pub mod hll;
 pub mod list;
+pub mod proto;
 pub mod pubsub;
 pub mod script;
 pub mod server;
@@ -81,6 +82,12 @@ pub async fn dispatch(
         "BG.DRAW" => budget::draw(engine, &args).await,
         "BG.INFO" => budget::info(engine, &args).await,
         "BG.RECLAIM" => budget::reclaim(engine, &args).await,
+
+        // --- protobuf registry + typed values (PROTO.*, design/17) ---
+        "PROTO.SCHEMA" => proto::schema(engine, &args).await,
+        "PROTO.BIND" => proto::bind(engine, &args).await,
+        "PROTO.UNBIND" => proto::unbind(engine, &args).await,
+        "PROTO.BINDINGS" => proto::bindings_cmd(engine, &args).await,
 
         // --- generic / keyspace ---
         "DEL" | "UNLINK" => generic::del(engine, &args).await,
