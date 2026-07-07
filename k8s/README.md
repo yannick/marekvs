@@ -254,6 +254,15 @@ is provably whole again.
 Without `spec.autoscale`, the operator manages a fixed `spec.nodes` — you
 still get the safe stepping, PVC handling, and status reporting.
 
+Scheduling: `spec.nodeSelector` and `spec.tolerations` place the pods on
+dedicated or tainted node pools, and
+`spec.hostnameSpreadWhenUnsatisfiable: DoNotSchedule` turns the default
+soft one-pod-per-node spread into a hard guarantee — excess pods stay
+Pending (a cluster-autoscaler reads that as "add a node"), and nodes the
+pods can't tolerate are excluded from the skew so they don't wedge
+scheduling. See the commented block in
+[`operator/example-cluster.yaml`](operator/example-cluster.yaml).
+
 ## Caveats
 
 - This is an **AP** store: during a scale event (as at any other time), two

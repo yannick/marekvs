@@ -76,9 +76,25 @@ spec:
                   type: string
                 description: Extra environment for the marekvs container (e.g. RUST_LOG).
                 type: object
+              hostnameSpreadWhenUnsatisfiable:
+                description: |-
+                  `whenUnsatisfiable` for the per-hostname topology spread constraint.
+                  Default is ScheduleAnyway (best-effort one pod per node). Set to
+                  DoNotSchedule to make one-per-node a hard guarantee: excess pods stay
+                  Pending, which lets a cluster-autoscaler add nodes instead of
+                  doubling up. Untolerated-tainted nodes are excluded from the skew
+                  calculation (nodeTaintsPolicy: Honor) so e.g. control-plane nodes
+                  don't count as empty domains and wedge scheduling.
+                nullable: true
+                type: string
               image:
                 description: Container image for the marekvs nodes.
                 type: string
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: Restrict marekvs pods to nodes with these labels.
+                type: object
               nodes:
                 default: 3
                 description: |-
@@ -128,6 +144,34 @@ spec:
                     description: PVC size per node.
                     type: string
                 type: object
+              tolerations:
+                description: Tolerations for the marekvs pods (e.g. dedicated node pools).
+                items:
+                  description: |-
+                    core/v1 Toleration, restated locally: the CRD schema needs JsonSchema,
+                    which k8s-openapi types don't derive without its `schemars` feature.
+                    Field names serialize to the exact core/v1 wire shape.
+                  properties:
+                    effect:
+                      description: NoSchedule | PreferNoSchedule | NoExecute
+                      nullable: true
+                      type: string
+                    key:
+                      nullable: true
+                      type: string
+                    operator:
+                      description: Equal | Exists
+                      nullable: true
+                      type: string
+                    tolerationSeconds:
+                      format: int64
+                      nullable: true
+                      type: integer
+                    value:
+                      nullable: true
+                      type: string
+                  type: object
+                type: array
             required:
             - image
             type: object
