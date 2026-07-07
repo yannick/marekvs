@@ -164,6 +164,13 @@ pub mod head {
     /// Budget collection (design/13): head tail carries the admin config
     /// (`crate::budget::HeadState`); elements are escrow slots and tokens.
     pub const CTYPE_BUDGET: u8 = 7;
+    /// JSON document (design/16): per-path CRDT records under `Tag::Json`.
+    /// The head carries only the standard delete clock (no tail).
+    pub const CTYPE_JSON: u8 = 8;
+    /// Protobuf-typed value (design/17): head-only record; the tail carries
+    /// the schema reference + validated message bytes (`crate::protohead`).
+    /// Merge is whole-message LWW on the head envelope.
+    pub const CTYPE_PROTO: u8 = 9;
 
     pub fn encode(ctype: u8, del_hlc: u64) -> Vec<u8> {
         let mut v = Vec::with_capacity(9);

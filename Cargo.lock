@@ -1323,6 +1323,7 @@ name = "marekvs-core"
 version = "0.2.0"
 dependencies = [
  "proptest",
+ "serde_json",
  "smallvec",
  "xxhash-rust",
 ]

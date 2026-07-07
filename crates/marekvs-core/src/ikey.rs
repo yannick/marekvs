@@ -37,6 +37,11 @@ pub enum Tag {
     /// Budget records (design/13): escrow slots, tokens, admin sub-records.
     /// Element kind is the first suffix byte (`BUDGET_SLOT`/`BUDGET_TOKEN`/…).
     Budget = b'b',
+    /// JSON document nodes (design/16): one record per JSON path. The suffix
+    /// is a chain of self-delimiting segments (`crate::json::Seg`); the root
+    /// record has an empty suffix. A node's key is a strict byte-prefix of
+    /// every descendant's key, so subtree = prefix scan.
+    Json = b'j',
 }
 
 fn put_varint(out: &mut Vec<u8>, mut v: u64) {
@@ -208,6 +213,12 @@ pub fn budget_kind_prefix(userkey: &[u8], kind: u8, gen: u64) -> Vec<u8> {
     prefixed(Tag::Budget, userkey, &suffix)
 }
 
+/// JSON node key: `[pid][b'j'][klen][userkey][path-bytes]`. The root record
+/// has an empty path; a node's key is the scan prefix of its subtree.
+pub fn json_node_key(userkey: &[u8], path: &[u8]) -> Vec<u8> {
+    prefixed(Tag::Json, userkey, path)
+}
+
 /// Scan prefix covering an entire partition (bootstrap, Merkle, purge).
 pub fn partition_prefix(pid: Pid) -> Vec<u8> {
     pid.to_be_bytes().to_vec()
@@ -238,7 +249,7 @@ pub fn parse(ikey: &[u8]) -> Option<ParsedKey<'_>> {
             userkey: rest,
             suffix: &[],
         }),
-        b'M' | b'h' | b'S' | b'z' | b'Z' | b'q' | b'x' | b'H' | b'b' => {
+        b'M' | b'h' | b'S' | b'z' | b'Z' | b'q' | b'x' | b'H' | b'b' | b'j' => {
             let (klen, n) = get_varint(rest)?;
             let klen = klen as usize;
             if rest.len() < n + klen {
@@ -310,5 +321,40 @@ mod tests {
         let p = parse(&k).unwrap();
         assert_eq!(p.userkey, b"hello");
         assert_eq!(p.tag, b's');
+    }
+
+    #[test]
+    fn json_node_roundtrip_parse() {
+        let path = b"\x01\x05title";
+        let k = json_node_key(b"doc:1", path);
+        let p = parse(&k).unwrap();
+        assert_eq!(p.tag, b'j');
+        assert_eq!(p.userkey, b"doc:1");
+        assert_eq!(p.suffix, path);
+        assert_eq!(p.pid, pid_of(b"doc:1"));
+    }
+
+    #[test]
+    fn json_root_has_empty_suffix() {
+        let k = json_node_key(b"doc:1", &[]);
+        let p = parse(&k).unwrap();
+        assert_eq!(p.suffix, b"");
+        // root key covers the whole doc as a scan prefix
+        let child = json_node_key(b"doc:1", b"\x01\x01a");
+        assert!(child.starts_with(&k));
+        assert_eq!(k, collection_prefix(Tag::Json, b"doc:1"));
+    }
+
+    #[test]
+    fn json_parent_is_prefix_of_descendants_only() {
+        let parent = json_node_key(b"d", b"\x01\x01a");
+        let child = json_node_key(b"d", b"\x01\x01a\x01\x01b");
+        let sibling = json_node_key(b"d", b"\x01\x02ab");
+        assert!(child.starts_with(&parent));
+        // "a" (len 1) vs "ab" (len 2): varint length byte diverges first
+        assert!(!sibling.starts_with(&parent));
+        // a longer user key must not fall under the shorter key's doc prefix
+        let other_doc = json_node_key(b"d2", b"\x01\x01a");
+        assert!(!other_doc.starts_with(&collection_prefix(Tag::Json, b"d")));
     }
 }

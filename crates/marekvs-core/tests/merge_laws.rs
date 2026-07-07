@@ -2,7 +2,9 @@
 //! associativity, idempotence, and permutation-independence of final state.
 
 use marekvs_core::envelope::{Envelope, RecordType};
-use marekvs_core::merge::{element_add, element_remove, merge_values, resolve, Dot, MergeOutcome};
+use marekvs_core::merge::{
+    element_add, element_remove, element_set, merge_values, resolve, Dot, MergeOutcome,
+};
 use proptest::prelude::*;
 
 /// Apply `incoming` onto an optional local state, like the storage layer does.
@@ -30,6 +32,13 @@ enum Op {
         origin: u16,
         observed: Vec<Dot>,
     },
+    /// Overwrite: covers observed dots + installs one fresh add (design/16
+    /// JSON path assignment).
+    Set {
+        hlc: u64,
+        origin: u16,
+        observed: Vec<Dot>,
+    },
     Lww {
         hlc: u64,
         origin: u16,
@@ -47,6 +56,18 @@ impl Op {
                 origin,
                 observed,
             } => element_remove(RecordType::SetMember, *hlc, *origin, observed),
+            Op::Set {
+                hlc,
+                origin,
+                observed,
+            } => element_set(
+                RecordType::SetMember,
+                *hlc,
+                *origin,
+                // value stays a pure function of the dot (see Add)
+                &[*hlc as u8, *origin as u8],
+                observed,
+            ),
             Op::Lww {
                 hlc,
                 origin,
@@ -84,6 +105,16 @@ fn element_op_strategy() -> impl Strategy<Value = Op> {
             prop::collection::vec(dot_strategy(), 0..4)
         )
             .prop_map(|(hlc, origin, observed)| Op::Rm {
+                hlc,
+                origin,
+                observed
+            }),
+        (
+            1u64..50,
+            0u16..4,
+            prop::collection::vec(dot_strategy(), 0..4)
+        )
+            .prop_map(|(hlc, origin, observed)| Op::Set {
                 hlc,
                 origin,
                 observed
