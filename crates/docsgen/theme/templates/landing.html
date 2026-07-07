@@ -100,7 +100,8 @@
         <div class="feat-ico">◆</div>
         <h3>Redis protocol</h3>
         <p>RESP2 &amp; RESP3 over the same <code>:6379</code> your clients already
-        use. Strings, hashes, sets, sorted sets, lists, streams, pub/sub, HyperLogLog.</p>
+        use. Strings, hashes, sets, sorted sets, lists, streams, pub/sub,
+        HyperLogLog, JSON documents.</p>
       </div>
       <div class="feat card">
         <div class="feat-ico">⇄</div>
@@ -115,10 +116,11 @@
         subscribes to its updates — replication follows demand.</p>
       </div>
       <div class="feat card">
-        <div class="feat-ico">⏱</div>
-        <h3>Bounded staleness</h3>
-        <p>Sequence-cursor catch-up plus Merkle anti-entropy repair divergence
-        within seconds. Milliseconds typical, 15&nbsp;s worst case.</p>
+        <div class="feat-ico">⬢</div>
+        <h3>Protobuf schema store</h3>
+        <p>Upload <code>.proto</code> schemas, bind them to key prefixes, and
+        every value written there is validated protobuf — with server-side
+        field access and JSON projection. No client codegen.</p>
       </div>
       <div class="feat card">
         <div class="feat-ico">☸</div>
