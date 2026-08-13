@@ -250,22 +250,20 @@ async fn commit_seqs_are_unique() {
 /// v0.2.0 (`beeffd1`, same drop-then-hook shape), so marekvs has always had
 /// this — it was simply never tested for.
 ///
-/// Why it matters for the ring (`marekvs-repl/src/ring.rs`): `push` stores
-/// entries in hook-delivery order but stamps them with the ondaDB seq, and
-/// `read_after(after, max)` filters `e.seq > after` and then takes the first
-/// `max`. It therefore assumes the buffer is sorted by seq. With a buffer of
-/// `[seq9, seq3]` and a batch limit of one, the pump ships seq9, advances the
-/// cursor to 9, and then filters seq3 out permanently — that op never
-/// replicates through the ring. It is not lost data: anti-entropy repairs it on
-/// the next round. So the effect is delayed convergence and some redundant
-/// re-shipping, not divergence.
+/// **marekvs no longer depends on it.** It used to: `Ring::push` stamped
+/// entries with the ondaDB seq while `read_after` filters `seq > after` and
+/// takes the first `max`, which assumes a sorted buffer — a buffer of
+/// `[seq9, seq3]` drained one entry at a time shipped seq9, advanced the cursor
+/// to 9, and filtered seq3 out permanently, leaving that op to anti-entropy.
+/// The ring now allocates its own monotonic seq under the same lock as the
+/// buffer append, so the buffer is sorted by construction
+/// (`marekvs-repl/src/ring.rs`, pinned by
+/// `ring::tests::concurrent_pushes_keep_the_buffer_seq_sorted`).
 ///
-/// Left failing-but-ignored rather than silently dropped: fixing it means
-/// either sorting on push or having `Ring::push` allocate its own monotonic
-/// seq instead of trusting the hint, and both change replication behaviour that
-/// the chaos/churn harness covers (the `crash_restart el-3600` cursor finding
-/// in particular). That is a decision of its own, not a rider on an engine
-/// upgrade.
+/// The test is kept, and kept ignored, because the ondaDB-side property is
+/// still worth stating precisely: if a future consumer *does* want ordered
+/// delivery, this measures whether it can have it. Un-ignore it to re-check
+/// after an ondaDB upgrade.
 #[tokio::test]
 #[ignore = "known pre-existing violation: ondaDB runs the commit hook outside \
             the commit guard, so batches arrive out of seq order"]

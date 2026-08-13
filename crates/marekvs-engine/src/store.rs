@@ -340,6 +340,19 @@ impl Drop for Store {
 
 impl Store {
     pub fn open(cfg: &StoreConfig) -> anyhow::Result<Arc<Store>> {
+        // List positions carry the node id in their low bits so concurrent
+        // cross-node pushes cannot collide (ikey::LIST_POS_STRIDE). Refuse to
+        // start rather than silently alias two nodes onto one salt, which
+        // would reintroduce exactly the lost-push bug the salt prevents.
+        anyhow::ensure!(
+            cfg.node_id <= ikey::LIST_NODE_ID_MAX,
+            "MAREKVS_NODE_ID must be <= {} (got {}): list positions encode the \
+             node id in {} bits to keep concurrent cross-node pushes from \
+             colliding",
+            ikey::LIST_NODE_ID_MAX,
+            cfg.node_id,
+            ikey::LIST_POS_STRIDE.trailing_zeros(),
+        );
         let mut opts = Options::new(&cfg.data_dir);
         // Pinned, not inherited. These bound resident memory and background IO,
         // and their ondaDB defaults have moved between releases (0.7.0 added a

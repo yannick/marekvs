@@ -3,7 +3,8 @@
 //! A list is a head-gated collection (ctype 5) of position-keyed LWW element
 //! records at `list_elem_key(key, pos)`. `pos` is an unsigned u64 whose
 //! big-endian key suffix makes memcmp order equal list order: the first push
-//! lands at `LIST_CENTER`, LPUSH allocates `head-1`, RPUSH `tail+1`. Each
+//! lands at `LIST_CENTER`, LPUSH allocates the stride slot below the head,
+//! RPUSH the one above the tail (see the concurrency note below). Each
 //! element payload is the raw value bytes — a plain LWW register (higher
 //! `(hlc, origin)` wins) — so push/pop touch O(1) records and replicate as
 //! ordinary deltas through `write_merged` (no list-specific merge code).
@@ -17,10 +18,10 @@
 //! the records — so a wrong hint can at worst cost a rescan, never a wrong
 //! answer.
 //!
-//! Concurrency caveat (design/02): two nodes pushing concurrently can allocate
-//! the same position; the element records then merge LWW and one push is lost
-//! — a bounded, per-collision loss, strictly better than the retired whole-
-//! list blob where an entire concurrent push SET was dropped. Interior
+//! Concurrency (design/02): positions are salted with the allocating node's id
+//! (`ikey::LIST_POS_STRIDE`), so two nodes pushing concurrently land in the
+//! same stride slot at different low bits and **both pushes survive**. Order
+//! between them is node-id order — arbitrary but identical everywhere. Interior
 //! mutations (LINSERT/LREM/LTRIM) rebuild the list compacted from CENTER
 //! (O(n), documented). The whole-list TTL rides the collection head like a
 //! hash/set; elements carry no TTL of their own.
@@ -287,26 +288,36 @@ fn live_count(ctx: &ShardCtx, key: &[u8], del: u64) -> usize {
 // ---------------------------------------------------------------------------
 
 /// Push `values` onto `key` (front if `left`); the head must already exist.
-/// Returns the new length as the contiguous span `tail - head + 1` — exact for
-/// single-node lists, best-effort under concurrent cross-node pushes.
+///
+/// Returns the new length as the **slot** span between head and tail — one
+/// push consumes one stride slot (see `ikey::LIST_POS_STRIDE`), so this is
+/// exact for single-node lists and best-effort under concurrent cross-node
+/// pushes, which is the same contract the raw position span had before the
+/// positions were salted. Two nodes pushing into the same slot now both keep
+/// their element (that is the point of the salt) and the count is one short
+/// until the next recount; `LLEN` is always exact — it counts live records.
 fn do_push(ctx: &ShardCtx, key: &[u8], values: &[Vec<u8>], left: bool, del: u64) -> i64 {
     // Recenter if a push would run off the u64 edge (astronomically rare;
-    // keeps the position arithmetic non-wrapping).
+    // keeps the position arithmetic non-wrapping). One push consumes a whole
+    // stride slot, so the edge margin is measured in slots.
     if let Some((h, t)) = list_range(ctx, key, del) {
-        let n = values.len() as u64;
-        if (left && h < n) || (!left && t > u64::MAX - n) {
+        let margin = values.len() as u64 * ikey::LIST_POS_STRIDE + ikey::LIST_POS_STRIDE;
+        if (left && h < margin) || (!left && t > u64::MAX - margin) {
             rebuild(ctx, key, del, None);
         }
     }
     let mut range = list_range(ctx, key, del);
     for v in values {
+        // Positions carry this node's id in their low bits, so a concurrent
+        // push on another node cannot land on the same position (see
+        // ikey::LIST_POS_STRIDE).
         let pos = match range {
-            None => LIST_CENTER,
+            None => ikey::list_pos_in_slot(LIST_CENTER, ctx.node_id),
             Some((h, t)) => {
                 if left {
-                    h - 1
+                    ikey::list_pos_before(h, ctx.node_id)
                 } else {
-                    t + 1
+                    ikey::list_pos_after(t, ctx.node_id)
                 }
             }
         };
@@ -326,7 +337,8 @@ fn do_push(ctx: &ShardCtx, key: &[u8], values: &[Vec<u8>], left: bool, del: u64)
         None => 0,
         Some((h, t)) => {
             set_known(ctx, key, h, t);
-            (t - h + 1) as i64
+            let slots = (ikey::list_slot_base(t) - ikey::list_slot_base(h)) / ikey::LIST_POS_STRIDE;
+            (slots + 1) as i64
         }
     }
 }
@@ -373,14 +385,16 @@ fn rebuild(ctx: &ShardCtx, key: &[u8], del: u64, replacement: Option<Vec<Vec<u8>
     }
     // Fresh HLC on each rewrite sorts after the tombstones above, so positions
     // reused from the old range (CENTER…) resolve LWW to the new value.
+    // Salted like pushes are, so a rebuild racing a remote push cannot collide
+    // with it either (the rebuild-race noted in design/02).
     for (i, v) in new_values.iter().enumerate() {
-        write_elem(ctx, key, LIST_CENTER + i as u64, v);
+        write_elem(ctx, key, ikey::list_pos_nth(i as u64, ctx.node_id), v);
     }
     set_known(
         ctx,
         key,
-        LIST_CENTER,
-        LIST_CENTER + new_values.len() as u64 - 1,
+        ikey::list_pos_nth(0, ctx.node_id),
+        ikey::list_pos_nth(new_values.len() as u64 - 1, ctx.node_id),
     );
 }
 

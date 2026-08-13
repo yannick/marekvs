@@ -269,11 +269,23 @@ list element  [pid][b'q'][klen][userkey][pos:u64 BE]   payload = raw value bytes
   they **rebuild**: read the live values, tombstone every old position, rewrite
   the new sequence compacted from CENTER (O(n), documented; these are rare).
   Position exhaustion at the u64 edge triggers the same recenter rebuild.
-- **Concurrency caveat (weaker than a sequence CRDT, stronger than the blob):**
-  two nodes pushing concurrently can allocate the **same** position; the
-  element records then merge LWW and **one push is lost — but only that one
-  colliding element**, not the whole push set the blob would have dropped.
-  Ordering across concurrent cross-node writers is best-effort; single-node
+- **Node-salted positions (T2-13).** Positions are allocated on a 1024-wide
+  stride whose low 10 bits carry the **allocating node's id**
+  (`ikey::LIST_POS_STRIDE`). Two nodes pushing concurrently observe the same
+  head/tail and land in the same slot, but at different low bits, so **both
+  elements survive** — the collision that used to lose one push to LWW is now
+  structurally impossible. Their relative order is node-id order: arbitrary,
+  but identical on every node, which is the same guarantee Redis gives for
+  concurrent pushes from different clients. Rebuilds allocate salted positions
+  too, so a rebuild racing a remote push cannot collide with it either.
+
+  Consequences: `MAREKVS_NODE_ID` must be `< 1024` (enforced at boot — a
+  wider id would alias two nodes onto one salt and reintroduce the bug), and
+  LPUSH/RPUSH return the **slot** span, exact for single-node lists and one
+  short per cross-node slot collision. `LLEN` counts live records and is
+  always exact. Headroom is `2^63/1024 ≈ 9×10^15` pushes per direction.
+- **Concurrency caveat (still weaker than a sequence CRDT):** ordering across
+  concurrent cross-node writers is deterministic but arbitrary; single-node
   order is exact (shard serialization). A true sequence CRDT (RGA) remains
   future work. Blocking ops (BLPOP…) poll the same primitives on local state.
 

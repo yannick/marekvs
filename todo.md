@@ -69,9 +69,11 @@ implicit (design-promised but absent, or stub/no-op in code).
 
 ## CRDT / data-model semantic gaps (documented, unproven or lossy)
 
-- [ ] **List position collisions**: concurrent cross-node pushes can land on
-      the same position → one push lost; true sequence CRDT (RGA) is future
-      work (`design/02-data-model.md:266`).
+- [x] **List position collisions**: concurrent cross-node pushes could land on
+      the same position → one push lost. — fixed (T2-13): positions are salted
+      with the node id on a 1024-wide stride, so both pushes survive. Requires
+      `MAREKVS_NODE_ID < 1024`, enforced at boot. True sequence CRDT (RGA)
+      remains future work (`design/02-data-model.md`).
 - [ ] **HINCRBY / INCRBYFLOAT stay LWW** — no PN-counter semantics for hash
       fields or floats (`design/02:299,302`).
 - [ ] **ORSWOT-lite add-wins races** "believed acceptable" but unproven
@@ -178,11 +180,12 @@ implicit (design-promised but absent, or stub/no-op in code).
       order-independent. Pre-existing and unrelated to the storage engine —
       measured 4/8 failures on `defc648` against ondaDB 0.2.0, 5/8 on the same
       commit against 0.7.8, 4/8 on the 0.7.8 upgrade branch.
-- [ ] Commit-hook delivery is not seq-ordered (pre-existing; see
-      `tests/commit_hook_contract.rs`). `Ring::read_after` assumes a sorted
-      buffer, so an out-of-order op can be skipped and left to anti-entropy.
-      Decide between sorting on push and letting `Ring::push` allocate its own
-      monotonic seq; both need a chaos/churn run.
+- [x] Commit-hook delivery is not seq-ordered (pre-existing; see
+      `tests/commit_hook_contract.rs`). `Ring::read_after` assumed a sorted
+      buffer, so an out-of-order op could be skipped and left to anti-entropy.
+      — fixed: `Ring::push` now allocates its own monotonic seq under the
+      buffer lock, so the ring is sorted by construction and no longer depends
+      on ondaDB's hook ordering.
 - [ ] LINSERT/LREM/LTRIM O(n) rebuilds (`design/02:261`).
 - [ ] mimalloc vs jemalloc decision still open (`design/08:41`).
 - [ ] Interest table exact-key memory (blooms rejected for now,

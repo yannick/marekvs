@@ -111,9 +111,61 @@ pub fn list_key(userkey: &[u8]) -> Vec<u8> {
 
 /// Origin position for a fresh list. Positions are unsigned so that memcmp
 /// order over the big-endian suffix equals list order; the first element lands
-/// at CENTER, LPUSH allocates below it (`pos-1`), RPUSH above (`pos+1`), giving
-/// ~2^63 headroom on each side before a rebuild has to recenter.
+/// at CENTER and pushes allocate outwards from it, giving ~2^63 headroom on
+/// each side before a rebuild has to recenter.
 pub const LIST_CENTER: u64 = 1u64 << 63;
+
+/// Positions are allocated on a stride this wide, and the low
+/// `log2(LIST_POS_STRIDE)` bits carry the **allocating node's id**.
+///
+/// Without the salt, two nodes pushing concurrently both read the same head
+/// (or tail) and both allocate `head-1` — the same position. The element
+/// records then merge LWW and one push is silently lost
+/// (design/02 §Lists, "Concurrency caveat"). Salting makes that structurally
+/// impossible: concurrent pushes from different nodes land in the *same slot*
+/// but at different low bits, so both records survive and their relative order
+/// is node-id order — arbitrary, but identical on every node, which is the
+/// same guarantee Redis gives for concurrent pushes from different clients.
+///
+/// The full fix is a sequence CRDT (RGA); this is the cheap structural one.
+/// Headroom: `2^63 / 1024 ≈ 9×10^15` pushes per direction before a recenter.
+pub const LIST_POS_STRIDE: u64 = 1024;
+
+/// Largest node id the position salt can represent (see [`LIST_POS_STRIDE`]).
+pub const LIST_NODE_ID_MAX: u16 = (LIST_POS_STRIDE - 1) as u16;
+
+/// Round a position down to its stride slot, discarding the node salt.
+#[inline]
+pub fn list_slot_base(pos: u64) -> u64 {
+    pos & !(LIST_POS_STRIDE - 1)
+}
+
+/// Place `node` inside the slot starting at `slot_base`.
+#[inline]
+pub fn list_pos_in_slot(slot_base: u64, node: u16) -> u64 {
+    list_slot_base(slot_base) | (node as u64 & (LIST_POS_STRIDE - 1))
+}
+
+/// Position for an LPUSH: the slot below `head`, salted for `node`.
+///
+/// Strictly less than `head` for every node id, because `head` lives at or
+/// above its own slot base and this lands a whole slot below that.
+#[inline]
+pub fn list_pos_before(head: u64, node: u16) -> u64 {
+    list_pos_in_slot(list_slot_base(head) - LIST_POS_STRIDE, node)
+}
+
+/// Position for an RPUSH: the slot above `tail`, salted for `node`.
+#[inline]
+pub fn list_pos_after(tail: u64, node: u16) -> u64 {
+    list_pos_in_slot(list_slot_base(tail) + LIST_POS_STRIDE, node)
+}
+
+/// Position of the `index`-th element of a freshly rebuilt list.
+#[inline]
+pub fn list_pos_nth(index: u64, node: u16) -> u64 {
+    list_pos_in_slot(LIST_CENTER + index * LIST_POS_STRIDE, node)
+}
 
 /// Element key for a list position: `[pid][b'q'][klen][userkey][pos u64 BE]`.
 pub fn list_elem_key(userkey: &[u8], pos: u64) -> Vec<u8> {
@@ -297,6 +349,127 @@ pub fn parse(ikey: &[u8]) -> Option<ParsedKey<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- list position salting (design/02 §Lists, T2-13) ---
+
+    /// The property the salt exists for: two nodes that observe the *same*
+    /// head/tail — the concurrent-push race — never allocate the same
+    /// position. Before salting they both produced `head-1` and one push was
+    /// lost to LWW.
+    #[test]
+    fn concurrent_pushes_from_identical_state_never_collide() {
+        let head = LIST_CENTER;
+        let tail = LIST_CENTER;
+        for a in 0..=LIST_NODE_ID_MAX {
+            for b in (a + 1)..=LIST_NODE_ID_MAX {
+                assert_ne!(
+                    list_pos_before(head, a),
+                    list_pos_before(head, b),
+                    "LPUSH collision between nodes {a} and {b}"
+                );
+                assert_ne!(
+                    list_pos_after(tail, a),
+                    list_pos_after(tail, b),
+                    "RPUSH collision between nodes {a} and {b}"
+                );
+            }
+        }
+    }
+
+    /// Order between colliding-slot pushes must be node-id order, and it must
+    /// be the same on every node (it is a pure function of the id).
+    #[test]
+    fn same_slot_order_is_node_id_order() {
+        for a in 0..LIST_NODE_ID_MAX {
+            let b = a + 1;
+            assert!(list_pos_before(LIST_CENTER, a) < list_pos_before(LIST_CENTER, b));
+            assert!(list_pos_after(LIST_CENTER, a) < list_pos_after(LIST_CENTER, b));
+        }
+    }
+
+    /// A salted allocation must still land on the correct side of the list,
+    /// for every node id — this is where an off-by-one in the masking shows.
+    #[test]
+    fn allocations_land_outside_the_observed_range() {
+        let samples = [
+            LIST_CENTER,
+            LIST_CENTER + 1,
+            LIST_CENTER + LIST_POS_STRIDE - 1,
+            LIST_CENTER + LIST_POS_STRIDE,
+            LIST_CENTER + 5 * LIST_POS_STRIDE + 7,
+        ];
+        for &pos in &samples {
+            for node in [0u16, 1, 7, 511, LIST_NODE_ID_MAX] {
+                assert!(
+                    list_pos_before(pos, node) < pos,
+                    "LPUSH at node {node} from {pos} did not sort before it"
+                );
+                assert!(
+                    list_pos_after(pos, node) > pos,
+                    "RPUSH at node {node} from {pos} did not sort after it"
+                );
+            }
+        }
+    }
+
+    /// Rebuild positions ascend with the index and carry the salt, so a
+    /// rebuild racing a remote push cannot collide with it either.
+    #[test]
+    fn rebuild_positions_ascend_and_carry_the_salt() {
+        for node in [0u16, 3, LIST_NODE_ID_MAX] {
+            let mut prev = list_pos_nth(0, node);
+            assert_eq!(prev & (LIST_POS_STRIDE - 1), node as u64);
+            for i in 1..64u64 {
+                let p = list_pos_nth(i, node);
+                assert!(p > prev, "rebuild position {i} did not ascend");
+                assert_eq!(p & (LIST_POS_STRIDE - 1), node as u64);
+                prev = p;
+            }
+        }
+    }
+
+    proptest::proptest! {
+        /// Against a naive model: the slot an allocation lands in is exactly
+        /// one below (or above) the observed position's slot, and the low bits
+        /// are exactly the node id.
+        #[test]
+        fn allocator_matches_naive_model(
+            pos in (LIST_POS_STRIDE * 2)..(u64::MAX - LIST_POS_STRIDE * 2),
+            node in 0u16..=LIST_NODE_ID_MAX,
+        ) {
+            let slot = pos - (pos % LIST_POS_STRIDE);
+
+            let lo = list_pos_before(pos, node);
+            proptest::prop_assert_eq!(lo, slot - LIST_POS_STRIDE + node as u64);
+            proptest::prop_assert!(lo < pos);
+
+            let hi = list_pos_after(pos, node);
+            proptest::prop_assert_eq!(hi, slot + LIST_POS_STRIDE + node as u64);
+            proptest::prop_assert!(hi > pos);
+
+            proptest::prop_assert_eq!(list_slot_base(lo), slot - LIST_POS_STRIDE);
+            proptest::prop_assert_eq!(list_slot_base(hi), slot + LIST_POS_STRIDE);
+        }
+
+        /// Repeated pushes from one node stay strictly monotonic in both
+        /// directions — the single-node list stays exactly ordered.
+        #[test]
+        fn repeated_single_node_pushes_are_monotonic(
+            node in 0u16..=LIST_NODE_ID_MAX,
+            steps in 1usize..64,
+        ) {
+            let mut head = list_pos_in_slot(LIST_CENTER, node);
+            let mut tail = head;
+            for _ in 0..steps {
+                let nh = list_pos_before(head, node);
+                proptest::prop_assert!(nh < head);
+                head = nh;
+                let nt = list_pos_after(tail, node);
+                proptest::prop_assert!(nt > tail);
+                tail = nt;
+            }
+        }
+    }
 
     #[test]
     fn roundtrip_parse() {

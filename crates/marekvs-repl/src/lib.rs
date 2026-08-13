@@ -559,51 +559,56 @@ impl ReplEngine {
             let ring = ring.clone();
             let self_node = store.node_id;
             let ae_dirty = ae_dirty.clone();
-            store.set_commit_hook(Some(Arc::new(move |seq: u64, ops: &[ondadb::CommitOp]| {
-                // AE root-cache invalidation FIRST — every committed op
-                // (client write, repair, bootstrap chunk, rejoin drop, sweep
-                // tombstone) makes its pid's cached root stale, including
-                // ops the early-returns below skip.
-                {
-                    let mut dirty = ae_dirty.lock();
-                    for op in ops {
-                        if let Some(p) = ikey::parse(&op.key) {
-                            dirty.insert(p.pid);
+            store.set_commit_hook(Some(Arc::new(
+                move |_seq: u64, ops: &[ondadb::CommitOp]| {
+                    // AE root-cache invalidation FIRST — every committed op
+                    // (client write, repair, bootstrap chunk, rejoin drop, sweep
+                    // tombstone) makes its pid's cached root stale, including
+                    // ops the early-returns below skip.
+                    {
+                        let mut dirty = ae_dirty.lock();
+                        for op in ops {
+                            if let Some(p) = ikey::parse(&op.key) {
+                                dirty.insert(p.pid);
+                            }
                         }
                     }
-                }
-                // Node-local maintenance writes (rejoin extras deletion)
-                // must not enter the ring.
-                if store::commit_hook_suppressed() {
-                    return;
-                }
-                // Configured-standalone with no discovered members → nobody
-                // will ever read the ring; skip the per-record clones. See
-                // Ring::buffering_needed for why this must NOT be gated on
-                // runtime connectivity.
-                if !ring.buffering_needed() {
-                    return;
-                }
-                // Attribution comes from the COMMIT CONTEXT (which batch is
-                // being applied on this shard thread), not the record
-                // envelope: merged CRDT records carry the version winner's
-                // origin, which misattributes local commits under clock
-                // skew (see store::set_apply_origin).
-                let origin = marekvs_engine::store::current_apply_origin().unwrap_or(self_node);
-                let mut out: Vec<ReplOp> = Vec::new();
-                for op in ops {
-                    if matches!(ikey::parse(&op.key), Some(p) if p.tag == b'Z') {
-                        continue;
+                    // Node-local maintenance writes (rejoin extras deletion)
+                    // must not enter the ring.
+                    if store::commit_hook_suppressed() {
+                        return;
                     }
-                    out.push(ReplOp {
-                        ikey: op.key.clone(),
-                        value: op.value.clone(),
-                    });
-                }
-                if !out.is_empty() {
-                    ring.push(origin, Some(seq), out);
-                }
-            })));
+                    // Configured-standalone with no discovered members → nobody
+                    // will ever read the ring; skip the per-record clones. See
+                    // Ring::buffering_needed for why this must NOT be gated on
+                    // runtime connectivity.
+                    if !ring.buffering_needed() {
+                        return;
+                    }
+                    // Attribution comes from the COMMIT CONTEXT (which batch is
+                    // being applied on this shard thread), not the record
+                    // envelope: merged CRDT records carry the version winner's
+                    // origin, which misattributes local commits under clock
+                    // skew (see store::set_apply_origin).
+                    let origin = marekvs_engine::store::current_apply_origin().unwrap_or(self_node);
+                    let mut out: Vec<ReplOp> = Vec::new();
+                    for op in ops {
+                        if matches!(ikey::parse(&op.key), Some(p) if p.tag == b'Z') {
+                            continue;
+                        }
+                        out.push(ReplOp {
+                            ikey: op.key.clone(),
+                            value: op.value.clone(),
+                        });
+                    }
+                    if !out.is_empty() {
+                        // ondaDB's `seq` is deliberately NOT forwarded: the hook
+                        // does not run in commit-seq order (see Ring::push), and
+                        // the ring's own counter is what readers assume is sorted.
+                        ring.push(origin, out);
+                    }
+                },
+            )));
         }
 
         // 2. Mesh listener + dialers driven by membership view.
@@ -669,7 +674,7 @@ impl ReplEngine {
                     .map(|(ikey, value)| ReplOp { ikey, value })
                     .collect();
                 if !repl_ops.is_empty() {
-                    ring.push(self_node, None, repl_ops);
+                    ring.push(self_node, repl_ops);
                 }
             }));
         }
