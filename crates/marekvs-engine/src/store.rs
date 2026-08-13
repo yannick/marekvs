@@ -32,6 +32,24 @@ pub fn gc_grace() -> Duration {
     })
 }
 
+/// `usize` knob from the environment, falling back to ondaDB's default.
+fn env_usize(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default)
+}
+
+/// Byte-valued knob. Unlike [`env_usize`], `0` is meaningful here — ondaDB
+/// reads it as "no bound" for `max_open_reader_bytes`.
+fn env_bytes(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -132,18 +150,127 @@ pub fn pop_hint_on_insert(ctx: &ShardCtx, prefix: &[u8], element_key: &[u8]) {
     }
 }
 
+/// A scan that did not observe the whole range it was asked for.
+///
+/// ondaDB ≥0.7 bounds the number (and bytes) of open SSTable readers, so a
+/// reader is re-opened on the read path and can fail there. `new_iterator`
+/// cannot return a `Result`, so such a failure yields an iterator that is
+/// simply *invalid* and records the error on `err()` — a bare
+/// `while it.valid()` loop therefore reads a **failed scan as an empty one**.
+///
+/// Every scan primitive here reports completion instead, and no caller may
+/// treat an incomplete scan as data: an empty-looking anti-entropy digest or
+/// an empty-looking `KEYS` reply is a wrong answer that looks authoritative.
+#[derive(Debug, Clone)]
+pub struct ScanIncomplete(pub String);
+
+impl std::fmt::Display for ScanIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "storage scan incomplete: {}", self.0)
+    }
+}
+
+impl std::error::Error for ScanIncomplete {}
+
+/// Process-wide count of scans that ended incomplete. Polled into
+/// `marekvs_scan_errors_total` by the replication stats task; a non-zero rate
+/// means reads are silently short somewhere and must be alerted on.
+static SCAN_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn scan_errors_total() -> u64 {
+    SCAN_ERRORS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Translate a finished iterator into a completion verdict.
+fn scan_outcome(it: &ondadb::Iterator) -> Result<(), ScanIncomplete> {
+    match it.err() {
+        Some(e) => {
+            SCAN_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(ScanIncomplete(format!("{e:?}")))
+        }
+        None => Ok(()),
+    }
+}
+
+/// [`scan_prefix`] for command handlers.
+///
+/// Redis command helpers return plain values (`Vec<..>`, `Option<..>`, counts)
+/// through many layers, so threading a `Result` from every collection scan up
+/// to the reply would touch most of the command surface. Instead an incomplete
+/// scan is recorded process-wide by [`scan_outcome`] and converted into a
+/// client error centrally by the dispatch fence in `cmd::dispatch`, which
+/// covers these call sites — and any added later — uniformly.
+///
+/// Use [`scan_prefix`] directly anywhere that is **not** behind that fence:
+/// anti-entropy, replication, bootstrap and startup all must handle the error
+/// themselves.
+pub fn scan_prefix_cmd(ctx: &ShardCtx, prefix: &[u8], f: impl FnMut(&[u8], &[u8]) -> bool) {
+    let _ = scan_prefix(ctx, prefix, f);
+}
+
+/// [`scan_from`] for command handlers — see [`scan_prefix_cmd`].
+pub fn scan_from_cmd(
+    ctx: &ShardCtx,
+    start: &[u8],
+    prefix: &[u8],
+    f: impl FnMut(&[u8], &[u8]) -> bool,
+) {
+    let _ = scan_from(ctx, start, prefix, f);
+}
+
+/// Exclusive upper bound for a prefix scan: the first key sorting after every
+/// key that starts with `prefix`. `None` when no such key exists (an empty
+/// prefix, or one that is all `0xFF`) — the scan is then unbounded above.
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.last_mut() {
+        if *last == u8::MAX {
+            end.pop();
+        } else {
+            *last += 1;
+            return Some(end);
+        }
+    }
+    None
+}
+
+/// Iterator over `[lower, prefix-successor)`, so ondaDB can skip SSTables that
+/// provably hold no matching key instead of opening and seeking every table in
+/// every level (closes design/02 §"ondaDB has no range-bounded iterator").
+fn bounded_iter(
+    txn: &ondadb::Txn,
+    ctx: &ShardCtx,
+    lower: &[u8],
+    upper: Option<&[u8]>,
+) -> ondadb::Iterator {
+    txn.new_iterator_bounded(
+        &ctx.data,
+        std::ops::Bound::Included(lower),
+        match upper {
+            Some(u) => std::ops::Bound::Excluded(u),
+            None => std::ops::Bound::Unbounded,
+        },
+    )
+}
+
 /// Scan forward from `start` while keys still match `prefix` (`start` itself
 /// is visited when present — callers filter dead records anyway).
+///
+/// Returns `Err` if the scan ended early because storage failed; the callback
+/// may then have seen only part of the range.
 pub fn scan_from(
     ctx: &ShardCtx,
     start: &[u8],
     prefix: &[u8],
     mut f: impl FnMut(&[u8], &[u8]) -> bool,
-) {
+) -> Result<(), ScanIncomplete> {
+    let upper = prefix_upper_bound(prefix);
     let txn = ctx.db.begin();
-    let mut it = txn.new_iterator(&ctx.data);
+    let mut it = bounded_iter(&txn, ctx, start, upper.as_deref());
     it.seek(start);
     while it.valid() {
+        // Bounds already stop the walk; the prefix re-check keeps the contract
+        // independent of the bound computation.
         if !it.key().starts_with(prefix) {
             break;
         }
@@ -152,6 +279,7 @@ pub fn scan_from(
         }
         it.next();
     }
+    scan_outcome(&it)
 }
 
 pub struct Store {
@@ -212,7 +340,25 @@ impl Drop for Store {
 
 impl Store {
     pub fn open(cfg: &StoreConfig) -> anyhow::Result<Arc<Store>> {
-        let opts = Options::new(&cfg.data_dir);
+        let mut opts = Options::new(&cfg.data_dir);
+        // Pinned, not inherited. These bound resident memory and background IO,
+        // and their ondaDB defaults have moved between releases (0.7.0 added a
+        // reader count bound, 0.7.5 a 1 GiB byte bound, and num_flush_threads
+        // went 2 → 4). marekvs is disk-native — the memtable, this block cache
+        // and the OS page cache are its only memory tiers — so an operator
+        // needs these where they can see and tune them.
+        opts.block_cache_size = env_bytes("MAREKVS_BLOCK_CACHE_BYTES", opts.block_cache_size);
+        opts.max_open_readers = env_usize("MAREKVS_MAX_OPEN_READERS", opts.max_open_readers);
+        opts.max_open_reader_bytes =
+            env_bytes("MAREKVS_MAX_OPEN_READER_BYTES", opts.max_open_reader_bytes);
+        opts.num_flush_threads = env_usize("MAREKVS_FLUSH_THREADS", opts.num_flush_threads);
+        tracing::info!(
+            block_cache_bytes = opts.block_cache_size,
+            max_open_readers = opts.max_open_readers,
+            max_open_reader_bytes = opts.max_open_reader_bytes,
+            flush_threads = opts.num_flush_threads,
+            "ondaDB options"
+        );
         let db = DB::open(opts)?;
         let cf_config = || ColumnFamilyConfig {
             sync_mode: cfg.sync_mode,
@@ -238,11 +384,24 @@ impl Store {
             _ => {
                 // Fresh only if the data CF is empty too — a pre-epoch data
                 // dir upgrading in place keeps everything it ever granted.
+                //
+                // A failed probe must NOT read as "empty": ondaDB yields an
+                // invalid iterator carrying the error on `err()`, and minting a
+                // fresh epoch over an existing data directory is unrecoverable.
+                // Refuse to open instead.
                 let empty = {
                     let txn = db.begin();
                     let mut it = txn.new_iterator(&data);
                     it.seek_to_first();
-                    !it.valid()
+                    let empty = !it.valid();
+                    if let Some(e) = it.err() {
+                        anyhow::bail!(
+                            "cannot determine whether the data directory is empty \
+                             (storage scan failed: {e:?}); refusing to mint a store \
+                             epoch, which would be unrecoverable over existing data"
+                        );
+                    }
+                    empty
                 };
                 let epoch = now_ms();
                 db.put(&meta, EPOCH_KEY, &epoch.to_be_bytes(), Duration::ZERO)?;
@@ -372,7 +531,11 @@ fn shard_loop(ctx: ShardCtx, rx: Receiver<Job>) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(job) => job(&ctx),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                sweep_expired(&ctx, &mut sweep_cursor, 128);
+                if let Err(e) = sweep_expired(&ctx, &mut sweep_cursor, 128) {
+                    // Passive ondaDB TTL is still the backstop, so a failed
+                    // sweep delays active expiry rather than losing it.
+                    tracing::warn!(shard = ctx.shard, error = %e, "expiry sweep incomplete");
+                }
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
         }
@@ -382,9 +545,14 @@ fn shard_loop(ctx: ShardCtx, rx: Receiver<Job>) {
 /// Walk up to `budget` records from the cursor; write expiry tombstones for
 /// records whose TTL deadline passed. Expiry tombstone HLC = deadline<<16 so
 /// every node converges on the identical tombstone (design/05).
-fn sweep_expired(ctx: &ShardCtx, cursor: &mut Vec<u8>, budget: usize) {
+fn sweep_expired(
+    ctx: &ShardCtx,
+    cursor: &mut Vec<u8>,
+    budget: usize,
+) -> Result<(), ScanIncomplete> {
     let now = now_ms();
     let mut expired: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let outcome;
     {
         let txn = ctx.db.begin();
         let mut it = txn.new_iterator(&ctx.data);
@@ -416,16 +584,25 @@ fn sweep_expired(ctx: &ShardCtx, cursor: &mut Vec<u8>, budget: usize) {
             n += 1;
             it.next();
         }
-        *cursor = if it.valid() {
-            it.key().to_vec()
-        } else {
-            Vec::new()
-        };
+        outcome = scan_outcome(&it);
+        // A failed walk leaves the cursor where it was so the next tick retries
+        // the same ground. Treating the invalid iterator as "reached the end"
+        // would rewind the sweep to the start of the keyspace on every error.
+        if outcome.is_ok() {
+            *cursor = if it.valid() {
+                it.key().to_vec()
+            } else {
+                Vec::new()
+            };
+        }
     }
     for (k, v) in expired {
         // Normal merged write → commit hook fires → expiry replicates.
+        // These were genuinely observed, so they are written even if the walk
+        // was cut short.
         write_merged(ctx, &k, &v);
     }
+    outcome
 }
 
 fn shard_total(_ctx: &ShardCtx) -> usize {
@@ -687,9 +864,18 @@ pub fn read_element(ctx: &ShardCtx, ikey_bytes: &[u8], del_hlc: u64) -> Option<V
 }
 
 /// Prefix scan over the data CF. `f` returns false to stop early.
-pub fn scan_prefix(ctx: &ShardCtx, prefix: &[u8], mut f: impl FnMut(&[u8], &[u8]) -> bool) {
+///
+/// Returns `Err` if the scan ended early because storage failed; the callback
+/// may then have seen only part of the range. Callers must not report a
+/// partial result as a complete one — see [`ScanIncomplete`].
+pub fn scan_prefix(
+    ctx: &ShardCtx,
+    prefix: &[u8],
+    mut f: impl FnMut(&[u8], &[u8]) -> bool,
+) -> Result<(), ScanIncomplete> {
+    let upper = prefix_upper_bound(prefix);
     let txn = ctx.db.begin();
-    let mut it = txn.new_iterator(&ctx.data);
+    let mut it = bounded_iter(&txn, ctx, prefix, upper.as_deref());
     it.seek(prefix);
     while it.valid() {
         if !it.key().starts_with(prefix) {
@@ -700,6 +886,7 @@ pub fn scan_prefix(ctx: &ShardCtx, prefix: &[u8], mut f: impl FnMut(&[u8], &[u8]
         }
         it.next();
     }
+    scan_outcome(&it)
 }
 
 /// Resolve the Redis-visible type of a user key: b's' string, b'l' list, or
@@ -751,7 +938,9 @@ fn collection_nonempty(ctx: &ShardCtx, ctype: u8, userkey: &[u8], del_hlc: u64) 
     };
     let now = now_ms();
     let mut found = false;
-    scan_prefix(ctx, &ikey::collection_prefix(tag, userkey), |_k, v| {
+    // Reached only from `key_type`, i.e. behind the `cmd::dispatch` fence: an
+    // incomplete scan would otherwise report a live collection as absent.
+    scan_prefix_cmd(ctx, &ikey::collection_prefix(tag, userkey), |_k, v| {
         if let Some((env, pay)) = Envelope::decode(v) {
             if visible(&env, pay, del_hlc, now).is_some() {
                 found = true;

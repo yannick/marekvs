@@ -166,10 +166,23 @@ implicit (design-promised but absent, or stub/no-op in code).
 - [ ] zstd per-level compression tuning (currently lz4 only, `design/09:53`).
 - [ ] `unsafe-fastpath` feature (mmap reads + arena memtable): benchmark,
       ship a `-fast` variant only if ≥ 20 % (`design/09:59`).
-- [ ] ondaDB iterator construction is O(memtable); lazy k-way merge belongs
-      in ondaDB (`design/09:93`).
+- [x] ondaDB iterator construction is O(memtable); lazy k-way merge belongs
+      in ondaDB (`design/09:93`). — landed in ondaDB (`LazyMemIter`), picked up
+      by the 0.7.8 upgrade. marekvs also now uses `new_iterator_bounded`.
+- [ ] Re-benchmark SPOP/ZPOPMIN on ondaDB 0.7.8 and decide whether the
+      `pop_hints` pop-cursor workaround (`store.rs`) still earns its keep.
 - [ ] Known bench gaps vs KeyDB: SPOP/ZPOPMIN ~0.15×, MSET ~0.10×
-      (`design/09:129`).
+      (`design/09:129`) — measured pre-0.7.8, stale.
+- [ ] `proto_crdt::oneof_race_converges_identically_both_orders` is **flaky at
+      ~50 %** ("oneof winner depends on order"): the oneof tie-break is not
+      order-independent. Pre-existing and unrelated to the storage engine —
+      measured 4/8 failures on `defc648` against ondaDB 0.2.0, 5/8 on the same
+      commit against 0.7.8, 4/8 on the 0.7.8 upgrade branch.
+- [ ] Commit-hook delivery is not seq-ordered (pre-existing; see
+      `tests/commit_hook_contract.rs`). `Ring::read_after` assumes a sorted
+      buffer, so an out-of-order op can be skipped and left to anti-entropy.
+      Decide between sorting on push and letting `Ring::push` allocate its own
+      monotonic seq; both need a chaos/churn run.
 - [ ] LINSERT/LREM/LTRIM O(n) rebuilds (`design/02:261`).
 - [ ] mimalloc vs jemalloc decision still open (`design/08:41`).
 - [ ] Interest table exact-key memory (blooms rejected for now,

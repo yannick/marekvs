@@ -109,7 +109,8 @@ async fn replicate_proto(src: &Arc<Engine>, dst: &Arc<Engine>, key: &[u8], rever
                     out.push((ik.to_vec(), v.to_vec()));
                     true
                 },
-            );
+            )
+            .unwrap();
             out
         })
         .await;

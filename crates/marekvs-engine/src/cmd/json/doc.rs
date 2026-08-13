@@ -1,7 +1,7 @@
 //! Load + materialize JSON documents from the store, plus the shared write
 //! helpers every JSON.* mutation goes through (design/16).
 
-use crate::store::{self, get_head, get_raw, now_ms, scan_prefix, write_merged, ShardCtx};
+use crate::store::{self, get_head, get_raw, now_ms, scan_prefix_cmd, write_merged, ShardCtx};
 use marekvs_core::envelope::{head, Envelope, RecordType};
 use marekvs_core::ikey;
 use marekvs_core::json::{
@@ -18,7 +18,7 @@ use marekvs_core::merge::{element_dots, element_remove, element_set, Dot, Elemen
 pub(crate) fn load_nodes(ctx: &ShardCtx, key: &[u8], del_hlc: u64) -> Vec<(Vec<u8>, NodeIn)> {
     let mut nodes: Vec<(Vec<u8>, NodeIn)> = Vec::new();
     let now = now_ms();
-    scan_prefix(
+    scan_prefix_cmd(
         ctx,
         &ikey::collection_prefix(ikey::Tag::Json, key),
         |k, v| {
@@ -133,7 +133,7 @@ pub(crate) fn tomb_arr_node(ctx: &ShardCtx, key: &[u8], path: &[u8], elem: &ArrE
 pub(crate) fn cover_descendants(ctx: &ShardCtx, key: &[u8], node_path: &[u8], del_hlc: u64) {
     let mut kind_a: Vec<(Vec<u8>, Vec<Dot>)> = Vec::new();
     let mut kind_b: Vec<(Vec<u8>, ArrElem)> = Vec::new();
-    scan_prefix(ctx, &ikey::json_node_key(key, node_path), |k, v| {
+    scan_prefix_cmd(ctx, &ikey::json_node_key(key, node_path), |k, v| {
         let (p, (env, pay)) = match (ikey::parse(k), Envelope::decode(v)) {
             (Some(p), Some(d)) => (p, d),
             _ => return true,

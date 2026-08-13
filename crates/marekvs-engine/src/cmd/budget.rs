@@ -27,7 +27,7 @@ use marekvs_core::envelope::{head, Envelope, COLLECTION_HEAD};
 use marekvs_core::{hlc_phys_ms, ikey};
 
 use crate::reply::Reply;
-use crate::store::{self, get_raw, now_ms, scan_prefix, ShardCtx};
+use crate::store::{self, get_raw, now_ms, scan_prefix_cmd, ShardCtx};
 use crate::{BudgetErr, BudgetGrant, Engine};
 
 /// How many expired own tokens one grant/close opportunistically folds.
@@ -324,7 +324,7 @@ fn fold_expired_own(
     let now = now_ms();
     let prefix = ikey::prefixed(ikey::Tag::Budget, key, &[ikey::BUDGET_TOKEN]);
     let mut victims: Vec<(Vec<u8>, u64, u16, u64, TokenState)> = Vec::new();
-    scan_prefix(ctx, &prefix, |k, v| {
+    scan_prefix_cmd(ctx, &prefix, |k, v| {
         let Some(p) = ikey::parse(k) else { return true };
         let Some((gen, _hlc, node, epoch)) = token_suffix_fields(p.suffix) else {
             return true;
@@ -414,7 +414,7 @@ fn gc_old_windows(
         ikey::prefixed(ikey::Tag::Budget, key, &suffix)
     };
     let mut victims: Vec<Vec<u8>> = Vec::new();
-    scan_prefix(ctx, &prefix, |k, v| {
+    scan_prefix_cmd(ctx, &prefix, |k, v| {
         let Some(p) = ikey::parse(k) else { return true };
         // suffix: [W][gen u64][window u64][node u16][epoch u64] — memcmp
         // order sorts by window first, so the scan stops at the cutoff.
@@ -471,7 +471,7 @@ fn own_outstanding(
     };
     let mut total: u128 = 0;
     let node_off = if fixed.is_some() { 17 } else { 9 };
-    scan_prefix(ctx, &prefix, |k, v| {
+    scan_prefix_cmd(ctx, &prefix, |k, v| {
         let Some(p) = ikey::parse(k) else { return true };
         if p.suffix.len() < node_off + 10 {
             return true;
@@ -1389,7 +1389,7 @@ pub async fn reclaim(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         // (stranded-open, conservative — nobody can fold them again).
         let mut token_consumed: u128 = 0;
         let tprefix = ikey::budget_kind_prefix(&key, ikey::BUDGET_TOKEN, hs.gen);
-        scan_prefix(ctx, &tprefix, |k, v| {
+        scan_prefix_cmd(ctx, &tprefix, |k, v| {
             let Some(p) = ikey::parse(k) else { return true };
             let Some((_gen, _hlc, node, _epoch)) = token_suffix_fields(p.suffix) else {
                 return true;
@@ -1422,7 +1422,7 @@ pub async fn reclaim(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             hs.gen,
         );
         let node_off = if hs.mode == MODE_WINDOW { 17 } else { 9 };
-        scan_prefix(ctx, &sprefix, |k, v| {
+        scan_prefix_cmd(ctx, &sprefix, |k, v| {
             let Some(p) = ikey::parse(k) else { return true };
             if p.suffix.len() < node_off + 10 {
                 return true;
@@ -1571,7 +1571,7 @@ pub async fn info(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             let node_off = if fixed.is_some() { 17 } else { 9 };
             let mut outstanding: u128 = 0;
             let mut nodes: Vec<Reply> = Vec::new();
-            scan_prefix(ctx, &prefix, |k, v| {
+            scan_prefix_cmd(ctx, &prefix, |k, v| {
                 let Some(p) = ikey::parse(k) else { return true };
                 if p.suffix.len() < node_off + 10 {
                     return true;
@@ -1599,7 +1599,7 @@ pub async fn info(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             let tprefix = ikey::budget_kind_prefix(&key, ikey::BUDGET_TOKEN, hs.gen);
             let mut open_tokens = 0i64;
             let mut open_amount: u128 = 0;
-            scan_prefix(ctx, &tprefix, |_k, v| {
+            scan_prefix_cmd(ctx, &tprefix, |_k, v| {
                 if let Some((env, pay)) = Envelope::decode(v) {
                     if !env.is_tombstone() {
                         if let Some(st) = TokenState::decode(pay) {

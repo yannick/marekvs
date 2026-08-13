@@ -15,7 +15,7 @@ use std::sync::Arc;
 use prost_reflect::{DescriptorPool, MessageDescriptor};
 use serde::{Deserialize, Serialize};
 
-use crate::store::{self, now_ms, read_lww, scan_prefix, write_merged};
+use crate::store::{self, now_ms, read_lww, scan_prefix_cmd, write_merged};
 use crate::Engine;
 use marekvs_core::envelope::{head, Envelope, RecordType};
 use marekvs_core::ikey;
@@ -169,7 +169,7 @@ async fn hgetall_sys_traced(
             let now = now_ms();
             let mut out = Vec::new();
             let mut saw_record = false;
-            scan_prefix(
+            scan_prefix_cmd(
                 ctx,
                 &ikey::collection_prefix(ikey::Tag::HashField, &k),
                 |ik, v| {

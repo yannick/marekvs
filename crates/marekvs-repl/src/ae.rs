@@ -11,11 +11,23 @@ use std::sync::Arc;
 
 use marekvs_core::envelope::Envelope;
 use marekvs_core::ikey::{self, Pid};
-use marekvs_engine::store::{self, Store};
+use marekvs_engine::store::{self, ScanIncomplete, Store};
 use marekvs_proto::ReplOp;
 use xxhash_rust::xxh3::xxh3_64;
 
 pub const BUCKETS: usize = 256;
+
+/// Every function here reports an incomplete scan instead of returning what it
+/// managed to collect.
+///
+/// An anti-entropy answer built from a partial scan is not merely stale, it is
+/// actively harmful: ondaDB ≥0.7 yields an *invalid* iterator when a reader
+/// fails to open, so a failed partition walk produces `vec![0u64; BUCKETS]` —
+/// byte-identical to "this partition holds nothing". `partition_root` would
+/// then return the documented empty sentinel `0`, and the repair machinery
+/// would conclude the peer holds data we deliberately do not. Skipping a round
+/// costs one AE interval; repairing against a fabricated digest corrupts.
+pub type AeResult<T> = Result<T, ScanIncomplete>;
 
 fn entry_hash(ikey: &[u8], hlc: u64, vhash: u64) -> u64 {
     let mut buf = Vec::with_capacity(ikey.len() + 16);
@@ -40,7 +52,7 @@ fn record_vhash(value: &[u8]) -> u64 {
 }
 
 /// XOR-fold digests of all 256 buckets of a partition.
-pub async fn bucket_digests(store: &Arc<Store>, pid: Pid) -> Vec<u64> {
+pub async fn bucket_digests(store: &Arc<Store>, pid: Pid) -> AeResult<Vec<u64>> {
     store
         .run(pid, move |ctx| {
             let mut digests = vec![0u64; BUCKETS];
@@ -51,14 +63,14 @@ pub async fn bucket_digests(store: &Arc<Store>, pid: Pid) -> Vec<u64> {
                 let bucket = (xxh3_64(k) & 0xFF) as usize;
                 digests[bucket] ^= entry_hash(k, record_hlc(v), record_vhash(v));
                 true
-            });
-            digests
+            })?;
+            Ok(digests)
         })
         .await
 }
 
-pub async fn partition_root(store: &Arc<Store>, pid: Pid) -> u64 {
-    let digests = bucket_digests(store, pid).await;
+pub async fn partition_root(store: &Arc<Store>, pid: Pid) -> AeResult<u64> {
+    let digests = bucket_digests(store, pid).await?;
     // 0 is the documented "no visible records" sentinel (stranded-AE and
     // the rejoin scope rely on it). xxh3 over 256 zero digests is a NONZERO
     // constant, so without this check every empty partition looked
@@ -68,17 +80,21 @@ pub async fn partition_root(store: &Arc<Store>, pid: Pid) -> u64 {
     // sentinel — that needs colliding entry hash pairs; the consequence is
     // a skipped offer, healed by owner-AE.)
     if digests.iter().all(|d| *d == 0) {
-        return 0;
+        return Ok(0);
     }
     let mut bytes = Vec::with_capacity(BUCKETS * 8);
     for d in digests {
         bytes.extend_from_slice(&d.to_be_bytes());
     }
-    xxh3_64(&bytes)
+    Ok(xxh3_64(&bytes))
 }
 
 /// (ikey_hash, hlc, value_hash) for every record in one bucket.
-pub async fn bucket_entries(store: &Arc<Store>, pid: Pid, bucket: u8) -> Vec<(u64, u64, u64)> {
+pub async fn bucket_entries(
+    store: &Arc<Store>,
+    pid: Pid,
+    bucket: u8,
+) -> AeResult<Vec<(u64, u64, u64)>> {
     store
         .run(pid, move |ctx| {
             let mut entries = Vec::new();
@@ -90,8 +106,8 @@ pub async fn bucket_entries(store: &Arc<Store>, pid: Pid, bucket: u8) -> Vec<(u6
                     entries.push((xxh3_64(k), record_hlc(v), record_vhash(v)));
                 }
                 true
-            });
-            entries
+            })?;
+            Ok(entries)
         })
         .await
 }
@@ -103,7 +119,7 @@ pub async fn diff_bucket(
     pid: Pid,
     bucket: u8,
     theirs: &[(u64, u64, u64)],
-) -> (Vec<ReplOp>, Vec<u64>) {
+) -> AeResult<(Vec<ReplOp>, Vec<u64>)> {
     let theirs: std::collections::HashMap<u64, (u64, u64)> = theirs
         .iter()
         .map(|(h, hlc, vh)| (*h, (*hlc, *vh)))
@@ -137,7 +153,7 @@ pub async fn diff_bucket(
                     });
                 }
                 true
-            });
+            })?;
             let want: Vec<u64> = theirs
                 .iter()
                 .filter(|(h, (thlc, tvh))| {
@@ -146,7 +162,7 @@ pub async fn diff_bucket(
                 })
                 .map(|(h, _)| *h)
                 .collect();
-            (push, want)
+            Ok((push, want))
         })
         .await
 }
@@ -157,7 +173,7 @@ pub async fn records_by_hash(
     pid: Pid,
     bucket: u8,
     hashes: &[u64],
-) -> Vec<ReplOp> {
+) -> AeResult<Vec<ReplOp>> {
     let wanted: std::collections::HashSet<u64> = hashes.iter().copied().collect();
     store
         .run(pid, move |ctx| {
@@ -173,8 +189,8 @@ pub async fn records_by_hash(
                     });
                 }
                 true
-            });
-            ops
+            })?;
+            Ok(ops)
         })
         .await
 }

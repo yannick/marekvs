@@ -7,7 +7,7 @@ use crate::cmd::{eq_ignore_case, parse_i64, parse_u64};
 use crate::pubsub::glob_match;
 use crate::reply::Reply;
 use crate::store::{
-    self, get_head, get_raw, key_type, now_ms, read_lww, scan_prefix, write_merged, ShardCtx,
+    self, get_head, get_raw, key_type, now_ms, read_lww, scan_prefix_cmd, write_merged, ShardCtx,
 };
 use crate::Engine;
 use marekvs_core::envelope::{head, Envelope, RecordType};
@@ -416,7 +416,7 @@ fn scan_userkeys(
     let mut next = Vec::new();
     let now = now_ms();
     let mut count = 0usize;
-    scan_prefix(ctx, &[], |k, v| {
+    scan_prefix_cmd(ctx, &[], |k, v| {
         count += 1;
         if count > limit * 64 {
             // hard budget per SCAN call
@@ -871,7 +871,7 @@ fn collect_key_records(ctx: &ShardCtx, key: &[u8]) -> Option<Vec<KeyRecord>> {
                 }
                 _ => return None,
             };
-            scan_prefix(ctx, &ikey::collection_prefix(tag, key), |k, v| {
+            scan_prefix_cmd(ctx, &ikey::collection_prefix(tag, key), |k, v| {
                 if let (Some(p), Some((env, pay))) = (ikey::parse(k), Envelope::decode(v)) {
                     if store::visible(&env, pay, del, now).is_some() {
                         if env.rtype().is_or_element() {

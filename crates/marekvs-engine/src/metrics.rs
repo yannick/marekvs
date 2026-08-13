@@ -52,6 +52,37 @@ pub struct Metrics {
     pub ae_rounds_total: IntCounter,
     pub ae_repair_ops_total: IntCounter,
     pub ae_digest_scans_total: IntCounter,
+    /// Anti-entropy exchanges abandoned because a partition scan did not
+    /// complete. Non-zero means repair rounds are being skipped — the safe
+    /// outcome, but convergence stalls until the underlying storage recovers.
+    pub ae_scan_failures_total: IntCounter,
+    /// Storage scans that ended incomplete, process-wide (mirrors
+    /// `store::scan_errors_total`). The alert signal for silently-short reads.
+    pub scan_errors_total: IntCounter,
+
+    // --- ondaDB engine internals (design/09 §Storage floor) ---
+    /// Resident bytes held by SSTable readers the table cache has open — index
+    /// blocks plus bloom filters. Before ondaDB 0.7 this was unbounded and
+    /// invisible, and it grew with total stored bytes rather than working set.
+    pub db_reader_resident_bytes: IntGauge,
+    /// The byte ceiling those readers are held under
+    /// (`MAREKVS_MAX_OPEN_READER_BYTES`); `0` means the byte bound is off.
+    /// Resident approaching budget means eviction pressure, not a leak.
+    pub db_reader_budget_bytes: IntGauge,
+    /// SSTable readers currently open.
+    pub db_open_readers: IntGauge,
+    /// L0 files in the `data` CF. A climbing value means compaction is not
+    /// keeping up and reads are probing more tables each level.
+    pub db_l0_files: IntGauge,
+    /// SSTable probes skipped by a bloom-filter negative, and probes actually
+    /// issued. The ratio is the direct check that ondaDB 0.7.1's bloom-sizing
+    /// fix is live — before it, compacted tables measured **zero** skips.
+    pub db_bloom_skips_total: IntGauge,
+    pub db_sst_probes_total: IntGauge,
+    /// Successful physical WAL `sync_data()` calls. Under `SyncMode::None` this
+    /// never advances, which is what makes it a durability assertion rather
+    /// than a restatement of config.
+    pub db_wal_syncs_total: IntGauge,
     pub ring_ops: IntGauge,
     pub ring_bytes: IntGauge,
     pub join_gate_pending_pids: IntGauge,
@@ -252,6 +283,51 @@ impl Metrics {
                 registry,
                 "marekvs_ae_digest_scans_total",
                 "Full partition scans performed to (re)compute a Merkle root (cache misses)"
+            ),
+            ae_scan_failures_total: counter!(
+                registry,
+                "marekvs_ae_scan_failures_total",
+                "Anti-entropy exchanges abandoned because a partition scan did not complete"
+            ),
+            scan_errors_total: counter!(
+                registry,
+                "marekvs_scan_errors_total",
+                "Storage scans that ended incomplete (a reply or digest would have been short)"
+            ),
+            db_reader_resident_bytes: gauge!(
+                registry,
+                "marekvs_db_reader_resident_bytes",
+                "Resident bytes (block index + bloom) across open ondaDB SSTable readers"
+            ),
+            db_reader_budget_bytes: gauge!(
+                registry,
+                "marekvs_db_reader_budget_bytes",
+                "Byte budget for open ondaDB SSTable readers (0 = byte bound disabled)"
+            ),
+            db_open_readers: gauge!(
+                registry,
+                "marekvs_db_open_readers",
+                "ondaDB SSTable readers currently open"
+            ),
+            db_l0_files: gauge!(
+                registry,
+                "marekvs_db_l0_files",
+                "L0 SSTable count in the data column family (compaction backlog)"
+            ),
+            db_bloom_skips_total: gauge!(
+                registry,
+                "marekvs_db_bloom_skips_total",
+                "SSTable probes skipped by a bloom-filter negative"
+            ),
+            db_sst_probes_total: gauge!(
+                registry,
+                "marekvs_db_sst_probes_total",
+                "SSTable probes issued"
+            ),
+            db_wal_syncs_total: gauge!(
+                registry,
+                "marekvs_db_wal_syncs_total",
+                "Successful physical WAL sync_data() calls"
             ),
             ring_ops: gauge!(
                 registry,

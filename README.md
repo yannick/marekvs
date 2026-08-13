@@ -183,6 +183,25 @@ what `just apple-up` automates via `tests/apple_cluster.sh`).
 | `MAREKVS_REPLICAS_N` | `3` | home replicas per partition |
 | `MAREKVS_REQUIREPASS` | — | optional AUTH password |
 
+### Storage engine (ondaDB)
+
+marekvs is disk-native — the memtable, the block cache and the OS page cache are
+its only memory tiers — so these are pinned explicitly rather than inherited,
+and they move with ondaDB releases. Defaults below are ondaDB 0.7.8's.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MAREKVS_BLOCK_CACHE_BYTES` | `67108864` (64 MiB) | ondaDB block cache |
+| `MAREKVS_MAX_OPEN_READERS` | `512` | SSTable readers held open (the `max_open_files` analogue) |
+| `MAREKVS_MAX_OPEN_READER_BYTES` | `1073741824` (1 GiB) | resident ceiling for those readers' index + bloom; `0` disables the byte bound |
+| `MAREKVS_FLUSH_THREADS` | `4` | ondaDB background flush threads |
+
+Reader memory is the one to watch: before ondaDB 0.7 it was unbounded and grew
+with *total stored bytes* rather than working set. `marekvs_db_reader_resident_bytes`
+against `marekvs_db_reader_budget_bytes` shows the headroom, and
+`marekvs_db_bloom_skips_total` / `marekvs_db_sst_probes_total` show whether bloom
+filters are actually filtering (the ratio should be high, not zero).
+
 ## Workspace layout
 
 | Crate | Contents |

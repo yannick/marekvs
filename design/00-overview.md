@@ -128,9 +128,16 @@ Test pointers refer to [10-testing.md](10-testing.md).
    membership-view divergence two nodes may briefly both act as H1 (harmless
    duplicates) or neither (repaired by anti-entropy — this path consumes the
    15 s bound). → membership-churn Jepsen tests (§10.3).
-2. **ondaDB commit-hook contract**: fires exactly once per committed batch, in
-   commit order, with the full op list. Cursor-resume replication depends on
-   it. → integration test against ondaDB (§10.2).
+2. **ondaDB commit-hook contract**: fires exactly once per committed batch, with
+   the full op list. Cursor-resume replication depends on it.
+   → `marekvs-engine/tests/commit_hook_contract.rs`, which pins exactly-once,
+   whole-batch delivery and seq uniqueness under concurrent committers.
+   **Correction:** delivery is *not* in commit order, and never was — ondaDB
+   assigns `commit_seq` under the commit guard but calls the hook after
+   releasing it (`txn.rs`, unchanged since 0.2.0), so batches can arrive
+   out of order. `Ring::read_after` assumes a seq-sorted buffer, so an
+   out-of-order op can be filtered out of the ring permanently and left for
+   anti-entropy to repair. Tracked by the ignored ordering test in that file.
 3. **ORSWOT-lite bias**: dot-based observed-remove without causal context is
    add-wins in races where a remove propagated through an intermediary that saw
    a newer add. Believed acceptable for Redis set semantics. → merge-law

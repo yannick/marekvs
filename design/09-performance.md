@@ -88,14 +88,21 @@ Verified per release by the benchmark plan below; regressions >10 % fail CI.
 
 The `just bench` harness (bench/) surfaced three real characteristics:
 
-1. **ondadb iterator construction is O(memtable)** — `Memtable::snapshot()`
-   clones and sorts every live entry on every `new_iterator()` call. Point
-   ops are unaffected (0.1 ms), but every prefix scan (SPOP, ZPOPMIN, SCARD,
-   SMEMBERS, HGETALL, sweeper ticks) pays milliseconds once the memtable
-   holds tens of thousands of records: measured 1.3 ms/SPOP at 2 k memtable
-   entries → 5.1 ms at ~15 k, while a point SADD stays at 0.12 ms. Fix
-   belongs in ondadb: lazy k-way merge over the (already sorted) skiplist
-   shards instead of snapshot-collect-sort.
+1. **ondadb iterator construction was O(memtable)** — `Memtable::snapshot()`
+   cloned and sorted every live entry on every `new_iterator()` call. Point
+   ops were unaffected (0.1 ms), but every prefix scan (SPOP, ZPOPMIN, SCARD,
+   SMEMBERS, HGETALL, sweeper ticks) paid milliseconds once the memtable
+   held tens of thousands of records: measured 1.3 ms/SPOP at 2 k memtable
+   entries → 5.1 ms at ~15 k, while a point SADD stayed at 0.12 ms.
+
+   **Fixed in ondaDB, as requested.** `Memtable::iter` is now lazy: a
+   `LazyMemIter` k-way merge (binary heap) directly over the already-sorted
+   shard skip lists, no snapshot-collect-sort (`ondadb/src/memtable.rs:13`).
+   ondaDB 0.7.2 additionally binary-searches sorted levels when building an
+   iterator, and marekvs now passes explicit key bounds (see design/02).
+   **The SPOP/ZPOPMIN numbers above predate all three and need re-measuring**;
+   the `pop_hints` workaround in `store.rs` should be re-justified or deleted
+   on the new numbers.
 2. **Scan-shaped pops need early exits** — SPOP/SRANDMEMBER/ZPOPMIN now use
    limit-bounded scans (O(count) visible hits) instead of materializing the
    collection; ZPOPMAX keeps a bounded tail window.

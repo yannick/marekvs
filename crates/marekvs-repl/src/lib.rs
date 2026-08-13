@@ -757,6 +757,29 @@ impl ReplEngine {
         let m = &self.engine.metrics;
         m.db_total_bytes
             .set(self.store.db.stats().total_bytes as i64);
+        // store:: keeps the authoritative count on a plain atomic (it is
+        // incremented from shard threads, which hold no Metrics handle); mirror
+        // the delta into the registry.
+        let scans = store::scan_errors_total();
+        let mirrored = m.scan_errors_total.get();
+        if scans > mirrored {
+            m.scan_errors_total.inc_by(scans - mirrored);
+        }
+
+        // ondaDB internals. Resident reader memory is the number that grew to
+        // dominate while being invisible before 0.7, and bloom_skips/sst_probes
+        // is how an operator can see that filters are actually filtering.
+        let (resident, budget) = self.store.db.table_cache_bytes();
+        m.db_reader_resident_bytes.set(resident as i64);
+        m.db_reader_budget_bytes.set(budget as i64);
+        let (open_readers, ..) = self.store.db.table_cache_stats();
+        m.db_open_readers.set(open_readers as i64);
+        m.db_wal_syncs_total
+            .set(self.store.db.wal_sync_count() as i64);
+        m.db_l0_files.set(self.store.data.l0_file_count() as i64);
+        let cf = self.store.data.stats();
+        m.db_bloom_skips_total.set(cf.bloom_skips as i64);
+        m.db_sst_probes_total.set(cf.sst_probes as i64);
         let Some((total, avail)) = store::fs_usage(&self.store.data_dir) else {
             if !*fs_warned {
                 *fs_warned = true;
@@ -922,17 +945,23 @@ impl ReplEngine {
             let Some(source) = owners.iter().find(|o| **o != self_id).copied() else {
                 continue;
             };
-            let empty = self
+            let probe = self
                 .store
                 .run(pid, move |ctx| {
                     let mut any = false;
                     store::scan_prefix(ctx, &ikey::partition_prefix(pid), |_, _| {
                         any = true;
                         false
-                    });
-                    !any
+                    })?;
+                    Ok::<bool, store::ScanIncomplete>(!any)
                 })
                 .await;
+            // "Empty" decides whether this partition is bootstrapped at all, so
+            // a failed probe must not answer it. Re-evaluate next round.
+            let Ok(empty) = probe else {
+                self.engine.metrics.scan_errors_total.inc();
+                continue;
+            };
             // A returning member does NOT bootstrap its empty partitions
             // (they were empty when it left; AE heals any drift). Only fresh
             // nodes pull empty partitions, and only interrupted joins resume.
@@ -1100,8 +1129,15 @@ impl ReplEngine {
                     // sync; empty ones take the normal bootstrap gate.
                     let mut unsynced: HashSet<Pid> = HashSet::new();
                     for pid in self.cluster.future_owned_pids() {
-                        if self.partition_root_cached(pid).await != 0 {
-                            unsynced.insert(pid);
+                        // Err = we could not read the partition. Scope it in:
+                        // syncing a partition that turns out to be empty costs
+                        // one round, while skipping one that holds data leaves
+                        // it permanently unsynced.
+                        match self.partition_root_cached(pid).await {
+                            Ok(0) => {}
+                            Ok(_) | Err(_) => {
+                                unsynced.insert(pid);
+                            }
                         }
                     }
                     self.gate.lock().rejoin_pending = unsynced.clone();
@@ -1147,7 +1183,13 @@ impl ReplEngine {
                         continue;
                     }
                     let peer = co[(self.pseudo_rand() % co.len() as u64) as usize];
-                    let root = self.partition_root_cached(pid).await;
+                    let Ok(root) = self.partition_root_cached(pid).await else {
+                        // Never complete a rejoin pid on a failed scan: that
+                        // would declare it synced on the strength of a digest
+                        // we never computed. Retry next round.
+                        self.engine.metrics.ae_scan_failures_total.inc();
+                        continue;
+                    };
                     if root == 0 {
                         // Drained empty (all extras dropped, nothing pulled
                         // yet counts as synced-empty for placement purposes).
@@ -1481,7 +1523,12 @@ impl ReplEngine {
                         continue;
                     }
                     let peer = others[(self.pseudo_rand() % others.len() as u64) as usize];
-                    let root = self.partition_root_cached(pid).await;
+                    // Offering a root we could not compute would advertise an
+                    // empty partition and invite the peer to "repair" us.
+                    let Ok(root) = self.partition_root_cached(pid).await else {
+                        self.engine.metrics.ae_scan_failures_total.inc();
+                        continue;
+                    };
                     self.mesh.send_ctl(peer, PeerMsg::MerkleRoot { pid, root });
                 }
                 // Stranded-record AE (chaos findings): every few rounds, also
@@ -1501,7 +1548,10 @@ impl ReplEngine {
                         if owners.is_empty() {
                             continue;
                         }
-                        let root = self.partition_root_cached(pid).await;
+                        let Ok(root) = self.partition_root_cached(pid).await else {
+                            self.engine.metrics.ae_scan_failures_total.inc();
+                            continue;
+                        };
                         if root == 0 {
                             continue; // no local data for this pid
                         }
@@ -1522,21 +1572,31 @@ impl ReplEngine {
     /// past AE_ROOT_CACHE_TTL (ondadb's TTL purge bypasses the commit
     /// hook). Quiescent partitions cost no I/O per AE round — previously
     /// the full keyspace was re-hashed every ~5 s.
-    async fn partition_root_cached(&self, pid: Pid) -> u64 {
+    async fn partition_root_cached(&self, pid: Pid) -> ae::AeResult<u64> {
         if !self.ae_dirty.lock().contains(&pid) {
             if let Some((root, at)) = self.ae_roots.lock().get(&pid) {
                 if at.elapsed() < AE_ROOT_CACHE_TTL {
-                    return *root;
+                    return Ok(*root);
                 }
             }
         }
         // Clear BEFORE scanning: writes landing mid-scan re-mark the pid,
         // so an invalidation can never be lost (worst case: one extra scan).
         self.ae_dirty.lock().remove(&pid);
-        let root = ae::partition_root(&self.store, pid).await;
+        let root = match ae::partition_root(&self.store, pid).await {
+            Ok(root) => root,
+            Err(e) => {
+                // A root computed from a partial scan must never be cached: it
+                // would be trusted for AE_ROOT_CACHE_TTL and, for a scan that
+                // failed early, it is exactly the "partition is empty"
+                // sentinel. Re-mark the pid so the next round rescans it.
+                self.ae_dirty.lock().insert(pid);
+                return Err(e);
+            }
+        };
         self.ae_roots.lock().insert(pid, (root, Instant::now()));
         self.engine.metrics.ae_digest_scans_total.inc();
-        root
+        Ok(root)
     }
 
     // ------------------------------------------------------------------
@@ -1609,7 +1669,14 @@ impl ReplEngine {
             }
             PeerMsg::FetchCollection { id, userkey } => {
                 self.engine.metrics.fetches_served_total.inc();
-                let ops = self.collect_userkey_records(&userkey).await;
+                // Do not answer with a partial collection: the requester caches
+                // the response under an INTEREST_LEASE and would serve the
+                // missing elements as absent for the whole lease. Staying
+                // silent makes it time out and retry.
+                let Ok(ops) = self.collect_userkey_records(&userkey).await else {
+                    self.engine.metrics.scan_errors_total.inc();
+                    return;
+                };
                 self.register_interest(peer, &userkey);
                 self.mesh.send_ctl(
                     peer,
@@ -1707,9 +1774,20 @@ impl ReplEngine {
                 }
             }
             PeerMsg::MerkleRoot { pid, root } => {
-                let ours = self.partition_root_cached(pid).await;
+                // Staying silent is the only safe answer to a failed scan here.
+                // Replying MerkleRootMatch would let a rejoining peer mark the
+                // partition synced against a digest we never computed, and
+                // replying with zeroed buckets would invite it to "repair" data
+                // we in fact hold. Either way the peer retries next round.
+                let Ok(ours) = self.partition_root_cached(pid).await else {
+                    self.engine.metrics.ae_scan_failures_total.inc();
+                    return;
+                };
                 if ours != root {
-                    let digests = ae::bucket_digests(&self.store, pid).await;
+                    let Ok(digests) = ae::bucket_digests(&self.store, pid).await else {
+                        self.engine.metrics.ae_scan_failures_total.inc();
+                        return;
+                    };
                     self.mesh
                         .send_ctl(peer, PeerMsg::MerkleBuckets { pid, digests });
                 } else {
@@ -1722,7 +1800,10 @@ impl ReplEngine {
                 self.complete_rejoin_pid(pid);
             }
             PeerMsg::MerkleBuckets { pid, digests } => {
-                let ours = ae::bucket_digests(&self.store, pid).await;
+                let Ok(ours) = ae::bucket_digests(&self.store, pid).await else {
+                    self.engine.metrics.ae_scan_failures_total.inc();
+                    return;
+                };
                 let we_own = self.cluster.owned_pids().contains(&pid);
                 // A rejoining node owns nothing (it is Joining) but WANTS
                 // backfill for the home partitions it is re-syncing.
@@ -1732,7 +1813,11 @@ impl ReplEngine {
                 };
                 for (bucket, (a, b)) in ours.iter().zip(digests.iter()).enumerate() {
                     if a != b {
-                        let entries = ae::bucket_entries(&self.store, pid, bucket as u8).await;
+                        let Ok(entries) = ae::bucket_entries(&self.store, pid, bucket as u8).await
+                        else {
+                            self.engine.metrics.ae_scan_failures_total.inc();
+                            continue;
+                        };
                         self.mesh.send_ctl(
                             peer,
                             PeerMsg::BucketKeys {
@@ -1751,7 +1836,14 @@ impl ReplEngine {
                 entries,
                 no_backfill,
             } => {
-                let (mut push, want) = ae::diff_bucket(&self.store, pid, bucket, &entries).await;
+                let Ok((mut push, want)) =
+                    ae::diff_bucket(&self.store, pid, bucket, &entries).await
+                else {
+                    // A partial diff both under-pushes and over-requests; the
+                    // next round recomputes it from a complete scan.
+                    self.engine.metrics.ae_scan_failures_total.inc();
+                    return;
+                };
                 if no_backfill {
                     // Stranded exchange: never GROW the non-owner's cache,
                     // but DO refresh records it already holds (it offered
@@ -1783,7 +1875,14 @@ impl ReplEngine {
                 bucket,
                 ikey_hashes,
             } => {
-                let ops = ae::records_by_hash(&self.store, pid, bucket, &ikey_hashes).await;
+                // The rejoin branch below DELETES every record in `ops`, and the
+                // serve branch treats it as the complete answer to the peer's
+                // request. A partial scan must reach neither.
+                let Ok(ops) = ae::records_by_hash(&self.store, pid, bucket, &ikey_hashes).await
+                else {
+                    self.engine.metrics.ae_scan_failures_total.inc();
+                    return;
+                };
                 let (rejoin_active, rejoin_home) = {
                     let r = self.rejoin.lock();
                     (r.active, r.unsynced.contains(&pid))
@@ -2025,7 +2124,10 @@ impl ReplEngine {
 
     /// All records of one user key (string + list + head + elements),
     /// verbatim — for FetchCollection responses and bootstrap.
-    async fn collect_userkey_records(&self, userkey: &[u8]) -> Vec<ReplOp> {
+    async fn collect_userkey_records(
+        &self,
+        userkey: &[u8],
+    ) -> Result<Vec<ReplOp>, store::ScanIncomplete> {
         let uk = userkey.to_vec();
         self.store
             .run_key(userkey, move |ctx| {
@@ -2046,9 +2148,9 @@ impl ReplEngine {
                             value: v.to_vec(),
                         });
                         true
-                    });
+                    })?;
                 }
-                ops
+                Ok(ops)
             })
             .await
     }
@@ -2105,19 +2207,31 @@ impl ReplEngine {
         let rate = bootstrap_rate_bytes_per_sec();
         let started = Instant::now();
         let mut streamed_bytes: u64 = 0;
+        // Resume cursor: the internal key of the last record emitted. Each
+        // chunk seeks straight past it. The offset-skip this replaced re-walked
+        // every already-sent record on every chunk, making a partition stream
+        // quadratic (O(n²/256) records visited) in partition size.
+        let prefix = ikey::partition_prefix(pid);
+        let mut cursor: Option<Vec<u8>> = None;
         loop {
-            let offset = sent;
-            let chunk: Vec<ReplOp> = self
+            let from = cursor.clone();
+            let prefix_for_chunk = prefix.clone();
+            let chunk = self
                 .store
                 .run(pid, move |ctx| {
-                    let mut ops = Vec::new();
-                    let mut skipped = 0usize;
-                    store::scan_prefix(ctx, &ikey::partition_prefix(pid), |k, v| {
-                        if matches!(ikey::parse(k), Some(p) if p.tag == b'Z') {
-                            return true;
+                    let mut ops: Vec<ReplOp> = Vec::new();
+                    // `scan_from` visits `start` itself, so resume at the
+                    // immediate successor of the last key emitted.
+                    let start = match &from {
+                        Some(last) => {
+                            let mut s = last.clone();
+                            s.push(0);
+                            s
                         }
-                        if skipped < offset {
-                            skipped += 1;
+                        None => prefix_for_chunk.clone(),
+                    };
+                    store::scan_from(ctx, &start, &prefix_for_chunk, |k, v| {
+                        if matches!(ikey::parse(k), Some(p) if p.tag == b'Z') {
                             return true;
                         }
                         ops.push(ReplOp {
@@ -2125,13 +2239,28 @@ impl ReplEngine {
                             value: v.to_vec(),
                         });
                         ops.len() < 256
-                    });
-                    ops
+                    })?;
+                    Ok::<Vec<ReplOp>, store::ScanIncomplete>(ops)
                 })
                 .await;
+            let Ok(chunk) = chunk else {
+                // Abandon the stream rather than fall through to
+                // BootstrapDone, which would tell the peer it holds a complete
+                // partition while everything past the failure is missing. The
+                // pid stays bootstrap-pending and the join gate retries.
+                self.engine.metrics.scan_errors_total.inc();
+                tracing::warn!(
+                    pid,
+                    peer,
+                    records = sent,
+                    "bootstrap stream aborted: partition scan incomplete"
+                );
+                return;
+            };
             if chunk.is_empty() {
                 break;
             }
+            cursor = chunk.last().map(|o| o.ikey.clone());
             sent += chunk.len();
             let chunk_bytes: u64 = chunk
                 .iter()

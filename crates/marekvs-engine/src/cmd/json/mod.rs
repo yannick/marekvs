@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::cmd::{eq_ignore_case, generic, parse_i64};
 use crate::reply::Reply;
-use crate::store::{self, scan_prefix, ShardCtx};
+use crate::store::{self, scan_prefix_cmd, ShardCtx};
 use crate::Engine;
 use marekvs_core::envelope::head;
 use marekvs_core::ikey;
@@ -1390,7 +1390,7 @@ pub async fn debug(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
                 .map(|loc| {
                     let rp = path::loc_to_record_path(loc, &d.index)?;
                     let mut bytes = 0i64;
-                    scan_prefix(ctx, &ikey::json_node_key(&key, &rp), |_k, v| {
+                    scan_prefix_cmd(ctx, &ikey::json_node_key(&key, &rp), |_k, v| {
                         bytes += v.len() as i64;
                         true
                     });
