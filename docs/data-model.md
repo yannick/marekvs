@@ -161,6 +161,53 @@ Families 2 and 3 compose: a counter-valued hash field is an observed-remove
 element (so `HDEL` works) whose value is a lattice (so concurrent increments all
 survive).
 
+### What makes a merge correct here
+
+"Commutative, associative, idempotent" is the textbook answer, and it is
+necessary but not sufficient. These are the rules a merge in marekvs also has
+to satisfy — each one is a way convergence can fail while every textbook law
+still holds.
+
+**The stored bytes must converge, not just the value.** Anti-entropy compares
+partitions by hashing the records as stored. Two replicas that agree on what a
+record *means* but encode it differently will hash differently, so repair fires,
+ships the record, re-merges to the same disagreement, and fires again — forever.
+Everything below follows from this one requirement.
+
+**The result must not depend on which side is "incoming".** The same merge runs
+on both nodes with the arguments swapped: node A merges (local A, incoming B)
+while node B merges (local B, incoming A). Anything derived from the incoming
+side rather than from both — including which of two record types the result
+takes — makes the two nodes encode different bytes from identical inputs. The
+merged type is therefore a deterministic function of both, and the merged
+version is the symmetric maximum, never "whichever arrived".
+
+**A lattice value on an observed-remove element has to be folded across every
+live contribution.** This is the subtle one. When two nodes write concurrently,
+both contributions survive the merge — that is the whole point of an
+observed-remove element. But reading only the newest one shows a single node's
+work and hides the rest. The record converges perfectly while the *read* loses
+data, which no merge-law test can catch. Anything whose value is a lattice
+(counter-valued hash fields today) folds all live contributions on read.
+
+**A value that changes constantly must not consume remove-history.** An
+observed-remove element remembers the dots a remove observed, and that memory is
+capped — 255 entries, oldest evicted. A value updated without bound that spent
+one entry per write would sit permanently at the cap, and evicting live
+remove-history is how a deleted item comes back. Counter-valued fields keep one
+entry per node instead, so the remove-history never grows from incrementing and
+a hot counter's record stays a fixed size no matter how often it is hit.
+
+**Node-local derived state stays out of the comparison.** The sorted-set score
+index is rebuilt locally on each node and never replicated; including it in
+anti-entropy would make two correct replicas look permanently divergent.
+
+**A new record type is not written until every node can read it.** Nodes
+announce their capabilities when they connect, and a type that some peer does
+not understand stays unwritten until the whole cluster has been upgraded — an
+older node would otherwise hand a client the raw internal payload. That is what
+makes a data-format change a rolling upgrade rather than a flag day.
+
 ### LWW registers
 
 Strings, hash-field values, zset scores, list elements, and collection heads are
