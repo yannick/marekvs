@@ -10,7 +10,7 @@
 //! harness creates exactly these), and gossip phi-accrual detects dead
 //! *nodes*, not dead *connections*.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -65,6 +65,12 @@ pub struct Mesh {
     /// containers); reconnect loops check this slot each iteration and exit
     /// when superseded, and maintain_peer for the new address takes over.
     dial_addrs: parking_lot::Mutex<HashMap<NodeId, SocketAddr>>,
+    /// Peers deliberately forgotten by [`forget_peer`]: their dial loops exit
+    /// instead of retrying until process exit. A node that reappears in the
+    /// view clears its mark in `maintain_peer`, so this is a suppression, not
+    /// a tombstone — the apple-container pattern (same id, new address) still
+    /// reconnects.
+    forgotten: parking_lot::Mutex<HashSet<NodeId>>,
     /// (peer, msg) stream consumed by the ReplEngine — latency-sensitive
     /// lane (Repl/Ack/Fetch/Check/Interest/Publish).
     pub incoming_tx: mpsc::Sender<(NodeId, PeerMsg)>,
@@ -112,6 +118,7 @@ impl Mesh {
             conn_timeouts,
             peers: RwLock::new(HashMap::new()),
             dial_addrs: parking_lot::Mutex::new(HashMap::new()),
+            forgotten: parking_lot::Mutex::new(HashSet::new()),
             incoming_tx,
             ae_tx,
             events_tx,
@@ -204,6 +211,9 @@ impl Mesh {
     /// Dial loop: keep ctl+bulk connections to `peer` alive while it stays in
     /// the membership view. Only called for peers with id > self (lower dials).
     pub async fn maintain_peer(self: Arc<Self>, peer: NodeId, addr: SocketAddr) {
+        // A peer we had forgotten is back in the view: un-forget it before
+        // spawning, or the new dial loops would exit on their first iteration.
+        self.forgotten.lock().remove(&peer);
         // Supersede any reconnect loops dialing an older address.
         self.dial_addrs.lock().insert(peer, addr);
         for kind in [ConnKind::Ctl, ConnKind::Bulk] {
@@ -244,8 +254,42 @@ impl Mesh {
         }
     }
 
-    fn dropped(&self, _peer: NodeId) -> bool {
-        false // v1: redial until process exit; view-driven GC is future work
+    fn dropped(&self, peer: NodeId) -> bool {
+        self.forgotten.lock().contains(&peer)
+    }
+
+    /// Stop maintaining connections to `peer` (T2-10).
+    ///
+    /// Called by the view watcher once a node has been absent from the
+    /// membership view for longer than the GC grace. Without this, a departed
+    /// node's two dial loops retry forever: a long-lived cluster that has
+    /// scaled up and down accumulates one pair per node it has ever seen,
+    /// each logging a failed dial every 5 s.
+    ///
+    /// Marking comes first so a dial loop currently sleeping in backoff sees
+    /// the mark on its next iteration and exits. Dropping the handles stops
+    /// `connected_peers`/`send_*` from routing to a peer that is gone.
+    ///
+    /// This is reversible on purpose: if the node comes back — including on a
+    /// new address, which is the norm under Apple containers — the view
+    /// watcher calls `maintain_peer` again, which clears the mark.
+    pub fn forget_peer(&self, peer: NodeId) {
+        self.forgotten.lock().insert(peer);
+        self.dial_addrs.lock().remove(&peer);
+        let had_conn = self.peers.write().remove(&peer).is_some();
+        // Let the engine tear down cursors/interest exactly as it would for a
+        // disconnect, so a later reappearance re-inits via ResumeFrom.
+        if had_conn {
+            let _ = self.events_tx.send((peer, false));
+        }
+        tracing::info!(peer, had_conn, "peer forgotten: dial loops stop");
+    }
+
+    /// Peers this mesh has deliberately stopped dialing.
+    pub fn forgotten_peers(&self) -> Vec<NodeId> {
+        let mut v: Vec<NodeId> = self.forgotten.lock().iter().copied().collect();
+        v.sort_unstable();
+        v
     }
 
     /// Shared read/write pump for one established connection.
@@ -389,5 +433,49 @@ impl Mesh {
         }
         tracing::info!(peer, ?kind, "peer connection closed");
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mesh() -> Arc<Mesh> {
+        let (incoming_tx, _rx1) = mpsc::channel(8);
+        let (ae_tx, _rx2) = mpsc::channel(8);
+        let (events_tx, _rx3) = mpsc::unbounded_channel();
+        Mesh::new(1, incoming_tx, ae_tx, events_tx, None, None)
+    }
+
+    /// A forgotten peer's dial loops must see the mark and exit; a peer that
+    /// comes back must be dialable again, or a node that briefly left the view
+    /// would be unreachable for the rest of the process's life.
+    #[tokio::test]
+    async fn forget_peer_suppresses_dialing_until_the_peer_returns() {
+        let m = mesh();
+        assert!(!m.dropped(7), "a peer starts dialable");
+
+        m.forget_peer(7);
+        assert!(m.dropped(7), "forgotten peer must stop its dial loops");
+        assert_eq!(m.forgotten_peers(), vec![7]);
+
+        // Reappearance: the view watcher re-dials, which un-forgets.
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        m.clone().maintain_peer(7, addr).await;
+        assert!(
+            !m.dropped(7),
+            "a peer back in the view must be dialable again"
+        );
+        assert!(m.forgotten_peers().is_empty());
+    }
+
+    /// Forgetting is per-peer: it must not disturb other peers' dial state.
+    #[tokio::test]
+    async fn forget_peer_is_scoped_to_one_peer() {
+        let m = mesh();
+        m.forget_peer(3);
+        m.forget_peer(9);
+        assert_eq!(m.forgotten_peers(), vec![3, 9]);
+        assert!(!m.dropped(4));
     }
 }

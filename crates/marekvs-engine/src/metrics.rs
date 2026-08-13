@@ -38,6 +38,13 @@ pub struct Metrics {
     pub mesh_output_bytes_total: IntCounter,
     pub mesh_peers: IntGauge,
     pub mesh_conn_timeouts_total: IntCounter,
+    /// Peers whose dial loops were torn down after they left the membership
+    /// view for longer than MAREKVS_MESH_PEER_GC_SECS (T2-10).
+    pub mesh_peers_forgotten_total: IntCounter,
+    /// Records dropped by cold purge: this node's local copy of a partition it
+    /// no longer owns, released after the delay and the clean-round evidence
+    /// (T2-9). Reclaims the disk that every scale event used to strand.
+    pub cold_purged_records_total: IntCounter,
 
     // --- replication (repl) ---
     pub repl_batches_sent_total: IntCounter,
@@ -283,6 +290,16 @@ impl Metrics {
                 registry,
                 "marekvs_ae_digest_scans_total",
                 "Full partition scans performed to (re)compute a Merkle root (cache misses)"
+            ),
+            mesh_peers_forgotten_total: counter!(
+                registry,
+                "marekvs_mesh_peers_forgotten_total",
+                "Departed peers whose dial loops were torn down by peer GC"
+            ),
+            cold_purged_records_total: counter!(
+                registry,
+                "marekvs_cold_purged_records_total",
+                "Records dropped from partitions this node no longer owns"
             ),
             ae_scan_failures_total: counter!(
                 registry,

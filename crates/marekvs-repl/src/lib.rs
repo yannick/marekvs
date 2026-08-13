@@ -301,6 +301,69 @@ fn bootstrap_rate_bytes_per_sec() -> u64 {
     })
 }
 
+// ---------------------------------------------------------------------------
+// cold purge after ownership loss (T2-9)
+// ---------------------------------------------------------------------------
+
+/// `meta` key holding the ms timestamp at which this node stopped owning `pid`.
+fn cold_marker_key(pid: Pid) -> Vec<u8> {
+    format!("cold:{pid}").into_bytes()
+}
+
+/// `meta` key counting clean stranded-AE exchanges for `pid` since the marker.
+fn cold_ae_key(pid: Pid) -> Vec<u8> {
+    format!("cold_ae:{pid}").into_bytes()
+}
+
+/// How long a partition must sit un-owned before its data may be purged.
+///
+/// Generous by default: the data on an ex-owner is exactly what stranded-record
+/// AE uses as its last-copy safety net, so the cost of waiting is disk and the
+/// cost of being hasty is deleting the only copy of an unshipped write.
+fn cold_purge_delay() -> Duration {
+    static V: OnceLock<Duration> = OnceLock::new();
+    *V.get_or_init(|| {
+        Duration::from_secs(
+            std::env::var("MAREKVS_COLD_PURGE_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or(900),
+        )
+    })
+}
+
+/// Clean stranded-AE exchanges required before a cold partition may be purged.
+/// Each one is positive evidence that a current owner already holds everything
+/// we hold for that pid.
+fn cold_purge_clean_rounds() -> u64 {
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MAREKVS_COLD_PURGE_CLEAN_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(3)
+    })
+}
+
+/// How long a node must be absent from the membership view before its dial
+/// loops are torn down (T2-10). Chitchat's own dead-node grace is an hour;
+/// this is our shorter, independent timer, kept generous enough that a rolling
+/// restart or a brief gossip partition never trips it.
+fn mesh_peer_gc_grace() -> Duration {
+    static V: OnceLock<Duration> = OnceLock::new();
+    *V.get_or_init(|| {
+        Duration::from_secs(
+            std::env::var("MAREKVS_MESH_PEER_GC_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or(300),
+        )
+    })
+}
+
 /// Per-peer unacked send window (bytes). Design/05 defaults table: 4 MiB.
 fn repl_window_bytes() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
@@ -633,6 +696,7 @@ impl ReplEngine {
 
         // 6b. Join-gate bootstrap retry tick.
         repl.clone().spawn_join_retry();
+        repl.clone().spawn_cold_purge();
 
         // 6c. gc_grace rejoin driver (exits immediately when not needed).
         if rejoin_needed {
@@ -844,11 +908,44 @@ impl ReplEngine {
         tokio::spawn(async move {
             let mut watch = self.cluster.watch();
             let mut dialed: HashMap<NodeId, std::net::SocketAddr> = HashMap::new();
+            // First time each dialed peer was seen missing from the view.
+            // Cleared the moment it reappears, so a flapping node never
+            // accumulates towards the grace.
+            let mut absent_since: HashMap<NodeId, Instant> = HashMap::new();
             loop {
                 let view = self.cluster.view();
                 self.ring
                     .members
                     .store(view.members.len(), std::sync::atomic::Ordering::Relaxed);
+                // --- peer GC (T2-10) ---
+                // Departed nodes are otherwise redialed until process exit.
+                // Gossip's own dead-node grace is an hour; this timer is ours
+                // and starts at first absence from the view.
+                let present: HashSet<NodeId> = view.members.iter().map(|m| m.node).collect();
+                let grace = mesh_peer_gc_grace();
+                let mut forget: Vec<NodeId> = Vec::new();
+                for peer in dialed.keys().copied() {
+                    if present.contains(&peer) {
+                        absent_since.remove(&peer);
+                    } else {
+                        let first = *absent_since.entry(peer).or_insert_with(Instant::now);
+                        if first.elapsed() >= grace {
+                            forget.push(peer);
+                        }
+                    }
+                }
+                for peer in forget {
+                    self.mesh.forget_peer(peer);
+                    // Drop the replication state that only made sense while
+                    // the peer existed. A reappearance re-inits the cursor via
+                    // ResumeFrom on reconnect.
+                    self.flows.lock().remove(&peer);
+                    self.interest.lock().remove_peer(peer);
+                    dialed.remove(&peer);
+                    absent_since.remove(&peer);
+                    self.engine.metrics.mesh_peers_forgotten_total.inc();
+                }
+                self.track_ownership_loss().await;
                 for m in &view.members {
                     // Lower id dials (design/04 §Transport). Re-dial when a
                     // restarted peer gossips a NEW mesh address — the old
@@ -1216,6 +1313,195 @@ impl ReplEngine {
         self.gate.lock().rejoin_pending.clear();
         self.engine.metrics.rejoin_active.set(0);
         tracing::info!("gc_grace rejoin complete");
+    }
+
+    // -----------------------------------------------------------------
+    // cold purge after ownership loss (T2-9)
+    // -----------------------------------------------------------------
+
+    /// Stamp partitions this node just stopped owning, and un-stamp ones it
+    /// owns again.
+    ///
+    /// The marker is persisted in `meta` rather than held in memory because the
+    /// purge delay must survive restarts — an ex-owner that bounces every few
+    /// minutes would otherwise reset its clock forever and never reclaim the
+    /// disk, which is the leak this exists to close.
+    async fn track_ownership_loss(&self) {
+        let owned: HashSet<Pid> = self.cluster.owned_pids().into_iter().collect();
+        self.store
+            .run(0, move |ctx| {
+                for pid in 0..marekvs_core::PARTITIONS as Pid {
+                    let key = cold_marker_key(pid);
+                    let marked = matches!(ctx.db.get(&ctx.meta, &key), Ok(v) if v.len() == 8);
+                    if owned.contains(&pid) {
+                        // Owned again: drop the marker AND the evidence count,
+                        // so a later loss starts its delay and its clean-round
+                        // tally from scratch.
+                        if marked {
+                            let _ = ctx.db.delete(&ctx.meta, &key);
+                            let _ = ctx.db.delete(&ctx.meta, &cold_ae_key(pid));
+                        }
+                    } else if !marked {
+                        let _ = ctx.db.put(
+                            &ctx.meta,
+                            &key,
+                            &store::now_ms().to_be_bytes(),
+                            Duration::ZERO,
+                        );
+                        let _ = ctx.db.delete(&ctx.meta, &cold_ae_key(pid));
+                    }
+                }
+            })
+            .await;
+    }
+
+    /// Record one clean stranded-AE exchange for a partition we no longer own:
+    /// an owner answered `MerkleRootMatch`, i.e. it holds exactly what we hold.
+    fn note_clean_cold_round(&self, pid: Pid) {
+        self.store.spawn_on(0, move |ctx| {
+            let key = cold_marker_key(pid);
+            // Only count while the partition is actually marked cold; a match
+            // for an owned pid says nothing about safe-to-purge.
+            if !matches!(ctx.db.get(&ctx.meta, &key), Ok(v) if v.len() == 8) {
+                return;
+            }
+            let k = cold_ae_key(pid);
+            let n = match ctx.db.get(&ctx.meta, &k) {
+                Ok(v) if v.len() == 8 => u64::from_be_bytes(v.as_slice().try_into().unwrap()),
+                _ => 0,
+            };
+            let _ = ctx
+                .db
+                .put(&ctx.meta, &k, &(n + 1).to_be_bytes(), Duration::ZERO);
+        });
+    }
+
+    /// Slow reclaim loop: drop the local copy of partitions this node has not
+    /// owned for a while and that a healthy set of owners provably holds.
+    ///
+    /// Every condition is a fence against deleting a last copy, which is the
+    /// only way this can go wrong:
+    ///
+    /// * the marker must be older than [`cold_purge_delay`];
+    /// * at least [`cold_purge_clean_rounds`] stranded-AE exchanges must have
+    ///   come back **matched** since the marker — direct evidence an owner has
+    ///   our bytes, not merely time passing;
+    /// * the current view must show a full `replicas_n` set of **Active**
+    ///   owners, so we never purge into a degraded cluster;
+    /// * no rejoin may be in progress — a rejoining node is quarantined and its
+    ///   view of ownership is deliberately not trusted (T1-3).
+    fn spawn_cold_purge(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                if self.rejoin.lock().active {
+                    continue;
+                }
+                let delay_ms = cold_purge_delay().as_millis() as u64;
+                let need_rounds = cold_purge_clean_rounds();
+                let n = self.cluster.replicas_n;
+                let view = self.cluster.view();
+                let owned: HashSet<Pid> = self.cluster.owned_pids().into_iter().collect();
+
+                for pid in 0..marekvs_core::PARTITIONS as Pid {
+                    if owned.contains(&pid) {
+                        continue;
+                    }
+                    // Never purge into a degraded cluster: if the owners are
+                    // not all Active we may be holding the redundancy.
+                    let owners = view.owners(pid, n);
+                    let healthy = owners.len() >= n
+                        && owners.iter().all(|o| {
+                            view.members.iter().any(|m| {
+                                m.node == *o && m.phase == marekvs_cluster::NodePhase::Active
+                            })
+                        });
+                    if !healthy {
+                        continue;
+                    }
+
+                    let (aged, rounds) = self
+                        .store
+                        .run(pid, move |ctx| {
+                            let marked = match ctx.db.get(&ctx.meta, &cold_marker_key(pid)) {
+                                Ok(v) if v.len() == 8 => {
+                                    Some(u64::from_be_bytes(v.as_slice().try_into().unwrap()))
+                                }
+                                _ => None,
+                            };
+                            let rounds = match ctx.db.get(&ctx.meta, &cold_ae_key(pid)) {
+                                Ok(v) if v.len() == 8 => {
+                                    u64::from_be_bytes(v.as_slice().try_into().unwrap())
+                                }
+                                _ => 0,
+                            };
+                            let aged = marked
+                                .is_some_and(|at| store::now_ms().saturating_sub(at) >= delay_ms);
+                            (aged, rounds)
+                        })
+                        .await;
+                    if !aged || rounds < need_rounds {
+                        continue;
+                    }
+
+                    match self.purge_partition(pid).await {
+                        Ok(0) => {}
+                        Ok(purged) => {
+                            self.engine
+                                .metrics
+                                .cold_purged_records_total
+                                .inc_by(purged as u64);
+                            tracing::info!(
+                                pid,
+                                purged,
+                                rounds,
+                                "cold purge: dropped local copy of an un-owned partition"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(pid, error = %e, "cold purge scan incomplete");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Physically drop this node's records for `pid`, in bounded chunks.
+    ///
+    /// Deliberately a *local* delete with the commit hook suppressed: this node
+    /// is dropping its own copy, not deleting the record cluster-wide. Letting
+    /// these reach the ring would replicate tombstones to the very owners the
+    /// data was handed to.
+    async fn purge_partition(&self, pid: Pid) -> Result<usize, store::ScanIncomplete> {
+        const CHUNK: usize = 512;
+        let mut total = 0usize;
+        loop {
+            let batch = self
+                .store
+                .run(pid, move |ctx| {
+                    let mut keys: Vec<Vec<u8>> = Vec::new();
+                    store::scan_prefix(ctx, &ikey::partition_prefix(pid), |k, _| {
+                        keys.push(k.to_vec());
+                        keys.len() < CHUNK
+                    })?;
+                    let _g = store::suppress_commit_hook();
+                    for k in &keys {
+                        store::del_raw(ctx, k);
+                    }
+                    Ok::<usize, store::ScanIncomplete>(keys.len())
+                })
+                .await?;
+            total += batch;
+            if batch < CHUNK {
+                return Ok(total);
+            }
+            // Yield between chunks so a large partition cannot monopolize the
+            // shard thread against client traffic.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     fn complete_rejoin_pid(&self, pid: Pid) {
@@ -1803,6 +2089,10 @@ impl ReplEngine {
                 // gc_grace rejoin: this partition is confirmed in sync with
                 // a healthy owner; no-op outside a rejoin.
                 self.complete_rejoin_pid(pid);
+                // Cold purge (T2-9): for a partition we no longer own, a match
+                // is direct evidence that an owner holds exactly our bytes —
+                // the evidence the purge fence requires.
+                self.note_clean_cold_round(pid);
             }
             PeerMsg::MerkleBuckets { pid, digests } => {
                 let Ok(ours) = ae::bucket_digests(&self.store, pid).await else {

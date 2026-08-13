@@ -55,15 +55,20 @@ implicit (design-promised but absent, or stub/no-op in code).
       (`MAREKVS_BOOTSTRAP_RATE_MB`, 64 MiB/s, 0 = unlimited). Chunking of
       `FetchCollectionResp` also still flagged simple-v1
       (`crates/marekvs-proto/src/lib.rs:78`).
-- [ ] **cold_purge_delay (15 m)** — data kept forever after losing
-      ownership (currently *feeds* stranded-record AE; purge needs care).
+- [x] **cold_purge_delay (15 m)** — implemented (T2-9): a partition this node
+      no longer owns is dropped locally after `MAREKVS_COLD_PURGE_SECS`, but
+      only once >=3 stranded-AE exchanges returned MerkleRootMatch, the view
+      shows a full Active owner set, and no rejoin is active. Deletes are
+      local-only (hook suppressed) so they never replicate.
 - [x] **HandoffAck** — resolved 2026-07-05 by removing it from the wire
       (it was never consumed): planned leave now drains the ring until
       every peer has *acked* the head, grace-expiry still falls back to
       crash repair (`design/06-cluster-membership.md`). Wire break —
       whole-cluster upgrade, no mixed-version mesh.
-- [ ] **Mesh peer GC** — disconnected peers are redialed until process exit;
-      view-driven GC is future work (`crates/marekvs-repl/src/mesh.rs:175`).
+- [x] **Mesh peer GC** — implemented (T2-10): a node absent from the view for
+      `MAREKVS_MESH_PEER_GC_SECS` (5 m) has its dial loops torn down and its
+      flow/interest state dropped; a returning node re-dials and re-inits via
+      ResumeFrom.
 - [ ] **MVS.SESSION HLC watermark tokens** for cross-connection
       read-your-writes (`design/04-replication.md:206`, v1.1 optional).
 
