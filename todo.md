@@ -80,7 +80,23 @@ implicit (design-promised but absent, or stub/no-op in code).
       `MAREKVS_NODE_ID < 1024`, enforced at boot. True sequence CRDT (RGA)
       remains future work (`design/02-data-model.md`).
 - [ ] **HINCRBY / INCRBYFLOAT stay LWW** — no PN-counter semantics for hash
-      fields or floats (`design/02:299,302`).
+      fields or floats (`design/02:299,302`). **T2-12 attempted; the written
+      plan is incomplete.** Two findings from the attempt:
+      1. The envelope's rtype field is 3 bits and all 8 values are taken, so
+         `CounterField` needs the field widened to bits 2..5. That widening is
+         backwards-compatible for reads (bit 5 was always 0) but not forwards —
+         hence the feature gate, which is why P0 landed first.
+      2. The plan's step 3 ("merge_values dispatches on rtype → counter merge")
+         is NOT sufficient. Hash fields are OR-elements: the payload is an
+         `ElementState` and `element_value()` returns `live.first()` — a single
+         dot. Two concurrent HINCRBYs on different nodes produce two live dots,
+         both survive the OR merge, and the reader shows only one — the
+         lost-increment bug relocates from LWW to dot-selection rather than
+         being fixed. Routing straight to `merge_counters` instead would lose
+         remove-observation and break HDEL.
+      The design needs to say how counter state folds across live dots (fold at
+      read, or collapse on merge) and how repeated same-node increments cover
+      their own prior dot. Prerequisite P0 is done.
 - [ ] **ORSWOT-lite add-wins races** "believed acceptable" but unproven
       (risky assumption 3, `design/00:136`); >255-way concurrent remove
       history can resurrect a stale add (`design/02:144`).
@@ -139,8 +155,16 @@ implicit (design-promised but absent, or stub/no-op in code).
       full AE cycle (`k8s/README.md` caveats).
 - [ ] **Hot-key H1 offload** — a single mega-hot key lands on one H1
       (risky assumption 5, `design/00:143`, `design/09:77`).
-- [ ] **Zone-aware HRW placement** — topology-blind v1; appears in three
-      docs (`design/07:115`, `design/09:77`, `design/12:147`). One epic.
+- [ ] **Zone-aware HRW placement (T2-11)** — topology-blind v1; appears in
+      three docs (`design/07:115`, `design/09:77`, `design/12:147`). One epic,
+      and the plan sequences it last: it needs `Member.zone` gossiped as
+      chitchat KV, a zone-spread greedy pick over HRW-sorted candidates, and
+      **both** `View::with_tables` and `Cluster::future_owned_pids` routed
+      through the same zone-aware path — they compute ownership separately
+      today, so changing only one would make the join gate and the placement
+      tables disagree. Gate on `MAREKVS_ZONE_AWARE` with a regression-freeze
+      test (unset ⇒ byte-identical placement). Only worth building if you will
+      actually deploy multi-zone.
 
 ## Operator / k8s (ops)
 
