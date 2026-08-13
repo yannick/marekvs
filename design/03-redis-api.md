@@ -49,7 +49,8 @@ as expensive.
 | Commands | Tier |
 |---|---|
 | HSET, HSETNX, HMSET, HGET, HMGET, HGETALL, HDEL, HEXISTS, HLEN, HKEYS, HVALS, HSTRLEN, HRANDFIELD, HSCAN | v1 |
-| HINCRBY, HINCRBYFLOAT | v1 (counter caveat) |
+| HINCRBY | v1 (PN counter, exact across nodes) |
+| HINCRBYFLOAT | v1 (LWW — float slots would drift) |
 | HEXPIRE, HPEXPIRE, HTTL, HPTTL, HPERSIST, HEXPIRETIME, HPEXPIRETIME, HGETEX, HSETEX | v1.1 (field TTL is native in our model) |
 | **EXPIREMEMBER / EXPIREMEMBERAT / PEXPIREMEMBERAT** (KeyDB extension) + `TTL key member` | ✓ — per-member TTL on hash fields, set members, zset members. TTL rides the element envelope (deadline absolute, evaluated locally → converges cluster-wide); expiry becomes an observed-remove via the sweeper |
 
@@ -169,7 +170,7 @@ possible later as string overlay, not v1), OBJECT tiering commands.
 | Area | Behavior |
 |---|---|
 | Atomicity | per key (shard-serialized). Multi-key commands are not atomic across shards; Redis-on-one-box atomicity is **not** preserved for cross-shard MSET/SINTERSTORE — documented. |
-| Counters | **exact across nodes** (v1.1 PN counters) for INCR/DECR/INCRBY/DECRBY; increments racing an explicit SET are dropped (SET-resets semantics). INCRBYFLOAT and HINCRBY remain LWW. |
+| Counters | **exact across nodes** (PN counters) for INCR/DECR/INCRBY/DECRBY and, since T2-12, HINCRBY; increments racing an explicit SET/HSET are dropped (SET-resets semantics). INCRBYFLOAT and HINCRBYFLOAT remain LWW — float addition is not associative. |
 | Read guarantees | read-your-writes + monotonic reads per connection; nothing across connections ([00-overview.md](00-overview.md#published-guarantees-what-we-tell-users)). |
 | WRONGTYPE | checked against head/string key ([02-data-model.md](02-data-model.md#what-a-type-check-reads)). |
 | Expiry | active sweeper + lazy check; `expired` notifications fire on the sweeping node only. |

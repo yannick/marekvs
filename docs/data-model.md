@@ -80,9 +80,9 @@ A fixed **19-byte header** is prefixed to every stored value:
 offset size field
 0      1    flags:  bit0 tombstone
                     bit1 collection-head
-                    bits 2..4 record type (0 string, 1 hash-field, 2 set-member,
+                    bits 2..5 record type (0 string, 1 hash-field, 2 set-member,
                               3 zset-member, 4 list, 5 stream-entry,
-                              6 counter, 7 hll-register)
+                              6 counter, 7 hll-register, 8 counter-field)
 1      8    hlc:    u64 big-endian = [phys_ms:48 | logical:16]
 9      2    origin: NodeId (u16)
 11     8    ttl_deadline_ms: u64 absolute wall-clock ms; 0 = no TTL
@@ -122,6 +122,44 @@ op — always reads the current envelope and **merges**. A blind overwrite never
 happens on the replication path. Every merge is commutative, associative, and
 idempotent, and those laws are enforced by property tests in
 `crates/marekvs-core/tests/merge_laws.rs`.
+
+### Every datatype at a glance
+
+The merge is chosen by the record's type, never by the command that wrote it.
+
+| Datatype | Written by | Storage shape | Merge |
+|---|---|---|---|
+| String | `SET` / `APPEND` / … | one record | Last-writer-wins on `(hlc, origin)` |
+| Counter | `INCR` / `DECR` / `INCRBY` | one record | **PN counter** — base register plus a per-node slot, joined by pointwise max |
+| Hash field | `HSET` / `HDEL` | one record per field | **Observed-remove element**; value is LWW |
+| Hash counter | `HINCRBY` | one record per field | **Observed-remove element with PN-counter value** |
+| Set member | `SADD` / `SREM` | one record per member | **Observed-remove element** (add-wins) |
+| Sorted-set member | `ZADD` / `ZREM` | one record per member | **Observed-remove element**; the score rides the value |
+| List element | `LPUSH` / `RPUSH` / `LSET` | one record per position | LWW per position; positions carry the writing node's id so concurrent pushes on different nodes cannot collide |
+| Stream entry | `XADD` | one record per entry | LWW (ids are unique in practice) |
+| HyperLogLog register | `PFADD` / `PFMERGE` | one record per touched register | **Max lattice** over a one-byte payload |
+| JSON node | `JSON.*` | one record per path | **Per-path CRDT** — see [JSON](../json/) |
+| Protobuf field | `PROTO.*` | one record per field number | **Per-field CRDT** — see [Protobuf](../protobuf/) |
+| Budget | `BG.*` | escrow slots and tokens | **Escrow**, fail-closed — see [Budgets](../budget/) |
+
+Four families cover all of it:
+
+1. **LWW register** — the higher `(hlc, origin)` wins. Used where a later write
+   genuinely should erase an earlier one.
+2. **Observed-remove element** — each add carries its own dot, and a remove
+   records the dots it observed. Used where a concurrent add and remove must
+   both mean something.
+3. **Lattice value** — a join that is order- and repetition-independent by
+   construction (counter slots, HyperLogLog register max). Used where *every*
+   concurrent write must survive, not merely the last one.
+4. **Structural decomposition** — one record per path, field, member or
+   position, so concurrent edits to *different* parts never contend at all.
+   JSON, protobuf, lists and HyperLogLogs are all this, layered on one of the
+   first three per record.
+
+Families 2 and 3 compose: a counter-valued hash field is an observed-remove
+element (so `HDEL` works) whose value is a lattice (so concurrent increments all
+survive).
 
 ### LWW registers
 
@@ -183,10 +221,17 @@ materialize the counter as a decimal string, so `GET` / `STRLEN` / `TYPE` behave
 normally; `APPEND` / `SETRANGE` / `GETSET` / `INCRBYFLOAT` freeze it back into a
 plain string.
 
+`HINCRBY` is a PN counter too. A hash field stays an observed-remove element —
+so `HDEL` and whole-hash `DEL` behave normally — but its *value* becomes counter
+state, and the number you read is the join across every concurrent writer's
+contribution. Two nodes each doing `HINCRBY h f 1` at the same time leave the
+field at 2.
+
 ```note
-`HINCRBY` is last-writer-wins on the result, and `INCRBYFLOAT` is LWW — counter
-semantics inside hash fields and float slots are future work. Same-node
-concurrency is always exact thanks to shard serialization.
+`INCRBYFLOAT` and `HINCRBYFLOAT` remain last-writer-wins: floating-point
+addition is not associative, so per-node float slots would drift apart instead
+of converging. Same-node concurrency is always exact thanks to shard
+serialization.
 ```
 
 ### HyperLogLog
