@@ -180,6 +180,89 @@ pub struct MarekvsClusterStatus {
     pub last_ops_total: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sample_epoch: Option<i64>,
+    /// Standard k8s conditions — the operator's failure surface (T2-14).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<Condition>,
+    /// StatefulSet `rollingUpdate.partition` the controller is currently
+    /// holding during a health-gated image rollout (T2-15). Absent when no
+    /// rollout is in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout_partition: Option<i32>,
+    /// Pods already carrying the target pod template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_nodes: Option<i32>,
+}
+
+/// A standard Kubernetes status condition.
+///
+/// The operator used to fail invisibly: metric scrapes returned empty on
+/// error, PVC-reclaim deletes were `let _ =` discarded, and reconcile errors
+/// only reached the operator's own log. An operator whose failures are
+/// invisible is worse than none — these make `kubectl describe mkv` the
+/// debugging entry point.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Condition {
+    /// `MetricsAvailable` | `ReconcileSucceeded` | `PvcReclaim` |
+    /// `RolloutHealthy`.
+    pub r#type: String,
+    /// `"True"` | `"False"` | `"Unknown"` (k8s uses strings, not bools).
+    pub status: String,
+    /// CamelCase machine-readable cause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// RFC3339. Only rewritten when `status` actually changes, so it means
+    /// "since when", which is what makes it useful in a describe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transition_time: Option<String>,
+}
+
+impl Condition {
+    pub const METRICS_AVAILABLE: &'static str = "MetricsAvailable";
+    pub const RECONCILE_SUCCEEDED: &'static str = "ReconcileSucceeded";
+    pub const PVC_RECLAIM: &'static str = "PvcReclaim";
+    pub const ROLLOUT_HEALTHY: &'static str = "RolloutHealthy";
+
+    pub fn new(r#type: &str, ok: bool, reason: &str, message: impl Into<String>) -> Condition {
+        Condition {
+            r#type: r#type.into(),
+            status: if ok { "True" } else { "False" }.into(),
+            reason: Some(reason.into()),
+            message: Some(message.into()),
+            last_transition_time: None,
+        }
+    }
+}
+
+/// Merge `next` into `prev`, preserving `lastTransitionTime` for conditions
+/// whose `status` did not change.
+///
+/// Kubernetes semantics: the timestamp marks the last *transition*, not the
+/// last observation. Rewriting it every reconcile would make every condition
+/// look like it just changed and destroy the signal.
+pub fn merge_conditions(prev: &[Condition], next: Vec<Condition>, now: &str) -> Vec<Condition> {
+    let mut out: Vec<Condition> = next
+        .into_iter()
+        .map(|mut c| {
+            let carried = prev
+                .iter()
+                .find(|p| p.r#type == c.r#type)
+                .filter(|p| p.status == c.status)
+                .and_then(|p| p.last_transition_time.clone());
+            c.last_transition_time = Some(carried.unwrap_or_else(|| now.to_string()));
+            c
+        })
+        .collect();
+    // Keep any condition this reconcile did not speak to.
+    for p in prev {
+        if !out.iter().any(|c| c.r#type == p.r#type) {
+            out.push(p.clone());
+        }
+    }
+    out.sort_by(|a, b| a.r#type.cmp(&b.r#type));
+    out
 }
 
 pub fn default_nodes() -> i32 {

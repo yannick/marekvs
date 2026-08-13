@@ -132,6 +132,77 @@ pub fn ops_rate(
     Some((total - pt) / dt as f64)
 }
 
+/// Observed rollout state, straight off the StatefulSet status.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RolloutObserved {
+    /// `spec.replicas` the controller settled on this pass.
+    pub replicas: i32,
+    /// Pods passing readiness.
+    pub ready: i32,
+    /// Worst underreplicated count; `None` = metrics unavailable.
+    pub underreplicated: Option<i64>,
+    /// True when the StatefulSet's update revision differs from its current
+    /// revision — i.e. the pod template changed and pods still need replacing.
+    pub revision_changed: bool,
+    /// Pods already carrying the update revision.
+    pub updated: i32,
+    /// `rollingUpdate.partition` the controller published last pass.
+    pub partition: Option<i32>,
+}
+
+/// What to do with `rollingUpdate.partition` this reconcile.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Rollout {
+    /// No template change in flight — let the StatefulSet run unpartitioned.
+    Idle,
+    /// Hold the partition here; the health gate is not satisfied.
+    Blocked(i32),
+    /// Move the partition down to this value, releasing one more pod.
+    Advance(i32),
+    /// Every pod carries the new revision.
+    Done,
+}
+
+/// Health-gated canary walk of `rollingUpdate.partition` (T2-15).
+///
+/// A plain StatefulSet rolling update is gated only on pod *readiness*, and
+/// readiness means "serving", not "the cluster is fully replicated". With
+/// RF=2, restarting pod B while pod A's partitions are still under-replicated
+/// leaves a single-copy window. So the controller drives the rollout itself:
+/// freeze it at `partition == replicas`, then release exactly one pod at a
+/// time, and only while every partition is fully replicated and every pod is
+/// ready.
+///
+/// The gate is deliberately the same one scale-down uses — `underreplicated ==
+/// 0` and all pods ready — because it is the same question: is it safe to take
+/// a node away right now?
+///
+/// Unknown metrics block: without `underreplicated` we cannot prove safety,
+/// and a stuck rollout is visible and recoverable, whereas one that proceeded
+/// blind is neither.
+pub fn rollout_step(o: &RolloutObserved) -> Rollout {
+    if !o.revision_changed {
+        return Rollout::Idle;
+    }
+    if o.updated >= o.replicas {
+        return Rollout::Done;
+    }
+    // First pass of a rollout: freeze before anything is replaced.
+    let current = o.partition.unwrap_or(o.replicas).clamp(0, o.replicas);
+    if o.partition.is_none() && current > 0 {
+        return Rollout::Blocked(current);
+    }
+    let healthy = o.ready >= o.replicas && o.underreplicated == Some(0);
+    if !healthy {
+        return Rollout::Blocked(current);
+    }
+    if current == 0 {
+        // Already fully released; waiting for the last pod to report updated.
+        return Rollout::Blocked(0);
+    }
+    Rollout::Advance(current - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +316,78 @@ mod tests {
     #[test]
     fn stepper_holds_at_target() {
         assert_eq!(next_replicas(4, &obs(4, None)), Step::Hold);
+    }
+
+    fn ro(replicas: i32, partition: Option<i32>) -> RolloutObserved {
+        RolloutObserved {
+            replicas,
+            ready: replicas,
+            underreplicated: Some(0),
+            revision_changed: true,
+            updated: 0,
+            partition,
+        }
+    }
+
+    #[test]
+    fn rollout_is_idle_without_a_template_change() {
+        let mut o = ro(3, None);
+        o.revision_changed = false;
+        assert_eq!(rollout_step(&o), Rollout::Idle);
+    }
+
+    /// The first pass must freeze the rollout, not let k8s replace a pod
+    /// before the controller has looked at cluster health even once.
+    #[test]
+    fn rollout_freezes_before_replacing_anything() {
+        assert_eq!(rollout_step(&ro(3, None)), Rollout::Blocked(3));
+    }
+
+    #[test]
+    fn rollout_releases_one_pod_at_a_time_while_healthy() {
+        assert_eq!(rollout_step(&ro(3, Some(3))), Rollout::Advance(2));
+        assert_eq!(rollout_step(&ro(3, Some(2))), Rollout::Advance(1));
+        assert_eq!(rollout_step(&ro(3, Some(1))), Rollout::Advance(0));
+    }
+
+    /// The whole point: under-replicated means "do not take another node",
+    /// which readiness alone would have allowed.
+    #[test]
+    fn rollout_holds_while_underreplicated() {
+        let mut o = ro(3, Some(2));
+        o.underreplicated = Some(4);
+        assert_eq!(rollout_step(&o), Rollout::Blocked(2));
+    }
+
+    #[test]
+    fn rollout_holds_while_a_pod_is_unready() {
+        let mut o = ro(3, Some(2));
+        o.ready = 2;
+        assert_eq!(rollout_step(&o), Rollout::Blocked(2));
+    }
+
+    /// No metrics = no proof of safety = do not advance.
+    #[test]
+    fn rollout_holds_without_metrics() {
+        let mut o = ro(3, Some(2));
+        o.underreplicated = None;
+        assert_eq!(rollout_step(&o), Rollout::Blocked(2));
+    }
+
+    #[test]
+    fn rollout_completes_when_every_pod_is_updated() {
+        let mut o = ro(3, Some(0));
+        o.updated = 3;
+        assert_eq!(rollout_step(&o), Rollout::Done);
+    }
+
+    /// At partition 0 the last pod is still being replaced; holding (rather
+    /// than reporting Done) keeps the phase honest until the status confirms.
+    #[test]
+    fn rollout_waits_at_zero_for_the_last_pod() {
+        let mut o = ro(3, Some(0));
+        o.updated = 2;
+        assert_eq!(rollout_step(&o), Rollout::Blocked(0));
     }
 
     #[test]

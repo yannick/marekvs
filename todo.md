@@ -144,22 +144,25 @@ implicit (design-promised but absent, or stub/no-op in code).
 
 ## Operator / k8s (ops)
 
-- [ ] **Leader election** — controller must run 1 replica; two would fight
-      over the same field manager (`design/12:130,141`,
-      `k8s/operator/deployment.yaml:8`).
+- [x] **Leader election** — implemented (T2-16): coordination.k8s.io Lease
+      `marekvs-operator-leader` (15 s duration / 10 s renew), only the holder
+      runs the controller stream, loss of the lease exits the process.
 - [ ] **Disk-fill autoscale signal** — the server-side prerequisite exists
       as of 2026-07-05 (`marekvs_db_total_bytes`,
       `marekvs_disk_total_bytes`/`_avail_bytes`, `marekvs_disk_write_stopped`
       + MISCONF write-stop at `MAREKVS_DISK_HIGH_WATER_PCT`); remaining work
       is the operator consuming it (`design/12:142`).
-- [ ] **Health-gated version rollouts** — `spec.image` change is a plain
-      StatefulSet rolling update today (`design/12:144`).
+- [x] **Health-gated version rollouts** — implemented (T2-15): the controller
+      walks `rollingUpdate.partition` down one ordinal at a time, gated on the
+      same check as scale-down (all pods ready AND underreplicated == 0), so a
+      rollout cannot open a single-copy window.
 - [ ] **`kubectl scale` subresource** on the CRD (`design/12:148`,
       `k8s/operator/crd.yaml:189`).
-- [ ] **Silent operator error paths**: metrics scrape failures swallowed
-      (`crates/marekvs-operator/src/main.rs:82-102`), PVC reclaim delete
-      result discarded (`main.rs:245`), reconcile errors only warn-logged,
-      never surfaced on CR status (`main.rs:283-313`).
+- [x] **Silent operator error paths** — implemented (T2-14): status
+      `conditions` (MetricsAvailable / ReconcileSucceeded / PvcReclaim /
+      RolloutHealthy) with k8s lastTransitionTime semantics; scrape reports
+      scraped/eligible and pod-list errors; PVC reclaim failures are reported
+      and retried instead of discarded.
 - [ ] **Flux ImagePolicy/ImageRepository manifests** are docs-only
       (`k8s/README.md:34-48`) — not shipped in `k8s/`.
 - [ ] Placeholders requiring per-cluster edits: storage size + memory
