@@ -223,8 +223,10 @@ implicit (design-promised but absent, or stub/no-op in code).
 
 - Read-after-write across connections unsupported by design
   (`design/00:46`); AP semantics during scale events (`k8s/README.md`).
-- ondaDB commit-hook contract (exactly-once, commit order) is load-bearing
-  (risky assumption 2, `design/00:133`) — regression-tested but a contract,
-  not an invariant marekvs can check.
+- ondaDB commit-hook contract is load-bearing (risky assumption 2,
+  `design/00:133`). Exactly-once and whole-batch delivery are now pinned by
+  `crates/marekvs-engine/tests/commit_hook_contract.rs`; **commit-order
+  delivery was measured false** and is tracked as an open item above. It
+  remains a contract, not an invariant marekvs can check at runtime.
 - Old list `'l'` blobs from pre-v1.1 are not read or migrated
   (`design/02:218`) — recreate lists after upgrade.
