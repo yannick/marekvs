@@ -178,6 +178,44 @@ spec:
           status:
             nullable: true
             properties:
+              conditions:
+                description: Standard k8s conditions — the operator's failure surface (T2-14).
+                items:
+                  description: |-
+                    A standard Kubernetes status condition.
+
+                    The operator used to fail invisibly: metric scrapes returned empty on
+                    error, PVC-reclaim deletes were `let _ =` discarded, and reconcile errors
+                    only reached the operator's own log. An operator whose failures are
+                    invisible is worse than none — these make `kubectl describe mkv` the
+                    debugging entry point.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        RFC3339. Only rewritten when `status` actually changes, so it means
+                        "since when", which is what makes it useful in a describe.
+                      nullable: true
+                      type: string
+                    message:
+                      nullable: true
+                      type: string
+                    reason:
+                      description: CamelCase machine-readable cause.
+                      nullable: true
+                      type: string
+                    status:
+                      description: '`"True"` | `"False"` | `"Unknown"` (k8s uses strings, not bools).'
+                      type: string
+                    type:
+                      description: |-
+                        `MetricsAvailable` | `ReconcileSucceeded` | `PvcReclaim` |
+                        `RolloutHealthy`.
+                      type: string
+                  required:
+                  - status
+                  - type
+                  type: object
+                type: array
               desiredNodes:
                 description: |-
                   The controller's current node-count target (spec.nodes or the
@@ -218,9 +256,22 @@ spec:
                 format: int32
                 nullable: true
                 type: integer
+              rolloutPartition:
+                description: |-
+                  StatefulSet `rollingUpdate.partition` the controller is currently
+                  holding during a health-gated image rollout (T2-15). Absent when no
+                  rollout is in flight.
+                format: int32
+                nullable: true
+                type: integer
               underreplicatedPartitions:
                 description: Worst value observed across nodes; 0 = safe to scale down.
                 format: int64
+                nullable: true
+                type: integer
+              updatedNodes:
+                description: Pods already carrying the target pod template.
+                format: int32
                 nullable: true
                 type: integer
             type: object

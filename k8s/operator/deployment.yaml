@@ -5,7 +5,9 @@ metadata:
   labels:
     app: marekvs-operator
 spec:
-  replicas: 1 # reconciliation is idempotent but not leader-elected yet
+  # Leader-elected via a coordination.k8s.io Lease, so >1 is safe;
+  # 1 is still the sensible default (failover is a pod restart).
+  replicas: 1
   selector:
     matchLabels:
       app: marekvs-operator
@@ -27,6 +29,16 @@ spec:
           env:
             - name: RUST_LOG
               value: info,kube=warn
+            # Leader election: the Lease lives in this namespace and the pod
+            # name is the holder identity, so two replicas never collide.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           resources:
             requests:
               cpu: 50m

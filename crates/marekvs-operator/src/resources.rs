@@ -24,7 +24,11 @@ fn labels(cr: &MarekvsCluster) -> serde_json::Value {
     })
 }
 
-pub fn statefulset(cr: &MarekvsCluster, replicas: i32) -> StatefulSet {
+/// `partition` holds back every pod with a **lower** ordinal from updating, so
+/// `partition == replicas` freezes the rollout entirely and `0` lets it finish.
+/// The controller walks it down one step at a time, gated on cluster health —
+/// see `rollout_partition` in main.rs (T2-15).
+pub fn statefulset(cr: &MarekvsCluster, replicas: i32, partition: i32) -> StatefulSet {
     let name = cr.name_any();
     let ns = cr.namespace().unwrap_or_default();
     let spec = &cr.spec;
@@ -78,6 +82,10 @@ pub fn statefulset(cr: &MarekvsCluster, replicas: i32) -> StatefulSet {
             "serviceName": format!("{name}-headless"),
             "replicas": replicas,
             "podManagementPolicy": "Parallel",
+            "updateStrategy": {
+                "type": "RollingUpdate",
+                "rollingUpdate": {"partition": partition.clamp(0, replicas.max(0))},
+            },
             "selector": {"matchLabels": {"app": name}},
             "template": {
                 "metadata": {"labels": labels(cr)},
@@ -236,7 +244,7 @@ mod tests {
 
     #[test]
     fn statefulset_wires_identity_and_rf() {
-        let sts = statefulset(&cr(), 3);
+        let sts = statefulset(&cr(), 3, 0);
         let spec = sts.spec.unwrap();
         assert_eq!(spec.replicas, Some(3));
         assert_eq!(spec.service_name.as_deref(), Some("demo-headless"));
@@ -260,7 +268,7 @@ mod tests {
     #[test]
     fn children_carry_owner_refs() {
         for owners in [
-            statefulset(&cr(), 3).metadata.owner_references,
+            statefulset(&cr(), 3, 0).metadata.owner_references,
             client_service(&cr()).metadata.owner_references,
             headless_service(&cr()).metadata.owner_references,
             pdb(&cr()).metadata.owner_references,
@@ -273,7 +281,12 @@ mod tests {
 
     #[test]
     fn statefulset_omits_scheduling_when_unset() {
-        let pod = statefulset(&cr(), 3).spec.unwrap().template.spec.unwrap();
+        let pod = statefulset(&cr(), 3, 0)
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap();
         assert!(pod.node_selector.is_none());
         assert!(pod.tolerations.is_none());
         let spread = pod.topology_spread_constraints.unwrap();
@@ -294,7 +307,7 @@ mod tests {
         }];
         cr.spec.hostname_spread_when_unsatisfiable = Some("DoNotSchedule".into());
 
-        let pod = statefulset(&cr, 3).spec.unwrap().template.spec.unwrap();
+        let pod = statefulset(&cr, 3, 0).spec.unwrap().template.spec.unwrap();
         assert_eq!(pod.node_selector.unwrap()["disk"], "nvme");
         let tol = &pod.tolerations.unwrap()[0];
         assert_eq!(tol.key.as_deref(), Some("dedicated"));

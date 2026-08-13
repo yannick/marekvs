@@ -12,6 +12,7 @@
 //! `marekvs-operator crd` prints the CRD YAML (k8s/operator/crd.yaml is
 //! generated from it — `just operator-crd`).
 
+mod lease;
 mod promtext;
 mod resources;
 mod scale;
@@ -30,8 +31,11 @@ use kube::runtime::watcher;
 use kube::{Client, CustomResourceExt, ResourceExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use scale::{autoscale_target, next_replicas, ops_rate, BlockReason, Observed, Step};
-use types::{MarekvsCluster, MarekvsClusterStatus};
+use scale::{
+    autoscale_target, next_replicas, ops_rate, rollout_step, BlockReason, Observed, Rollout,
+    RolloutObserved, Step,
+};
+use types::{Condition, MarekvsCluster, MarekvsClusterStatus};
 
 const MANAGER: &str = "marekvs-operator";
 const RECONCILE_EVERY: Duration = Duration::from_secs(30);
@@ -73,6 +77,12 @@ struct ClusterMetrics {
     /// no node responded at all.
     underreplicated: Option<i64>,
     scraped: usize,
+    /// Pods that were eligible to scrape (have an IP). `scraped` out of this
+    /// many answered — the difference is what the MetricsAvailable condition
+    /// reports, instead of an empty result that looks like a healthy zero.
+    eligible: usize,
+    /// Why listing pods failed, when it did.
+    list_error: Option<String>,
 }
 
 async fn scrape(client: &Client, cr: &MarekvsCluster) -> ClusterMetrics {
@@ -81,22 +91,29 @@ async fn scrape(client: &Client, cr: &MarekvsCluster) -> ClusterMetrics {
     let lp = ListParams::default().labels(&format!("app={}", cr.name_any()));
     let list = match pods.list(&lp).await {
         Ok(l) => l,
-        Err(_) => {
+        Err(e) => {
+            // Previously swallowed: an API failure and a genuinely empty
+            // cluster produced the identical all-None result.
+            tracing::warn!(%e, "listing pods for metrics scrape failed");
             return ClusterMetrics {
                 ops_total: None,
                 underreplicated: None,
                 scraped: 0,
-            }
+                eligible: 0,
+                list_error: Some(e.to_string()),
+            };
         }
     };
     let mut ops = 0.0;
     let mut got_ops = false;
     let mut under: Option<i64> = None;
     let mut scraped = 0;
+    let mut eligible = 0;
     for pod in &list.items {
         let Some(ip) = pod.status.as_ref().and_then(|s| s.pod_ip.clone()) else {
             continue;
         };
+        eligible += 1;
         let Some(body) = fetch_metrics(&ip, 9121).await else {
             continue;
         };
@@ -113,6 +130,8 @@ async fn scrape(client: &Client, cr: &MarekvsCluster) -> ClusterMetrics {
         ops_total: got_ops.then_some(ops),
         underreplicated: under,
         scraped,
+        eligible,
+        list_error: None,
     }
 }
 
@@ -121,6 +140,12 @@ fn now_epoch() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+/// RFC3339 `lastTransitionTime` for status conditions. `jiff` rides in with
+/// k8s-openapi (its `Time` wraps it), so this needs no extra dependency.
+fn rfc3339_now() -> String {
+    k8s_openapi::jiff::Timestamp::now().to_string()
 }
 
 async fn reconcile(cr: Arc<MarekvsCluster>, ctx: Arc<Ctx>) -> Result<Action, Error> {
@@ -222,11 +247,77 @@ async fn reconcile(cr: Arc<MarekvsCluster>, ctx: Arc<Ctx>) -> Result<Action, Err
         }
     };
 
+    // ── health-gated rollout (T2-15) ─────────────────────────────────────
+    // A pod-template change (usually spec.image) is walked pod by pod through
+    // rollingUpdate.partition instead of letting k8s roll on readiness alone,
+    // which does not know about replication.
+    let sts_status = existing.as_ref().and_then(|s| s.status.as_ref());
+    let ro = RolloutObserved {
+        replicas,
+        ready,
+        underreplicated: m.underreplicated,
+        revision_changed: match (
+            sts_status.and_then(|s| s.update_revision.as_deref()),
+            sts_status.and_then(|s| s.current_revision.as_deref()),
+        ) {
+            (Some(u), Some(c)) => u != c,
+            _ => false,
+        },
+        updated: sts_status.and_then(|s| s.updated_replicas).unwrap_or(0),
+        partition: prev.rollout_partition,
+    };
+    let rollout = rollout_step(&ro);
+    let partition = match rollout {
+        Rollout::Idle | Rollout::Done => 0,
+        Rollout::Blocked(p) | Rollout::Advance(p) => p,
+    };
+    let rollout_partition = match rollout {
+        Rollout::Idle | Rollout::Done => None,
+        Rollout::Blocked(p) | Rollout::Advance(p) => Some(p),
+    };
+    // A rollout in flight overrides the scaling phase: it is the thing an
+    // operator is watching, and it is the thing that can get stuck.
+    let (phase, message) = match rollout {
+        Rollout::Advance(p) => (
+            "Updating",
+            format!(
+                "rollout: releasing ordinal {p} ({}/{} pods updated)",
+                ro.updated, replicas
+            ),
+        ),
+        Rollout::Blocked(p) => {
+            let why = if m.underreplicated.is_none() {
+                "metrics unreachable".to_string()
+            } else if m.underreplicated != Some(0) {
+                format!(
+                    "{} partitions under-replicated",
+                    m.underreplicated.unwrap_or(-1)
+                )
+            } else if ready < replicas {
+                format!("{ready}/{replicas} pods ready")
+            } else {
+                "waiting for the released pod to report updated".to_string()
+            };
+            (
+                "Updating",
+                format!(
+                    "rollout held at ordinal {p} ({}/{} updated): {why}",
+                    ro.updated, replicas
+                ),
+            )
+        }
+        Rollout::Idle | Rollout::Done => (phase, message),
+    };
+
     // ── act ──────────────────────────────────────────────────────────────
-    let sts = resources::statefulset(&cr, replicas);
+    let sts = resources::statefulset(&cr, replicas, partition);
     stss.patch(&name, &ssapply, &Patch::Apply(&sts)).await?;
 
     // Reclaim PVCs of retired ordinals once the cluster is provably whole.
+    // Delete failures used to be discarded, so a PVC that never went away —
+    // a stuck finalizer, an RBAC gap — looked exactly like a successful
+    // reclaim. Failures are now reported and retried next reconcile.
+    let mut reclaim_failures: Vec<String> = Vec::new();
     if cr.spec.reclaim_pvcs
         && matches!(step, Step::Hold)
         && m.underreplicated == Some(0)
@@ -242,7 +333,10 @@ async fn reconcile(cr: Arc<MarekvsCluster>, ctx: Arc<Ctx>) -> Result<Action, Err
             if let Some(o) = ordinal {
                 if o >= replicas {
                     tracing::info!(pvc = %pn, "reclaiming PVC of retired ordinal");
-                    let _ = pvcs.delete(&pn, &Default::default()).await;
+                    if let Err(e) = pvcs.delete(&pn, &Default::default()).await {
+                        tracing::warn!(pvc = %pn, %e, "PVC reclaim failed");
+                        reclaim_failures.push(format!("{pn}: {e}"));
+                    }
                 }
             }
         }
@@ -250,6 +344,68 @@ async fn reconcile(cr: Arc<MarekvsCluster>, ctx: Arc<Ctx>) -> Result<Action, Err
 
     // ── publish status ───────────────────────────────────────────────────
     let scaled = replicas != current;
+    let mut conds = vec![
+        match (&m.list_error, m.eligible) {
+            (Some(e), _) => Condition::new(
+                Condition::METRICS_AVAILABLE,
+                false,
+                "PodListFailed",
+                format!("listing pods failed: {e}"),
+            ),
+            (None, 0) => Condition::new(
+                Condition::METRICS_AVAILABLE,
+                false,
+                "NoPods",
+                "no pods with an IP to scrape",
+            ),
+            (None, eligible) if m.scraped < eligible => Condition::new(
+                Condition::METRICS_AVAILABLE,
+                false,
+                "ScrapeFailed",
+                format!("{}/{} pods scraped", m.scraped, eligible),
+            ),
+            (None, eligible) => Condition::new(
+                Condition::METRICS_AVAILABLE,
+                true,
+                "AllScraped",
+                format!("{}/{} pods scraped", m.scraped, eligible),
+            ),
+        },
+        Condition::new(
+            Condition::RECONCILE_SUCCEEDED,
+            true,
+            "Reconciled",
+            message.clone(),
+        ),
+    ];
+    if !matches!(rollout, Rollout::Idle) {
+        conds.push(Condition::new(
+            Condition::ROLLOUT_HEALTHY,
+            !matches!(rollout, Rollout::Blocked(_)) || m.underreplicated == Some(0),
+            match rollout {
+                Rollout::Done => "Complete",
+                Rollout::Advance(_) => "Progressing",
+                _ => "Held",
+            },
+            message.clone(),
+        ));
+    }
+    if !reclaim_failures.is_empty() {
+        conds.push(Condition::new(
+            Condition::PVC_RECLAIM,
+            false,
+            "DeleteFailed",
+            reclaim_failures.join("; "),
+        ));
+    } else if cr.spec.reclaim_pvcs {
+        conds.push(Condition::new(
+            Condition::PVC_RECLAIM,
+            true,
+            "UpToDate",
+            "no retired PVCs pending reclaim",
+        ));
+    }
+    let conditions = types::merge_conditions(&prev.conditions, conds, &rfc3339_now());
     let status = MarekvsClusterStatus {
         phase: Some(phase.into()),
         message: Some(message.clone()),
@@ -268,6 +424,9 @@ async fn reconcile(cr: Arc<MarekvsCluster>, ctx: Arc<Ctx>) -> Result<Action, Err
         } else {
             prev.last_sample_epoch
         },
+        conditions,
+        rollout_partition,
+        updated_nodes: Some(ro.updated),
     };
     crs.patch_status(
         &name,
@@ -277,7 +436,13 @@ async fn reconcile(cr: Arc<MarekvsCluster>, ctx: Arc<Ctx>) -> Result<Action, Err
     .await?;
 
     tracing::info!(cluster = %name, phase, %message, "reconciled");
-    Ok(Action::requeue(RECONCILE_EVERY))
+    // Drive the partition walk promptly instead of waiting out the normal
+    // reconcile period between pods.
+    Ok(Action::requeue(if matches!(rollout, Rollout::Idle) {
+        RECONCILE_EVERY
+    } else {
+        Duration::from_secs(15)
+    }))
 }
 
 fn error_policy(_cr: Arc<MarekvsCluster>, err: &Error, _ctx: Arc<Ctx>) -> Action {
@@ -299,6 +464,17 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let client = Client::try_default().await?;
+
+    // Leader election (T2-16): only the holder runs the controller stream, so
+    // two replicas cannot both server-side-apply the same children or race the
+    // scale stepper. Loss of the lease exits the process.
+    let ns = std::env::var("POD_NAMESPACE").unwrap_or_else(|_| "default".into());
+    let identity = std::env::var("POD_NAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "marekvs-operator".into());
+    tracing::info!(%ns, %identity, "waiting for leadership");
+    lease::acquire_and_keep(client.clone(), &ns, &identity).await?;
+
     let crs: Api<MarekvsCluster> = Api::all(client.clone());
     let stss: Api<StatefulSet> = Api::all(client.clone());
     tracing::info!("marekvs-operator starting");

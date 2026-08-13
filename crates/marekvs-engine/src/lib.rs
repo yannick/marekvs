@@ -216,6 +216,14 @@ pub struct Engine {
     /// replication, AE and bootstrap apply via `apply_op_from` (bypasses
     /// dispatch) and REPLICAOF applies with `Session.internal`.
     pub write_stopped: std::sync::atomic::AtomicBool,
+    /// Every peer in the current view announces `features::COUNTER_FIELD`
+    /// (T2-12), so HINCRBY may write counter-valued hash fields.
+    ///
+    /// False until the replication layer proves it: a pre-T2-12 node decodes
+    /// the record type as `String` and would render the counter payload to a
+    /// client as opaque bytes, so a single un-upgraded peer keeps the whole
+    /// cluster on the old LWW behaviour. Set by the repl stats task.
+    pub counter_fields: std::sync::atomic::AtomicBool,
     /// Stable per-boot run id (40 hex chars, Redis convention).
     pub run_id: String,
     /// Prometheus registry + handles (design/07 §Observability).
@@ -283,6 +291,7 @@ impl Engine {
             cluster_topology: parking_lot::RwLock::new(None),
             replicaof: parking_lot::RwLock::new(None),
             write_stopped: std::sync::atomic::AtomicBool::new(false),
+            counter_fields: std::sync::atomic::AtomicBool::new(false),
             tcp_port: std::sync::atomic::AtomicU16::new(6379),
             clients: std::sync::atomic::AtomicI64::new(0),
             metrics,

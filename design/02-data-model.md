@@ -73,9 +73,10 @@ A fixed **19-byte header** prefixed to every stored value:
 offset size field
 0      1    flags:  bit0 tombstone
                     bit1 collection-head
-                    bits 2..4 type: 0 string, 1 hash-field, 2 set-member,
-                                    3 zset-member, 4 list, 5 stream-entry
-                    bits 5..7 reserved
+                    bits 2..5 type: 0 string,  1 hash-field, 2 set-member,
+                                    3 zset-member, 4 list,   5 stream-entry,
+                                    6 counter, 7 hll-register, 8 counter-field
+                    bits 6..7 reserved
 1      8    hlc: u64 big-endian = [phys_ms:48 | logical:16]
 9      2    origin: NodeId (u16)
 11     8    ttl_deadline_ms: u64 absolute wall-clock ms; 0 = no TTL
@@ -92,7 +93,8 @@ offset size field
 Head-key payload (`flags.collection-head = 1`):
 
 ```
-[ctype: u8]                 1 hash, 2 set, 3 zset, 4 stream, 5 list
+[ctype: u8]                 1 hash, 2 set, 3 zset, 4 stream, 5 list,
+                            6 hll, 7 budget, 8 json, 9 proto
 [del_hlc: u64]              whole-collection tombstone clock (0 = never deleted)
 [stream state, ctype=4]     last_id (u64,u64), max_len config, group state blob
 ```
@@ -119,6 +121,81 @@ The apply path (local command or incoming replication op) always reads the
 current envelope for the internal key and merges. **Blind overwrite never
 happens on the replication path.** All merges are commutative, associative,
 idempotent (verified by property tests, [10-testing.md](10-testing.md#101)).
+
+### Every datatype at a glance
+
+Merge is chosen by the record's `RecordType` (envelope flags bits 2..5), never
+by the command that wrote it. Types documented in their own files are linked.
+
+| Datatype | Written by | Record type | Storage shape | Merge |
+|---|---|---|---|---|
+| String | SET/GETSET/APPEND… | `String` | one record | LWW on `(hlc, origin)` |
+| Counter | INCR/DECR/INCRBY | `Counter` | one record | **PN counter**: LWW base register + per-node `(pos, neg)` slots joined by pointwise max |
+| Hash field | HSET/HDEL | `HashField` | one record per field | **OR-element**; value LWW |
+| Hash counter | HINCRBY | `CounterField` | one record per field | **OR-element + PN counter**, folded across live dots ([below](#counters-v11-pn-counters--stable-increments)) |
+| Set member | SADD/SREM | `SetMember` | one record per member | **OR-element** (ORSWOT-lite, add-wins) |
+| Zset member | ZADD/ZREM | `ZsetMember` | one record per member | **OR-element**; score rides the value |
+| Zset score index | (derived) | `ZsetScore` (`Z`) | one record per member | **Node-local**, never replicated, excluded from AE digests |
+| List element | LPUSH/RPUSH/LSET | `List` @ `ListElem` key | one record per position | LWW per position; positions node-salted so concurrent cross-node pushes cannot collide |
+| Stream entry | XADD | `StreamEntry` | one record per entry | LWW (ids are unique in practice) |
+| HLL register | PFADD/PFMERGE | `HllRegister` | one record per touched register | **Max lattice** on a 1-byte payload |
+| JSON node | JSON.* | `String`/element @ `Json` key | one record per path | **Per-path CRDT** — [16-json.md](16-json.md) |
+| Proto field | PROTO.* | element @ `ProtoField` key | one record per field number | **Per-field CRDT** — [18-proto-field-crdt.md](18-proto-field-crdt.md) |
+| Budget | BG.* | `Budget` | escrow slots + tokens | **Escrow**, fail-closed — [13-budget.md](13-budget.md) |
+| Collection head | (implicit) | head flag set | one per user key | LWW; carries `del_hlc` and the collection's ctype/TTL |
+
+Four merge families cover all of it:
+
+1. **LWW register** — higher `(hlc, origin)` wins. Used where a later write
+   genuinely should erase an earlier one.
+2. **Observed-remove element** — two capped dot lattices (`live`, `covered`).
+   Used where concurrent add and remove must both be meaningful.
+3. **Lattice value** — a join that is commutative/associative/idempotent by
+   construction (PN counter slots, HLL register max). Used where *every*
+   concurrent write must survive, not just the last.
+4. **Structural decomposition** — one record per path/field/position, so
+   concurrent edits to *different* parts never contend at all. JSON, protobuf,
+   lists and HLL are all this, layered on one of the first three per record.
+
+Families 2 and 3 compose: a `CounterField` is an OR-element (so HDEL works)
+whose value is a lattice (so concurrent increments survive).
+
+### Invariants a new merge must not break
+
+These are load-bearing and each one has cost real debugging:
+
+- **Bytes must converge, not just values.** Anti-entropy digests hash the
+  stored record (`record_vhash = xxh3_64(value)`), so two replicas that agree
+  on the *meaning* but differ in bytes repair each other forever. Everything
+  below follows from this.
+- **The merged record must not depend on merge direction.** `merge_values(a,b)`
+  runs on one node and `merge_values(b,a)` on the other. Anything derived from
+  "the incoming side" — including the merged `RecordType` — makes the two
+  encode different bytes. The merged rtype is therefore the deterministic max
+  of both sides, which also makes `CounterField` sticky over `HashField`.
+- **Envelope version = symmetric max** for element merges, with TTL following
+  the version winner. Picking the local or incoming version instead reopens the
+  same direction-dependence.
+- **A CRDT value on an OR-element must be folded across ALL live dots.**
+  `element_value()` returns `live.first()` — one dot. Two nodes writing
+  concurrently produce two live dots and both survive the merge, so reading the
+  first shows one and hides the other. `element_display_value()` folds; use it
+  for any lattice-valued element. This is the subtle one: the record converges
+  correctly while the *read* silently loses data.
+- **Do not put a write-heavy value on a per-write dot.** `covered` is capped at
+  `MAX_TOMB_DOTS` (255) and truncates the oldest; `live` at `MAX_LIVE_DOTS`
+  (4). A value updated unboundedly often (a counter) that mints a fresh dot per
+  write and covers the old one sits permanently at the cap, which turns the
+  ">255-way remove history can resurrect a stale add" hazard from
+  astronomically unlikely into routine. `CounterField` mints a fresh dot but
+  collapses to one entry per origin, so `covered` never grows from
+  incrementing.
+- **Node-local derived state is excluded from digests.** The zset score index
+  (`Z`) is rebuilt locally and never replicated; including it would make two
+  correct replicas disagree.
+- **New record types are gated on a peer feature bit.** A node that does not
+  know a type decodes it as `String` and will hand its payload to a client
+  verbatim. See `features::COUNTER_FIELD` and `Engine::counter_fields`.
 
 ### LWW registers — strings, hash-field values, zset scores, heads, lists
 
@@ -269,11 +346,23 @@ list element  [pid][b'q'][klen][userkey][pos:u64 BE]   payload = raw value bytes
   they **rebuild**: read the live values, tombstone every old position, rewrite
   the new sequence compacted from CENTER (O(n), documented; these are rare).
   Position exhaustion at the u64 edge triggers the same recenter rebuild.
-- **Concurrency caveat (weaker than a sequence CRDT, stronger than the blob):**
-  two nodes pushing concurrently can allocate the **same** position; the
-  element records then merge LWW and **one push is lost — but only that one
-  colliding element**, not the whole push set the blob would have dropped.
-  Ordering across concurrent cross-node writers is best-effort; single-node
+- **Node-salted positions (T2-13).** Positions are allocated on a 1024-wide
+  stride whose low 10 bits carry the **allocating node's id**
+  (`ikey::LIST_POS_STRIDE`). Two nodes pushing concurrently observe the same
+  head/tail and land in the same slot, but at different low bits, so **both
+  elements survive** — the collision that used to lose one push to LWW is now
+  structurally impossible. Their relative order is node-id order: arbitrary,
+  but identical on every node, which is the same guarantee Redis gives for
+  concurrent pushes from different clients. Rebuilds allocate salted positions
+  too, so a rebuild racing a remote push cannot collide with it either.
+
+  Consequences: `MAREKVS_NODE_ID` must be `< 1024` (enforced at boot — a
+  wider id would alias two nodes onto one salt and reintroduce the bug), and
+  LPUSH/RPUSH return the **slot** span, exact for single-node lists and one
+  short per cross-node slot collision. `LLEN` counts live records and is
+  always exact. Headroom is `2^63/1024 ≈ 9×10^15` pushes per direction.
+- **Concurrency caveat (still weaker than a sequence CRDT):** ordering across
+  concurrent cross-node writers is deterministic but arbitrary; single-node
   order is exact (shard serialization). A true sequence CRDT (RGA) remains
   future work. Blocking ops (BLPOP…) poll the same primitives on local state.
 
@@ -305,10 +394,46 @@ no-lost-increments property are enforced in
 `crates/marekvs-core/tests/merge_laws.rs`; the cluster test drives 60
 concurrent INCRs across 3 nodes and asserts exact convergence.
 
-**HINCRBY remains LWW-on-result** (hash fields are OR elements; counter
-semantics inside element records is future work). Same-node concurrency is
-exact everywhere (shard serialization); INCRBYFLOAT remains LWW (f64 slots
-would trade exactness for convergence).
+**HINCRBY is a PN counter too (T2-12).** A hash field stays an OR element —
+HDEL and whole-hash DEL are untouched — but its *value* becomes
+`CounterState`, so concurrent increments on different nodes all survive.
+
+Getting this right needs two things the naive version misses:
+
+- **The visible number is the fold over every live dot, not `live.first()`.**
+  Two nodes incrementing concurrently create two dots and both survive the OR
+  merge; returning the first would show one and hide the other, relocating the
+  lost-increment bug rather than fixing it. `merge::counter_field_value` folds
+  with `CounterState::merge` (a pointwise max), and since both replicas hold
+  the identical `live` set after merging, both fold to the same number.
+- **One live entry per node, via a fresh dot plus a per-origin collapse.**
+  Writing with `element_set` (fresh dot, covering what it observed) would push
+  a dot onto `covered` per increment; that list caps at `MAX_TOMB_DOTS` (255)
+  and truncates the oldest, so a hot counter would sit permanently at the cap
+  — turning the ">255-way remove history can resurrect a stale add" hazard
+  into an everyday event. Reusing one dot per node instead does not work
+  either: the merge dedups by exact dot and cannot order two values on one
+  dot, so the stale value wins. So each increment mints a fresh dot and
+  `collapse_per_origin` keeps only the newest per node: `covered` never grows
+  from incrementing, records stay ~60 bytes however hot the counter is, and a
+  concurrent HDEL stays add-wins like SADD.
+
+Each node publishes only its own slot on its own dot; peers' slots come from
+their own dots via the fold, so records stay O(1) rather than O(nodes) each.
+A plain field incremented for the first time adopts its parsed value as the
+counter base, the same conversion INCR does to a string; a later HSET covers
+the counter's dots and resets it. Arbitrary user bytes are never mistaken for
+counter state — the decoder demands a canonical round-trip **and** at least
+one slot, and the slotless canonical form (19 zero bytes) is unreachable from
+the write path since `bump` always inserts the bumping node's slot.
+
+Counter-valued fields are a data-format change, so writing one is gated on
+every peer in the view announcing `features::COUNTER_FIELD`
+(`Engine::counter_fields`); until then HINCRBY keeps the old LWW behaviour.
+Inspect the per-dot state with `DEBUG COUNTERSTATE <key> <field>`.
+
+Same-node concurrency is exact everywhere (shard serialization); INCRBYFLOAT
+remains LWW (f64 slots would trade exactness for convergence).
 
 ## TTL representation
 

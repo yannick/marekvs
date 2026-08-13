@@ -81,18 +81,29 @@ impl Ring {
 
     /// Append ops committed locally (or applied from a remote origin — the
     /// origin rides along so senders can route correctly).
-    pub fn push(&self, origin: u16, seq_hint: Option<u64>, ops: Vec<ReplOp>) {
+    ///
+    /// **The ring allocates its own sequence numbers.** It used to stamp
+    /// locally-committed ops with ondaDB's `commit_seq`, which was wrong in a
+    /// way that only showed under concurrency: ondaDB assigns `commit_seq`
+    /// while holding the commit guard but runs the hook *after* releasing it,
+    /// so two committing threads can reach the hook in the opposite order to
+    /// their seqs. The buffer then held out-of-order seqs while
+    /// [`read_after`](Self::read_after) filters on `seq > after` and takes the
+    /// first `max` — it assumes a sorted buffer. A buffer of `[seq9, seq3]`
+    /// read one entry at a time ships seq9, advances the cursor to 9, and then
+    /// filters seq3 out **permanently**; that op only ever reaches peers via
+    /// anti-entropy.
+    ///
+    /// Allocating here — under the same lock as the `push_back` — makes the
+    /// buffer sorted by construction, which is the invariant every reader
+    /// already relied on. Nothing outside the ring needs the seq to *be*
+    /// ondaDB's: the persisted `ring:hw`, `BootstrapDone.as_of_seq` and the
+    /// per-origin `cur:{origin}` cursors are all in ring space already.
+    pub fn push(&self, origin: u16, ops: Vec<ReplOp>) {
         let mut g = self.inner.lock();
-        for (i, op) in ops.into_iter().enumerate() {
-            let seq = match seq_hint {
-                Some(s) => s + i as u64,
-                None => {
-                    let s = g.next_local_seq;
-                    g.next_local_seq += 1;
-                    s
-                }
-            };
-            g.next_local_seq = g.next_local_seq.max(seq + 1);
+        for op in ops {
+            let seq = g.next_local_seq;
+            g.next_local_seq += 1;
             g.bytes += op.ikey.len() + op.value.len() + 32;
             g.buf.push_back(RingEntry { seq, origin, op });
         }
@@ -149,7 +160,7 @@ mod tests {
     #[test]
     fn push_read() {
         let r = Ring::new();
-        r.push(1, None, vec![op(1), op(2)]);
+        r.push(1, vec![op(1), op(2)]);
         let (got, gap) = r.read_after(0, 10);
         assert!(!gap);
         assert_eq!(got.len(), 2);
@@ -158,12 +169,75 @@ mod tests {
         assert_eq!(got.len(), 1);
     }
 
+    /// The buffer must be sorted by seq: `read_after` filters `seq > after`
+    /// and then takes the first `max`, so an out-of-order entry sitting behind
+    /// a higher one is skipped forever once the cursor passes it.
+    ///
+    /// This is the invariant that broke when the ring stamped ops with
+    /// ondaDB's `commit_seq` — that hook does not run in seq order. Pushing
+    /// from many threads here is the same shape as many shard threads
+    /// committing concurrently.
+    #[test]
+    fn concurrent_pushes_keep_the_buffer_seq_sorted() {
+        use std::sync::Arc as StdArc;
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 500;
+
+        let r = Ring::new();
+        let barrier = StdArc::new(std::sync::Barrier::new(THREADS));
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let r = StdArc::clone(&r);
+                let barrier = StdArc::clone(&barrier);
+                s.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..PER_THREAD {
+                        r.push(t as u16, vec![op(t as u8)]);
+                    }
+                });
+            }
+        });
+
+        let (entries, _) = r.read_after(0, THREADS * PER_THREAD);
+        assert_eq!(
+            entries.len(),
+            THREADS * PER_THREAD,
+            "lost or duplicated ops"
+        );
+        for w in entries.windows(2) {
+            assert!(
+                w[1].seq > w[0].seq,
+                "ring buffer is not seq-sorted ({} after {}) — read_after would \
+                 permanently skip the lower entry",
+                w[1].seq,
+                w[0].seq
+            );
+        }
+
+        // Draining one entry at a time — the case that actually loses ops when
+        // the buffer is unsorted — must visit every op exactly once.
+        let mut cursor = 0u64;
+        let mut drained = 0usize;
+        loop {
+            let (batch, _) = r.read_after(cursor, 1);
+            let Some(e) = batch.first() else { break };
+            cursor = e.seq;
+            drained += 1;
+        }
+        assert_eq!(
+            drained,
+            THREADS * PER_THREAD,
+            "one-at-a-time drain skipped ops"
+        );
+    }
+
     #[test]
     fn gap_detection() {
         let r = Ring::new();
         // Overflow by op count
         for i in 0..(RING_MAX_OPS + 10) {
-            r.push(1, None, vec![op((i % 250) as u8)]);
+            r.push(1, vec![op((i % 250) as u8)]);
         }
         let (_, gap) = r.read_after(0, 1);
         assert!(gap, "cursor at 0 must be reported as gapped");

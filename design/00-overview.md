@@ -92,7 +92,7 @@ pods may observe divergent values inside the staleness bound.
 
 | Term | Meaning |
 |---|---|
-| **Partition** (`pid`) | One of 4096 fixed key buckets: `pid = xxh3_64(userkey) >> 52`. Every internal storage key is prefixed with its pid, making a partition a contiguous ondaDB key range. |
+| **Partition** (`pid`) | One of 4096 fixed key buckets: `pid = crc16(hash_slice(userkey)) % 16384 >> 2` — the key's Redis Cluster slot, four consecutive slots per pid, so a pid is the exact slot range `[pid*4, pid*4+3]` and `CLUSTER SLOTS` reports real ranges (design/15). `hash_slice` applies Redis hash tags: `{...}` content only, when non-empty. Every internal storage key is prefixed with its pid, making a partition a contiguous ondaDB key range. |
 | **Home replicas** `H(p)` | The N nodes durably responsible for partition p, chosen by rendezvous hashing over the gossip membership view. |
 | **Primary home** `H1(p)` | The highest-rendezvous-score alive home. Coordinates interest fan-out and serves fetches. Not a consistency primary — any home accepts writes. |
 | **Interest replica** | A non-home node that cached a key on demand and holds a live lease subscribing it to updates. |

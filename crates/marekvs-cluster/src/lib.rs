@@ -15,7 +15,47 @@ use marekvs_core::NodeId;
 use parking_lot::RwLock;
 use tokio::sync::watch;
 
-pub use placement::owners_for;
+pub use placement::{owners_for, owners_for_zoned, Candidate};
+
+/// This node's failure domain (`MAREKVS_ZONE`), gossiped so peers can spread
+/// replicas across zones. Empty/unset = unlabelled.
+pub fn self_zone() -> Option<String> {
+    static V: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        std::env::var("MAREKVS_ZONE")
+            .ok()
+            .map(|z| z.trim().to_string())
+            .filter(|z| !z.is_empty())
+    })
+    .clone()
+}
+
+/// Whether placement spreads a partition's replicas across zones (T2-11).
+///
+/// Off by default, and it **must be uniform cluster-wide**: two nodes
+/// disagreeing compute different owners for the same partition, which is the
+/// same class of split as a REPLICAS_N mismatch. `Cluster::rebuild_view` logs
+/// an ERROR when a peer's placement config hash differs from ours.
+///
+/// Turning it on for a live cluster reshuffles ownership, so the data movement
+/// runs through the normal join/bootstrap machinery (rate-limited by
+/// `MAREKVS_BOOTSTRAP_RATE_MB`); watch `marekvs_cluster_underreplicated_partitions`
+/// for progress. Treat the flip as a maintenance operation.
+pub fn zone_spread_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        matches!(
+            std::env::var("MAREKVS_ZONE_AWARE").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        )
+    })
+}
+
+/// Hash of the settings every node must agree on for placement to converge.
+/// Gossiped so a mismatch is loud instead of silently splitting ownership.
+fn placement_config_hash(replicas_n: usize) -> String {
+    format!("rf{}z{}", replicas_n, u8::from(zone_spread_enabled()))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodePhase {
@@ -66,6 +106,9 @@ pub struct Member {
     /// reported as config-epoch in CLUSTER NODES/INFO.
     pub generation: u64,
     pub phase: NodePhase,
+    /// Failure domain from `MAREKVS_ZONE` (k8s downward API from
+    /// `topology.kubernetes.io/zone`), gossiped. `None` = unlabelled.
+    pub zone: Option<String>,
 }
 
 /// Immutable placement view derived from the current gossip state.
@@ -99,10 +142,11 @@ impl View {
             tbl_n: n,
         };
         let candidates = view.owner_candidates();
+        let zone_spread = zone_spread_enabled();
         let mut owners_tbl = Vec::with_capacity(PARTITIONS as usize);
         let mut h1_tbl = Vec::with_capacity(PARTITIONS as usize);
         for pid in 0..PARTITIONS {
-            let owners = owners_for(&candidates, pid, n);
+            let owners = owners_for_zoned(&candidates, pid, n, zone_spread);
             h1_tbl.push(view.h1_uncached(&owners));
             owners_tbl.push(owners);
         }
@@ -111,11 +155,15 @@ impl View {
         view
     }
 
-    pub fn owner_candidates(&self) -> Vec<(NodeId, bool)> {
+    pub fn owner_candidates(&self) -> Vec<Candidate> {
         self.members
             .iter()
             .filter(|m| m.phase.owns_data())
-            .map(|m| (m.node, m.phase == NodePhase::Active))
+            .map(|m| Candidate {
+                node: m.node,
+                active: m.phase == NodePhase::Active,
+                zone: m.zone.clone(),
+            })
             .collect()
     }
 
@@ -124,7 +172,7 @@ impl View {
         if n == self.tbl_n && !self.owners_tbl.is_empty() {
             return self.owners_tbl[pid as usize].clone();
         }
-        owners_for(&self.owner_candidates(), pid, n)
+        owners_for_zoned(&self.owner_candidates(), pid, n, zone_spread_enabled())
     }
 
     /// Table-backed membership test without allocating.
@@ -215,11 +263,17 @@ impl Cluster {
             catchup_callback: None,
             extra_liveness_predicate: None,
         };
-        let initial_kvs = vec![
+        let mut initial_kvs = vec![
             ("mesh_addr".to_string(), cfg.mesh_advertise.to_string()),
             ("resp_addr".to_string(), cfg.resp_advertise.to_string()),
             ("state".to_string(), NodePhase::Joining.as_str().to_string()),
+            // Placement settings every node must agree on; a mismatch splits
+            // ownership silently, so it is gossiped and checked on every view.
+            ("pcfg".to_string(), placement_config_hash(cfg.replicas_n)),
         ];
+        if let Some(z) = self_zone() {
+            initial_kvs.push(("zone".to_string(), z));
+        }
         let handle = spawn_chitchat(config, initial_kvs, &UdpTransport).await?;
 
         let (view_tx, _) = watch::channel(0u64);
@@ -277,10 +331,37 @@ impl Cluster {
                 resp_addr: state.get("resp_addr").and_then(|a| a.parse().ok()),
                 generation: id.generation_id,
                 phase,
+                zone: state
+                    .get("zone")
+                    .filter(|z| !z.is_empty())
+                    .map(String::from),
             });
         }
         members.sort_by_key(|m| m.node);
         members.dedup_by_key(|m| m.node);
+
+        // Placement config must be uniform: a node computing ownership under a
+        // different RF or zone-awareness setting disagrees about who owns what,
+        // and the disagreement is invisible until reads go missing. Loud, every
+        // view change, rather than a startup-only check that a later rollout
+        // could slip past.
+        let ours = placement_config_hash(self.replicas_n);
+        for (id, state) in &nodes {
+            let Some(theirs) = state.get("pcfg") else {
+                continue;
+            };
+            if theirs != ours {
+                tracing::error!(
+                    peer = %id.node_id,
+                    ours = %ours,
+                    theirs = %theirs,
+                    "PLACEMENT CONFIG MISMATCH: this peer computes different \
+                     partition owners than we do (check MAREKVS_REPLICAS_N and \
+                     MAREKVS_ZONE_AWARE are identical cluster-wide)"
+                );
+            }
+        }
+
         tracing::info!(?members, epoch, "membership view updated");
         *self.view.write() = Arc::new(View::with_tables(members, epoch, self.replicas_n));
         let _ = self.view_tx.send(epoch);
@@ -341,11 +422,18 @@ impl Cluster {
     pub fn future_owned_pids(&self) -> Vec<Pid> {
         let view = self.view();
         let mut candidates = view.owner_candidates();
-        if !candidates.iter().any(|(id, _)| *id == self.self_id) {
-            candidates.push((self.self_id, true));
+        if !candidates.iter().any(|c| c.node == self.self_id) {
+            candidates.push(Candidate {
+                node: self.self_id,
+                active: true,
+                zone: self_zone(),
+            });
         }
         (0..PARTITIONS)
-            .filter(|pid| owners_for(&candidates, *pid, self.replicas_n).contains(&self.self_id))
+            .filter(|pid| {
+                owners_for_zoned(&candidates, *pid, self.replicas_n, zone_spread_enabled())
+                    .contains(&self.self_id)
+            })
             .collect()
     }
 
@@ -356,10 +444,14 @@ impl Cluster {
     pub fn future_co_owners(&self, pid: Pid) -> Vec<NodeId> {
         let view = self.view();
         let mut candidates = view.owner_candidates();
-        if !candidates.iter().any(|(id, _)| *id == self.self_id) {
-            candidates.push((self.self_id, true));
+        if !candidates.iter().any(|c| c.node == self.self_id) {
+            candidates.push(Candidate {
+                node: self.self_id,
+                active: true,
+                zone: self_zone(),
+            });
         }
-        owners_for(&candidates, pid, self.replicas_n)
+        owners_for_zoned(&candidates, pid, self.replicas_n, zone_spread_enabled())
             .into_iter()
             .filter(|o| *o != self.self_id)
             .collect()
@@ -371,7 +463,8 @@ impl Cluster {
         let mut under = 0usize;
         let mut min_rf = usize::MAX;
         for pid in 0..PARTITIONS {
-            let rf = owners_for(&candidates, pid, self.replicas_n).len();
+            let rf =
+                owners_for_zoned(&candidates, pid, self.replicas_n, zone_spread_enabled()).len();
             min_rf = min_rf.min(rf);
             if rf < self.replicas_n {
                 under += 1;

@@ -76,7 +76,8 @@ resets the counter. See [counters](../data-model/#counters).
 | `HTTL` `HPTTL` `HEXPIRETIME` `HPEXPIRETIME` `HPERSIST` | Read or clear field-level TTL metadata. |
 | `HGETEX` | Return fields and optionally set `EX`/`PX`/`EXAT`/`PXAT` or `PERSIST`. |
 | `HSETEX` | Set field/value pairs using `FVS n field value ...`; supports `FNX`/`FXX`, expiry options, and `KEEPTTL`. |
-| `HINCRBY` `HINCRBYFLOAT` | Field arithmetic. |
+| `HINCRBY` | Field arithmetic. A PN counter: concurrent increments on different nodes all survive. |
+| `HINCRBYFLOAT` | Field arithmetic. Last-writer-wins — float addition is not associative, so per-node slots would drift. |
 | `HRANDFIELD` `HSCAN` | Sample / iterate. |
 
 ## Sets
@@ -204,7 +205,7 @@ last-writer-wins on whole documents. Full guide: [JSON documents](../json/).
 |---|---|
 | `JSON.SET` `JSON.GET` `JSON.MGET` `JSON.MSET` | Both path dialects (`$…` JSONPath, legacy `.a.b[3]`); `MSET` not atomic across keys. |
 | `JSON.DEL` `JSON.FORGET` `JSON.TYPE` `JSON.CLEAR` | Subtree delete wins over concurrent interior edits; add-wins per record. |
-| `JSON.NUMINCRBY` `JSON.NUMMULTBY` | LWW under concurrency (like `HINCRBY`). |
+| `JSON.NUMINCRBY` `JSON.NUMMULTBY` | LWW under concurrency (unlike `HINCRBY`, which is a PN counter). |
 | `JSON.STRAPPEND` `JSON.STRLEN` `JSON.TOGGLE` | Scalar ops. |
 | `JSON.ARRAPPEND` `JSON.ARRINDEX` `JSON.ARRINSERT` `JSON.ARRLEN` `JSON.ARRPOP` `JSON.ARRTRIM` | Arrays are RGA sequences: concurrent appends all survive, runs never interleave. |
 | `JSON.OBJKEYS` `JSON.OBJLEN` | Lexicographic key order. |

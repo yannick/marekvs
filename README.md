@@ -15,7 +15,7 @@
 <p align="center">
   <a href="https://github.com/yannick/marekvs/actions/workflows/docker.yml"><img src="https://github.com/yannick/marekvs/actions/workflows/docker.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/yannick/marekvs/actions/workflows/pages.yml"><img src="https://github.com/yannick/marekvs/actions/workflows/pages.yml/badge.svg" alt="Docs"></a>
-  <img src="https://img.shields.io/badge/rust-1.85%2B-CE422B?logo=rust&logoColor=white" alt="Rust 1.85+">
+  <img src="https://img.shields.io/badge/rust-1.89%2B-CE422B?logo=rust&logoColor=white" alt="Rust 1.89+">
   <img src="https://img.shields.io/badge/API-Redis%20RESP2%2F3-DC382D?logo=redis&logoColor=white" alt="Redis RESP2/3">
   <img src="https://img.shields.io/badge/Kubernetes-operator-326CE5?logo=kubernetes&logoColor=white" alt="Kubernetes operator">
   <img src="https://img.shields.io/badge/license-proprietary-lightgrey" alt="License: proprietary">
@@ -181,6 +181,8 @@ what `just apple-up` automates via `tests/apple_cluster.sh`).
 | `MAREKVS_ADVERTISE_IP` | `127.0.0.1` | IP/hostname peers should use |
 | `MAREKVS_SEEDS` | — | comma-separated gossip seeds (`host:7946`) |
 | `MAREKVS_REPLICAS_N` | `3` | home replicas per partition |
+| `MAREKVS_ZONE` | — | failure domain, gossiped for zone-aware placement |
+| `MAREKVS_ZONE_AWARE` | `0` | spread a partition's replicas across zones; **must be identical cluster-wide** |
 | `MAREKVS_REQUIREPASS` | — | optional AUTH password |
 
 ### Storage engine (ondaDB)

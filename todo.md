@@ -55,25 +55,37 @@ implicit (design-promised but absent, or stub/no-op in code).
       (`MAREKVS_BOOTSTRAP_RATE_MB`, 64 MiB/s, 0 = unlimited). Chunking of
       `FetchCollectionResp` also still flagged simple-v1
       (`crates/marekvs-proto/src/lib.rs:78`).
-- [ ] **cold_purge_delay (15 m)** — data kept forever after losing
-      ownership (currently *feeds* stranded-record AE; purge needs care).
+- [x] **cold_purge_delay (15 m)** — implemented (T2-9): a partition this node
+      no longer owns is dropped locally after `MAREKVS_COLD_PURGE_SECS`, but
+      only once >=3 stranded-AE exchanges returned MerkleRootMatch, the view
+      shows a full Active owner set, and no rejoin is active. Deletes are
+      local-only (hook suppressed) so they never replicate.
 - [x] **HandoffAck** — resolved 2026-07-05 by removing it from the wire
       (it was never consumed): planned leave now drains the ring until
       every peer has *acked* the head, grace-expiry still falls back to
       crash repair (`design/06-cluster-membership.md`). Wire break —
       whole-cluster upgrade, no mixed-version mesh.
-- [ ] **Mesh peer GC** — disconnected peers are redialed until process exit;
-      view-driven GC is future work (`crates/marekvs-repl/src/mesh.rs:175`).
+- [x] **Mesh peer GC** — implemented (T2-10): a node absent from the view for
+      `MAREKVS_MESH_PEER_GC_SECS` (5 m) has its dial loops torn down and its
+      flow/interest state dropped; a returning node re-dials and re-inits via
+      ResumeFrom.
 - [ ] **MVS.SESSION HLC watermark tokens** for cross-connection
       read-your-writes (`design/04-replication.md:206`, v1.1 optional).
 
 ## CRDT / data-model semantic gaps (documented, unproven or lossy)
 
-- [ ] **List position collisions**: concurrent cross-node pushes can land on
-      the same position → one push lost; true sequence CRDT (RGA) is future
-      work (`design/02-data-model.md:266`).
-- [ ] **HINCRBY / INCRBYFLOAT stay LWW** — no PN-counter semantics for hash
-      fields or floats (`design/02:299,302`).
+- [x] **List position collisions**: concurrent cross-node pushes could land on
+      the same position → one push lost. — fixed (T2-13): positions are salted
+      with the node id on a 1024-wide stride, so both pushes survive. Requires
+      `MAREKVS_NODE_ID < 1024`, enforced at boot. True sequence CRDT (RGA)
+      remains future work (`design/02-data-model.md`).
+- [x] **HINCRBY is a PN counter** (T2-12) — hash fields keep OR-element
+      semantics but their value is `CounterState`; the visible number is the
+      fold over every live dot, and a per-origin collapse keeps one entry per
+      node so `covered` never grows from incrementing. Gated on every peer
+      announcing `features::COUNTER_FIELD` (P0). **INCRBYFLOAT stays LWW** by
+      design — f64 slots are not associative and would drift
+      (`design/02-data-model.md`).
 - [ ] **ORSWOT-lite add-wins races** "believed acceptable" but unproven
       (risky assumption 3, `design/00:136`); >255-way concurrent remove
       history can resurrect a stale add (`design/02:144`).
@@ -132,27 +144,44 @@ implicit (design-promised but absent, or stub/no-op in code).
       full AE cycle (`k8s/README.md` caveats).
 - [ ] **Hot-key H1 offload** — a single mega-hot key lands on one H1
       (risky assumption 5, `design/00:143`, `design/09:77`).
-- [ ] **Zone-aware HRW placement** — topology-blind v1; appears in three
-      docs (`design/07:115`, `design/09:77`, `design/12:147`). One epic.
+- [x] **Zone-aware HRW placement (T2-11)** — `MAREKVS_ZONE` is gossiped and
+      `MAREKVS_ZONE_AWARE=1` makes `owners_for_zoned` walk HRW score order
+      greedily, taking a candidate only if its zone is not yet represented and
+      falling back to score order for the rest (so fewer zones than RF, or
+      unlabelled nodes, still fill every slot). Placement settings are hashed
+      into a gossiped `pcfg` key and a mismatch logs PLACEMENT CONFIG MISMATCH
+      on every view change. The candidate type changed from a tuple to
+      `Candidate` specifically so the compiler forced every ownership path —
+      `View::with_tables`, `View::owners`, `future_owned_pids`,
+      `future_co_owners`, `cluster_stats` — through the same function.
+      Regression-frozen: with the flag off, placement is identical to plain HRW
+      for all 4096 pids.
+      Remaining: no chaos `zone_loss` scenario yet (needs per-node zones in the
+      docker harness), and k8s has no downward API for node labels, so
+      `MAREKVS_ZONE` must come from a per-zone StatefulSet or an initContainer
+      (documented in `k8s/statefulset.yaml`).
 
 ## Operator / k8s (ops)
 
-- [ ] **Leader election** — controller must run 1 replica; two would fight
-      over the same field manager (`design/12:130,141`,
-      `k8s/operator/deployment.yaml:8`).
+- [x] **Leader election** — implemented (T2-16): coordination.k8s.io Lease
+      `marekvs-operator-leader` (15 s duration / 10 s renew), only the holder
+      runs the controller stream, loss of the lease exits the process.
 - [ ] **Disk-fill autoscale signal** — the server-side prerequisite exists
       as of 2026-07-05 (`marekvs_db_total_bytes`,
       `marekvs_disk_total_bytes`/`_avail_bytes`, `marekvs_disk_write_stopped`
       + MISCONF write-stop at `MAREKVS_DISK_HIGH_WATER_PCT`); remaining work
       is the operator consuming it (`design/12:142`).
-- [ ] **Health-gated version rollouts** — `spec.image` change is a plain
-      StatefulSet rolling update today (`design/12:144`).
+- [x] **Health-gated version rollouts** — implemented (T2-15): the controller
+      walks `rollingUpdate.partition` down one ordinal at a time, gated on the
+      same check as scale-down (all pods ready AND underreplicated == 0), so a
+      rollout cannot open a single-copy window.
 - [ ] **`kubectl scale` subresource** on the CRD (`design/12:148`,
       `k8s/operator/crd.yaml:189`).
-- [ ] **Silent operator error paths**: metrics scrape failures swallowed
-      (`crates/marekvs-operator/src/main.rs:82-102`), PVC reclaim delete
-      result discarded (`main.rs:245`), reconcile errors only warn-logged,
-      never surfaced on CR status (`main.rs:283-313`).
+- [x] **Silent operator error paths** — implemented (T2-14): status
+      `conditions` (MetricsAvailable / ReconcileSucceeded / PvcReclaim /
+      RolloutHealthy) with k8s lastTransitionTime semantics; scrape reports
+      scraped/eligible and pod-list errors; PVC reclaim failures are reported
+      and retried instead of discarded.
 - [ ] **Flux ImagePolicy/ImageRepository manifests** are docs-only
       (`k8s/README.md:34-48`) — not shipped in `k8s/`.
 - [ ] Placeholders requiring per-cluster edits: storage size + memory
@@ -173,16 +202,20 @@ implicit (design-promised but absent, or stub/no-op in code).
       `pop_hints` pop-cursor workaround (`store.rs`) still earns its keep.
 - [ ] Known bench gaps vs KeyDB: SPOP/ZPOPMIN ~0.15×, MSET ~0.10×
       (`design/09:129`) — measured pre-0.7.8, stale.
-- [ ] `proto_crdt::oneof_race_converges_identically_both_orders` is **flaky at
-      ~50 %** ("oneof winner depends on order"): the oneof tie-break is not
-      order-independent. Pre-existing and unrelated to the storage engine —
-      measured 4/8 failures on `defc648` against ondaDB 0.2.0, 5/8 on the same
-      commit against 0.7.8, 4/8 on the 0.7.8 upgrade branch.
-- [ ] Commit-hook delivery is not seq-ordered (pre-existing; see
-      `tests/commit_hook_contract.rs`). `Ring::read_after` assumes a sorted
-      buffer, so an out-of-order op can be skipped and left to anti-entropy.
-      Decide between sorting on push and letting `Ring::push` allocate its own
-      monotonic seq; both need a chaos/churn run.
+- [x] `proto_crdt::oneof_race_converges_identically_both_orders` was **flaky at
+      ~50 %** — a test bug, not a product bug. It re-ran the scenario on fresh
+      stores and compared winners ACROSS runs; the oneof winner is LWW on
+      `(hlc, origin)`, so fresh wall-clock HLCs legitimately pick differently.
+      The real invariant (replicas agree, exactly one member live) never
+      failed. Now the conflicting records are produced once and replayed into
+      fresh replicas in both delivery orders — same inputs, so the comparison
+      means something. 20/20 runs pass.
+- [x] Commit-hook delivery is not seq-ordered (pre-existing; see
+      `tests/commit_hook_contract.rs`). `Ring::read_after` assumed a sorted
+      buffer, so an out-of-order op could be skipped and left to anti-entropy.
+      — fixed: `Ring::push` now allocates its own monotonic seq under the
+      buffer lock, so the ring is sorted by construction and no longer depends
+      on ondaDB's hook ordering.
 - [ ] LINSERT/LREM/LTRIM O(n) rebuilds (`design/02:261`).
 - [ ] mimalloc vs jemalloc decision still open (`design/08:41`).
 - [ ] Interest table exact-key memory (blooms rejected for now,

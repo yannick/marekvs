@@ -69,6 +69,29 @@ spec:
               value: "2" # replication factor; every partition on 2 nodes
             - name: MAREKVS_DATA_DIR
               value: /data
+            # Zone-aware placement (T2-11), opt-in and multi-zone only.
+            #
+            # MAREKVS_ZONE is this node's failure domain, gossiped so peers can
+            # spread a partition's replicas across zones. NOTE: the downward
+            # API can only read the POD's own labels, and
+            # topology.kubernetes.io/zone lives on the NODE — there is no
+            # fieldRef for it. Supply it one of these ways:
+            #   * one StatefulSet per zone, each with a literal MAREKVS_ZONE
+            #     and a nodeSelector pinning it there (simplest, no RBAC);
+            #   * an initContainer with get-node RBAC that reads the node's
+            #     label and writes it to a shared env file.
+            # Leaving it unset is safe: placement degrades to plain HRW.
+            #
+            # MAREKVS_ZONE_AWARE turns the spreading on and MUST be identical
+            # on every node — a mismatch splits ownership, and nodes log
+            # PLACEMENT CONFIG MISMATCH when they detect one. Enabling it on a
+            # live cluster reshuffles ownership, so treat the flip as a
+            # maintenance operation and watch
+            # marekvs_cluster_underreplicated_partitions drain.
+            # - name: MAREKVS_ZONE
+            #   value: "eu-central-1a"
+            # - name: MAREKVS_ZONE_AWARE
+            #   value: "1"
             - name: RUST_LOG
               value: info
           volumeMounts:

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! offset size field
-//! 0      1    flags: bit0 tombstone, bit1 collection-head, bits 2..4 type
+//! 0      1    flags: bit0 tombstone, bit1 collection-head, bits 2..5 type
 //! 1      8    hlc  (big-endian)
 //! 9      2    origin NodeId (big-endian)
 //! 11     8    ttl_deadline_ms, absolute wall ms; 0 = no TTL (big-endian)
@@ -27,8 +27,20 @@ pub enum RecordType {
     /// PN-counter (v1.1): hybrid base-register + per-node delta slots.
     Counter = 6,
     /// One HyperLogLog register (bucket → max rank); payload = 1 byte.
-    /// Merge is payload max — the last free slot in the 3-bit type field.
+    /// Merge is payload max.
     HllRegister = 7,
+    /// A hash field holding PN-counter state instead of opaque bytes (T2-12),
+    /// so concurrent HINCRBYs on different nodes all survive.
+    ///
+    /// Still an OR-element — HDEL and whole-hash DEL work unchanged; only the
+    /// *value* is a lattice. See `merge::counter_field_value`.
+    ///
+    /// This widened the type field from 3 bits to 4. Widening is
+    /// backwards-compatible for reads (bit 5 was always 0 in records written
+    /// before it, since every rtype was <= 7), but NOT forwards-compatible: a
+    /// pre-T2-12 node decodes type 8 as `String`. Writing one is therefore
+    /// gated on every peer announcing `features::COUNTER_FIELD`.
+    CounterField = 8,
 }
 
 impl RecordType {
@@ -41,6 +53,7 @@ impl RecordType {
             5 => RecordType::StreamEntry,
             6 => RecordType::Counter,
             7 => RecordType::HllRegister,
+            8 => RecordType::CounterField,
             _ => RecordType::String,
         }
     }
@@ -49,7 +62,10 @@ impl RecordType {
     pub fn is_or_element(self) -> bool {
         matches!(
             self,
-            RecordType::HashField | RecordType::SetMember | RecordType::ZsetMember
+            RecordType::HashField
+                | RecordType::SetMember
+                | RecordType::ZsetMember
+                | RecordType::CounterField
         )
     }
 }
@@ -104,7 +120,7 @@ impl Envelope {
     }
 
     pub fn rtype(&self) -> RecordType {
-        RecordType::from_bits((self.flags >> 2) & 0b111)
+        RecordType::from_bits((self.flags >> 2) & 0b1111)
     }
 
     /// LWW total order: `(hlc, origin)`.
@@ -214,5 +230,50 @@ mod tests {
         assert_eq!(t.rtype(), RecordType::HashField);
         let h = Envelope::head(5, 0);
         assert!(h.is_head());
+    }
+}
+
+#[cfg(test)]
+mod counter_field_tests {
+    use super::*;
+
+    /// The type field widened from 3 bits to 4. Records written before that
+    /// never set bit 5, so every pre-existing type must still decode to
+    /// itself — this is the on-disk compatibility guard.
+    #[test]
+    fn widening_the_type_field_preserves_old_types() {
+        for old in 0u8..=7 {
+            let flags = old << 2;
+            assert_eq!(
+                RecordType::from_bits((flags >> 2) & 0b1111),
+                RecordType::from_bits(old),
+                "type {old} changed meaning when the field widened"
+            );
+        }
+    }
+
+    #[test]
+    fn counter_field_round_trips_through_the_envelope() {
+        let e = Envelope::new(RecordType::CounterField, 42, 7);
+        let bytes = e.encode_with(b"payload");
+        let (d, pay) = Envelope::decode(&bytes).expect("decodes");
+        assert_eq!(d.rtype(), RecordType::CounterField);
+        assert_eq!(pay, b"payload");
+        assert!(!d.is_tombstone());
+    }
+
+    /// A counter field is still an OR-element: HDEL must keep working.
+    #[test]
+    fn counter_field_is_an_or_element() {
+        assert!(RecordType::CounterField.is_or_element());
+    }
+
+    /// Tombstone and collection-head bits must survive alongside the wider
+    /// type — they live below it and the widening grew upwards.
+    #[test]
+    fn flag_bits_are_independent_of_the_wider_type() {
+        let t = Envelope::tombstone(RecordType::CounterField, 1, 1);
+        assert_eq!(t.rtype(), RecordType::CounterField);
+        assert!(t.is_tombstone());
     }
 }
