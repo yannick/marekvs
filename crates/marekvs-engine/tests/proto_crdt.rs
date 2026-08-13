@@ -93,6 +93,41 @@ async fn seed_fmt1(e: &Arc<Engine>, key: &[u8], msg: &[u8], del_hlc: u64, ttl_de
 
 /// Copy every proto record of `key` (head + `'p'` field records) from `src`
 /// to `dst`, applying them through `write_merged` in the given delivery order.
+/// Snapshot a key's head + proto-field records, exactly what replication
+/// ships. Used to replay the SAME records in different delivery orders.
+async fn capture_proto(src: &Arc<Engine>, key: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let k = key.to_vec();
+    src.store
+        .run_key(&k.clone(), move |ctx| {
+            let mut out = Vec::new();
+            if let Some(h) = store::get_raw(ctx, &ikey::head_key(&k)) {
+                out.push((ikey::head_key(&k), h));
+            }
+            store::scan_prefix(
+                ctx,
+                &ikey::collection_prefix(ikey::Tag::ProtoField, &k),
+                |ik, v| {
+                    out.push((ik.to_vec(), v.to_vec()));
+                    true
+                },
+            )
+            .unwrap();
+            out
+        })
+        .await
+}
+
+async fn apply_proto(dst: &Arc<Engine>, key: &[u8], records: Vec<(Vec<u8>, Vec<u8>)>) {
+    let key = key.to_vec();
+    dst.store
+        .run_key(&key, move |ctx| {
+            for (ik, v) in records {
+                store::write_merged(ctx, &ik, &v);
+            }
+        })
+        .await;
+}
+
 async fn replicate_proto(src: &Arc<Engine>, dst: &Arc<Engine>, key: &[u8], reverse: bool) {
     let k = key.to_vec();
     let mut records: Vec<(Vec<u8>, Vec<u8>)> = src
@@ -264,33 +299,64 @@ async fn concurrent_map_disjoint_keys_and_same_key_add_wins() {
     assert_eq!(gf(&e1, b"rec:1", b"m.k").await, Reply::Int(9), "add-wins");
 }
 
+/// A oneof race must converge to the SAME winner regardless of the order the
+/// two writes are delivered in.
+///
+/// The winner itself is decided by LWW on `(hlc, origin)`, so it depends on
+/// which write got the higher HLC — a wall-clock fact that differs run to run.
+/// An earlier version of this test re-ran the whole scenario on fresh stores
+/// and compared the winners across runs; that compares *different inputs* and
+/// failed about half the time. It never indicated a product bug: the real
+/// invariant (both replicas agree, exactly one member live) held every time.
+///
+/// So: produce the two conflicting records ONCE, then replay those exact bytes
+/// into fresh replicas in both orders. Same inputs, different delivery order,
+/// same result — which is the property that actually matters.
 #[tokio::test]
 async fn oneof_race_converges_identically_both_orders() {
+    let (_d1, e1) = setup(1).await;
+    let (_d2, e2) = setup(2).await;
+    setjson(&e1, b"rec:1", br#"{"a":"init"}"#).await;
+    replicate_proto(&e1, &e2, b"rec:1", false).await;
+
+    // Two nodes set different members of the same oneof, concurrently.
+    setfield(&e1, b"rec:1", b"label", b"L").await; // member 5
+    setfield(&e2, b"rec:1", b"code", b"7").await; // member 6
+
+    let from_1 = capture_proto(&e1, b"rec:1").await;
+    let from_2 = capture_proto(&e2, b"rec:1").await;
+
     let mut winners = Vec::new();
-    for reverse_second in [false, true] {
-        let (_d1, e1) = setup(1).await;
-        let (_d2, e2) = setup(2).await;
-        setjson(&e1, b"rec:1", br#"{"a":"init"}"#).await;
-        replicate_proto(&e1, &e2, b"rec:1", false).await;
-
-        setfield(&e1, b"rec:1", b"label", b"L").await; // member 5
-        setfield(&e2, b"rec:1", b"code", b"7").await; // member 6
-
-        replicate_proto(&e1, &e2, b"rec:1", false).await;
-        replicate_proto(&e2, &e1, b"rec:1", reverse_second).await;
-        replicate_proto(&e1, &e2, b"rec:1", false).await;
-
-        let v1 = getjson(&e1, b"rec:1").await;
-        let v2 = getjson(&e2, b"rec:1").await;
-        assert_eq!(v1, v2, "oneof replicas diverged");
-        // exactly one member is live
-        let has_label = v1.get("label").is_some();
-        let has_code = v1.get("code").is_some();
-        assert!(has_label ^ has_code, "oneof must have one winner: {v1}");
-        winners.push(v1);
+    for order in [
+        vec![from_1.clone(), from_2.clone()],
+        vec![from_2.clone(), from_1.clone()],
+    ] {
+        let (_d, e) = setup(3).await;
+        for batch in order {
+            apply_proto(&e, b"rec:1", batch).await;
+        }
+        let v = getjson(&e, b"rec:1").await;
+        let has_label = v.get("label").is_some();
+        let has_code = v.get("code").is_some();
+        assert!(
+            has_label ^ has_code,
+            "oneof must have exactly one winner: {v}"
+        );
+        winners.push(v);
     }
-    // deterministic across delivery orders
-    assert_eq!(winners[0], winners[1], "oneof winner depends on order");
+    assert_eq!(
+        winners[0], winners[1],
+        "the oneof winner depends on delivery order"
+    );
+
+    // And the two original replicas converge to that same state once they
+    // have exchanged both ways.
+    replicate_proto(&e1, &e2, b"rec:1", false).await;
+    replicate_proto(&e2, &e1, b"rec:1", false).await;
+    let v1 = getjson(&e1, b"rec:1").await;
+    let v2 = getjson(&e2, b"rec:1").await;
+    assert_eq!(v1, v2, "oneof replicas diverged");
+    assert_eq!(v1, winners[0], "replicas disagree with the replayed winner");
 }
 
 // ---------------------------------------------------------------------------

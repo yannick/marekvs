@@ -202,11 +202,14 @@ implicit (design-promised but absent, or stub/no-op in code).
       `pop_hints` pop-cursor workaround (`store.rs`) still earns its keep.
 - [ ] Known bench gaps vs KeyDB: SPOP/ZPOPMIN ~0.15×, MSET ~0.10×
       (`design/09:129`) — measured pre-0.7.8, stale.
-- [ ] `proto_crdt::oneof_race_converges_identically_both_orders` is **flaky at
-      ~50 %** ("oneof winner depends on order"): the oneof tie-break is not
-      order-independent. Pre-existing and unrelated to the storage engine —
-      measured 4/8 failures on `defc648` against ondaDB 0.2.0, 5/8 on the same
-      commit against 0.7.8, 4/8 on the 0.7.8 upgrade branch.
+- [x] `proto_crdt::oneof_race_converges_identically_both_orders` was **flaky at
+      ~50 %** — a test bug, not a product bug. It re-ran the scenario on fresh
+      stores and compared winners ACROSS runs; the oneof winner is LWW on
+      `(hlc, origin)`, so fresh wall-clock HLCs legitimately pick differently.
+      The real invariant (replicas agree, exactly one member live) never
+      failed. Now the conflicting records are produced once and replayed into
+      fresh replicas in both delivery orders — same inputs, so the comparison
+      means something. 20/20 runs pass.
 - [x] Commit-hook delivery is not seq-ordered (pre-existing; see
       `tests/commit_hook_contract.rs`). `Ring::read_after` assumed a sorted
       buffer, so an out-of-order op could be skipped and left to anti-entropy.
