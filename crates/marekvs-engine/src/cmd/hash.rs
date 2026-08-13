@@ -13,7 +13,8 @@ use crate::Engine;
 use marekvs_core::envelope::{head, Envelope, RecordType};
 use marekvs_core::ikey;
 use marekvs_core::merge::{
-    element_add, element_add_ttl, element_dots, element_remove, element_value,
+    element_add, element_add_ttl, element_display_value, element_dots, element_remove,
+    element_value,
 };
 
 pub(crate) fn hash_del_hlc(ctx: &ShardCtx, key: &[u8]) -> Result<u64, ()> {
@@ -30,7 +31,7 @@ pub(crate) fn hash_entries(ctx: &ShardCtx, key: &[u8], del: u64) -> Vec<(Vec<u8>
         |k, v| {
             if let (Some(p), Some((env, pay))) = (ikey::parse(k), Envelope::decode(v)) {
                 if visible(&env, pay, del, now).is_some() {
-                    if let Some(val) = element_value(pay) {
+                    if let Some(val) = element_display_value(env.rtype(), pay) {
                         out.push((p.suffix.to_vec(), val));
                     }
                 }
@@ -47,6 +48,98 @@ fn field_exists(ctx: &ShardCtx, key: &[u8], field: &[u8], del: u64) -> bool {
 
 fn read_element_checked(ctx: &ShardCtx, key: &[u8], field: &[u8], del: u64) -> Option<Vec<u8>> {
     read_element(ctx, &ikey::hash_field_key(key, field), del)
+}
+
+/// HINCRBY as a PN counter (T2-12).
+///
+/// The field stays an OR-element — HDEL and whole-hash DEL are untouched — but
+/// its value becomes `CounterState`, so two nodes incrementing concurrently
+/// each grow their own slot and the fold recovers both. Under the old LWW
+/// write, one of the two increments was simply lost.
+///
+/// The new record COVERS the dots it observed, which keeps the live set at one
+/// entry per concurrent writer instead of growing per increment, and makes a
+/// later HSET (which covers these dots in turn) reset the counter — the
+/// element-level form of Redis's "SET resets the counter".
+///
+/// Returns the new value, or `Err` for a non-integer field / overflow.
+///
+/// Exposed for `tests/hash_counter.rs`, which drives two real stores and
+/// replicates between them — the write path's observed-dot bookkeeping is
+/// exactly what the pure merge-law tests cannot reach.
+#[doc(hidden)]
+pub fn incr_counter_field_for_test(
+    ctx: &ShardCtx,
+    key: &[u8],
+    field: &[u8],
+    delta: i64,
+    del: u64,
+) -> Result<i64, &'static str> {
+    incr_counter_field(ctx, key, field, delta, del)
+}
+
+fn incr_counter_field(
+    ctx: &ShardCtx,
+    key: &[u8],
+    field: &[u8],
+    delta: i64,
+    del: u64,
+) -> Result<i64, &'static str> {
+    use marekvs_core::counter::CounterState;
+    use marekvs_core::merge::{counter_field_set, counter_field_state};
+
+    let ikey_bytes = ikey::hash_field_key(key, field);
+    let prior = get_raw(ctx, &ikey_bytes).and_then(|raw| {
+        let (env, pay) = Envelope::decode(&raw)?;
+        visible(&env, pay, del, now_ms())?;
+        Some(pay.to_vec())
+    });
+
+    // The agreed state across every live dot. `CounterState::merge` is a
+    // pointwise max, so folding is idempotent and cannot double-count.
+    let folded = match prior.as_deref() {
+        None => CounterState::default(),
+        Some(pay) => match counter_field_state(pay) {
+            Some(c) => c,
+            // First increment of a plain field: adopt its parsed value as the
+            // counter base, the same conversion INCR does to a string
+            // (crate::counter §Interop).
+            None => {
+                let cur = element_value(pay)
+                    .and_then(|v| String::from_utf8(v).ok())
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+                    .ok_or("ERR hash value is not an integer")?;
+                CounterState::on_base(ctx.hlc.now(), ctx.node_id, cur)
+            }
+        },
+    };
+
+    let new = folded
+        .value()
+        .ok_or("ERR hash value is not an integer")?
+        .checked_add(delta)
+        .ok_or("ERR increment or decrement would overflow")?;
+
+    // Publish ONLY this node's slot on this node's dot: peers' slots are
+    // recovered from their own dots by the fold, so restating them would bloat
+    // every record to O(nodes) without adding information.
+    let (pos, neg) = folded
+        .slots
+        .iter()
+        .find(|(n, _, _)| *n == ctx.node_id)
+        .map(|(_, p, n)| (*p, *n))
+        .unwrap_or((0, 0));
+    let mut mine = CounterState {
+        base_hlc: folded.base_hlc,
+        base_origin: folded.base_origin,
+        base: folded.base,
+        slots: vec![(ctx.node_id, pos, neg)],
+    };
+    mine.bump(ctx.node_id, delta);
+
+    let rec = counter_field_set(ctx.hlc.now(), ctx.node_id, prior.as_deref(), &mine.encode());
+    write_merged(ctx, &ikey_bytes, &rec);
+    Ok(new)
 }
 
 fn write_field(ctx: &ShardCtx, key: &[u8], field: &[u8], value: &[u8]) {
@@ -280,7 +373,7 @@ fn read_field_env(
     let raw = get_raw(ctx, &ikey::hash_field_key(key, field))?;
     let (env, pay) = Envelope::decode(&raw)?;
     visible(&env, pay, del, now_ms())?;
-    let value = element_value(pay)?;
+    let value = element_display_value(env.rtype(), pay)?;
     Some((env, value))
 }
 
@@ -762,12 +855,26 @@ pub async fn hincrby(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     };
     let (key, field) = (args[1].clone(), args[2].clone());
     engine.ensure_local(&key).await;
+    // Counter-valued fields are a data-format change: hold off until every
+    // peer announces it, or an un-upgraded node would serve the counter
+    // payload to clients as opaque bytes (see Engine::counter_fields).
+    let as_counter = engine
+        .counter_fields
+        .load(std::sync::atomic::Ordering::Relaxed);
     engine
         .store
         .run_key(&args[1], move |ctx| {
             let Ok(del) = hash_del_hlc(ctx, &key) else {
                 return Reply::wrongtype();
             };
+            ensure_head(ctx, &key, head::CTYPE_HASH);
+            if as_counter {
+                return match incr_counter_field(ctx, &key, &field, delta, del) {
+                    Ok(new) => Reply::Int(new),
+                    Err(e) => Reply::err(e),
+                };
+            }
+            // Legacy LWW path: concurrent cross-node increments lose one.
             let cur: i64 = match read_element_checked(ctx, &key, &field, del) {
                 None => 0,
                 Some(v) => match std::str::from_utf8(&v).ok().and_then(|s| s.parse().ok()) {
@@ -778,7 +885,6 @@ pub async fn hincrby(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             let Some(new) = cur.checked_add(delta) else {
                 return Reply::err("ERR increment or decrement would overflow");
             };
-            ensure_head(ctx, &key, head::CTYPE_HASH);
             write_field(ctx, &key, &field, new.to_string().as_bytes());
             Reply::Int(new)
         })

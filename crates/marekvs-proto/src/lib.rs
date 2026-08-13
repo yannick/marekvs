@@ -57,10 +57,15 @@ pub const PROTO_VERSION: u16 = 2;
 /// mesh silently mis-merges. Allocate a bit in the same change that starts
 /// emitting the thing it guards, so `ALL` never over-promises.
 pub mod features {
-    /// Everything this build can do. No optional capabilities yet: the
-    /// negotiation exists so the next data-format change (e.g. T2-12's
-    /// counter-valued hash fields) can roll out instead of needing a flag day.
-    pub const ALL: u32 = 0;
+    /// The peer understands `RecordType::CounterField`: a hash field whose
+    /// value is PN-counter state rather than opaque bytes (T2-12). Without
+    /// this bit a peer decodes the record type as `String` and would hand the
+    /// counter payload to a client verbatim, so HINCRBY stays LWW until every
+    /// peer announces it.
+    pub const COUNTER_FIELD: u32 = 1 << 0;
+
+    /// Everything this build can do.
+    pub const ALL: u32 = COUNTER_FIELD;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -397,12 +402,17 @@ mod proto_tests {
     }
 
     /// `ALL` must never announce a bit this build does not actually honour:
-    /// a peer trusting it would send data this node mis-merges.
+    /// a peer trusting it would send data this node mis-merges. Update this
+    /// only together with the code that honours the new bit.
+    ///
+    /// `COUNTER_FIELD` is honoured by `RecordType::CounterField` +
+    /// `merge::counter_field_value` (marekvs-core) and gated for writing by
+    /// `Engine::counter_fields` (set from `update_counter_field_gate`).
     #[test]
     fn announced_features_are_implemented() {
         assert_eq!(
             features::ALL,
-            0,
+            features::COUNTER_FIELD,
             "a capability bit was added to ALL — confirm the code that honours \
              it landed in the same change"
         );

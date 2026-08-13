@@ -550,6 +550,58 @@ pub fn time() -> Reply {
 }
 
 pub async fn debug(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    // DEBUG COUNTERSTATE <key> <field>: the same for a counter-valued hash
+    // field (T2-12). Reports every live dot separately AND the fold, because
+    // the whole point is that the visible number is the fold — a per-dot view
+    // is how you see which node contributed what.
+    if args.len() == 4 && eq_ignore_case(&args[1], "COUNTERSTATE") {
+        let (key, field) = (args[2].clone(), args[3].clone());
+        return engine
+            .store
+            .run_key(&args[2], move |ctx| {
+                let ik = marekvs_core::ikey::hash_field_key(&key, &field);
+                let Some(raw) = crate::store::get_raw(ctx, &ik) else {
+                    return Reply::Null;
+                };
+                let Some((env, pay)) = marekvs_core::envelope::Envelope::decode(&raw) else {
+                    return Reply::err("ERR undecodable record");
+                };
+                if env.rtype() != marekvs_core::envelope::RecordType::CounterField {
+                    return Reply::err("ERR not a counter field");
+                }
+                let Some(st) = marekvs_core::merge::ElementState::decode(pay) else {
+                    return Reply::err("ERR undecodable element");
+                };
+                let mut out = format!(
+                    "hlc={} origin={} dots={}",
+                    env.hlc,
+                    env.origin,
+                    st.live.len()
+                );
+                for (dot, v) in &st.live {
+                    out.push_str(&format!(" [n{}@{}", dot.origin, dot.hlc));
+                    match marekvs_core::counter::CounterState::decode(v) {
+                        Some(c) => {
+                            out.push_str(&format!(
+                                " base=({},{},{})",
+                                c.base_hlc, c.base_origin, c.base
+                            ));
+                            for (node, pos, neg) in &c.slots {
+                                out.push_str(&format!(" n{node}:+{pos}-{neg}"));
+                            }
+                        }
+                        None => out.push_str(" opaque"),
+                    }
+                    out.push(']');
+                }
+                match marekvs_core::merge::counter_field_value(pay) {
+                    Some(v) => out.push_str(&format!(" value={v}")),
+                    None => out.push_str(" value=none"),
+                }
+                Reply::Bulk(out.into_bytes())
+            })
+            .await;
+    }
     // DEBUG COUNTERSTATE <key>: raw PN state — base(hlc,origin,val) + slots.
     // Reads strictly locally (no read-through) so divergence is observable.
     if args.len() == 3 && eq_ignore_case(&args[1], "COUNTERSTATE") {

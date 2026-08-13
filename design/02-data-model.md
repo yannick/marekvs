@@ -317,10 +317,46 @@ no-lost-increments property are enforced in
 `crates/marekvs-core/tests/merge_laws.rs`; the cluster test drives 60
 concurrent INCRs across 3 nodes and asserts exact convergence.
 
-**HINCRBY remains LWW-on-result** (hash fields are OR elements; counter
-semantics inside element records is future work). Same-node concurrency is
-exact everywhere (shard serialization); INCRBYFLOAT remains LWW (f64 slots
-would trade exactness for convergence).
+**HINCRBY is a PN counter too (T2-12).** A hash field stays an OR element —
+HDEL and whole-hash DEL are untouched — but its *value* becomes
+`CounterState`, so concurrent increments on different nodes all survive.
+
+Getting this right needs two things the naive version misses:
+
+- **The visible number is the fold over every live dot, not `live.first()`.**
+  Two nodes incrementing concurrently create two dots and both survive the OR
+  merge; returning the first would show one and hide the other, relocating the
+  lost-increment bug rather than fixing it. `merge::counter_field_value` folds
+  with `CounterState::merge` (a pointwise max), and since both replicas hold
+  the identical `live` set after merging, both fold to the same number.
+- **One live entry per node, via a fresh dot plus a per-origin collapse.**
+  Writing with `element_set` (fresh dot, covering what it observed) would push
+  a dot onto `covered` per increment; that list caps at `MAX_TOMB_DOTS` (255)
+  and truncates the oldest, so a hot counter would sit permanently at the cap
+  — turning the ">255-way remove history can resurrect a stale add" hazard
+  into an everyday event. Reusing one dot per node instead does not work
+  either: the merge dedups by exact dot and cannot order two values on one
+  dot, so the stale value wins. So each increment mints a fresh dot and
+  `collapse_per_origin` keeps only the newest per node: `covered` never grows
+  from incrementing, records stay ~60 bytes however hot the counter is, and a
+  concurrent HDEL stays add-wins like SADD.
+
+Each node publishes only its own slot on its own dot; peers' slots come from
+their own dots via the fold, so records stay O(1) rather than O(nodes) each.
+A plain field incremented for the first time adopts its parsed value as the
+counter base, the same conversion INCR does to a string; a later HSET covers
+the counter's dots and resets it. Arbitrary user bytes are never mistaken for
+counter state — the decoder demands a canonical round-trip **and** at least
+one slot, and the slotless canonical form (19 zero bytes) is unreachable from
+the write path since `bump` always inserts the bumping node's slot.
+
+Counter-valued fields are a data-format change, so writing one is gated on
+every peer in the view announcing `features::COUNTER_FIELD`
+(`Engine::counter_fields`); until then HINCRBY keeps the old LWW behaviour.
+Inspect the per-dot state with `DEBUG COUNTERSTATE <key> <field>`.
+
+Same-node concurrency is exact everywhere (shard serialization); INCRBYFLOAT
+remains LWW (f64 slots would trade exactness for convergence).
 
 ## TTL representation
 

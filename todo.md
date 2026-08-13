@@ -79,24 +79,13 @@ implicit (design-promised but absent, or stub/no-op in code).
       with the node id on a 1024-wide stride, so both pushes survive. Requires
       `MAREKVS_NODE_ID < 1024`, enforced at boot. True sequence CRDT (RGA)
       remains future work (`design/02-data-model.md`).
-- [ ] **HINCRBY / INCRBYFLOAT stay LWW** — no PN-counter semantics for hash
-      fields or floats (`design/02:299,302`). **T2-12 attempted; the written
-      plan is incomplete.** Two findings from the attempt:
-      1. The envelope's rtype field is 3 bits and all 8 values are taken, so
-         `CounterField` needs the field widened to bits 2..5. That widening is
-         backwards-compatible for reads (bit 5 was always 0) but not forwards —
-         hence the feature gate, which is why P0 landed first.
-      2. The plan's step 3 ("merge_values dispatches on rtype → counter merge")
-         is NOT sufficient. Hash fields are OR-elements: the payload is an
-         `ElementState` and `element_value()` returns `live.first()` — a single
-         dot. Two concurrent HINCRBYs on different nodes produce two live dots,
-         both survive the OR merge, and the reader shows only one — the
-         lost-increment bug relocates from LWW to dot-selection rather than
-         being fixed. Routing straight to `merge_counters` instead would lose
-         remove-observation and break HDEL.
-      The design needs to say how counter state folds across live dots (fold at
-      read, or collapse on merge) and how repeated same-node increments cover
-      their own prior dot. Prerequisite P0 is done.
+- [x] **HINCRBY is a PN counter** (T2-12) — hash fields keep OR-element
+      semantics but their value is `CounterState`; the visible number is the
+      fold over every live dot, and a per-origin collapse keeps one entry per
+      node so `covered` never grows from incrementing. Gated on every peer
+      announcing `features::COUNTER_FIELD` (P0). **INCRBYFLOAT stays LWW** by
+      design — f64 slots are not associative and would drift
+      (`design/02-data-model.md`).
 - [ ] **ORSWOT-lite add-wins races** "believed acceptable" but unproven
       (risky assumption 3, `design/00:136`); >255-way concurrent remove
       history can resurrect a stale add (`design/02:144`).

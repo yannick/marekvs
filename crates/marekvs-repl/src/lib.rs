@@ -758,6 +758,7 @@ impl ReplEngine {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let m = &self.engine.metrics;
                 self.update_disk_guard(&mut fs_warned);
+                self.update_counter_field_gate();
                 // alive:last heartbeat — only while Active/Leaving: a crash
                 // mid-rejoin must keep measuring downtime from the PRE-death
                 // timestamp, or a restart during rejoin would skip it.
@@ -1313,6 +1314,45 @@ impl ReplEngine {
         self.gate.lock().rejoin_pending.clear();
         self.engine.metrics.rejoin_active.set(0);
         tracing::info!("gc_grace rejoin complete");
+    }
+
+    /// Enable counter-valued hash fields only once the whole cluster can read
+    /// them (T2-12).
+    ///
+    /// Stricter than "every connected peer announces the bit": every non-self
+    /// member of the current **view** must be connected *and* announce it. A
+    /// peer that is in the view but unreachable is exactly the case that would
+    /// otherwise slip through — we would start writing counters while it is
+    /// partitioned, and it would serve their raw payload to clients on heal.
+    ///
+    /// This is still a heuristic, not a cluster-wide epoch: a node that is
+    /// gone from the view entirely (past the failure detector) cannot be
+    /// consulted. The operational rule is the usual one — upgrade every node,
+    /// and the feature turns itself on.
+    fn update_counter_field_gate(&self) {
+        let view = self.cluster.view();
+        let connected: HashSet<NodeId> = self.mesh.connected_peers().into_iter().collect();
+        let ok = view
+            .members
+            .iter()
+            .filter(|m| m.node != self.store.node_id)
+            .all(|m| {
+                connected.contains(&m.node)
+                    && self
+                        .mesh
+                        .peer_features(m.node)
+                        .is_some_and(|f| f & marekvs_proto::features::COUNTER_FIELD != 0)
+            });
+        let was = self
+            .engine
+            .counter_fields
+            .swap(ok, std::sync::atomic::Ordering::Relaxed);
+        if was != ok {
+            tracing::info!(
+                enabled = ok,
+                "counter-valued hash fields (HINCRBY PN semantics) toggled"
+            );
+        }
     }
 
     // -----------------------------------------------------------------

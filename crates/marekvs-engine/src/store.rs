@@ -873,7 +873,9 @@ pub fn read_element(ctx: &ShardCtx, ikey_bytes: &[u8], del_hlc: u64) -> Option<V
     let v = get_raw(ctx, ikey_bytes)?;
     let (env, pay) = Envelope::decode(&v)?;
     visible(&env, pay, del_hlc, now_ms())?;
-    marekvs_core::merge::element_value(pay)
+    // display_value, not element_value: a counter-valued hash field must
+    // render as the fold over every live dot, not one dot's raw state (T2-12).
+    marekvs_core::merge::element_display_value(env.rtype(), pay)
 }
 
 /// Prefix scan over the data CF. `f` returns false to stop early.
