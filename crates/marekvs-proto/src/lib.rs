@@ -46,12 +46,38 @@ pub struct ReplBatch {
     pub implicit_sub: bool,
 }
 
+/// Mesh wire version. Bumped only for a layout change that older nodes cannot
+/// parse; `features` handles everything additive.
+pub const PROTO_VERSION: u16 = 2;
+
+/// Capability bits announced in [`PeerMsg::Hello`].
+///
+/// A sender must not emit data a peer cannot merge. Bits are permanent once
+/// allocated — never reuse one for a different meaning, or a mixed-version
+/// mesh silently mis-merges. Allocate a bit in the same change that starts
+/// emitting the thing it guards, so `ALL` never over-promises.
+pub mod features {
+    /// Everything this build can do. No optional capabilities yet: the
+    /// negotiation exists so the next data-format change (e.g. T2-12's
+    /// counter-valued hash fields) can roll out instead of needing a flag day.
+    pub const ALL: u32 = 0;
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PeerMsg {
-    /// First message on every connection: identify the dialer.
+    /// First message on every connection: identify the dialer and announce
+    /// what it can speak.
+    ///
+    /// `proto`/`features` exist so a data-format change can roll out instead
+    /// of requiring a flag day: a sender must not emit anything the peer has
+    /// not announced. New `PeerMsg` variants are **appended, never reordered**
+    /// (postcard encodes the discriminant positionally), and new record types
+    /// are gated on a feature bit.
     Hello {
         node: NodeId,
         kind: ConnKind,
+        proto: u16,
+        features: u32,
     },
 
     // --- replication (ctl) ---
@@ -346,5 +372,39 @@ mod tests {
         let (m2, n2) = decode(&buf[n1..]).unwrap().unwrap();
         assert_eq!(m2, PeerMsg::Pong { nonce: 2 });
         assert_eq!(n1 + n2, buf.len());
+    }
+}
+
+#[cfg(test)]
+mod proto_tests {
+    use super::*;
+
+    /// Hello carries the version/feature negotiation (P0). Round-tripping it
+    /// is the guard against the frame layout drifting silently — a mismatch
+    /// here is a mesh that cannot form.
+    #[test]
+    fn hello_round_trips_with_capabilities() {
+        let h = PeerMsg::Hello {
+            node: 7,
+            kind: ConnKind::Ctl,
+            proto: PROTO_VERSION,
+            features: features::ALL,
+        };
+        let bytes = encode(&h).expect("encode");
+        let (got, consumed) = decode(&bytes).expect("decode").expect("a whole frame");
+        assert_eq!(got, h);
+        assert_eq!(consumed, bytes.len(), "Hello must consume its whole frame");
+    }
+
+    /// `ALL` must never announce a bit this build does not actually honour:
+    /// a peer trusting it would send data this node mis-merges.
+    #[test]
+    fn announced_features_are_implemented() {
+        assert_eq!(
+            features::ALL,
+            0,
+            "a capability bit was added to ALL — confirm the code that honours \
+             it landed in the same change"
+        );
     }
 }

@@ -71,6 +71,9 @@ pub struct Mesh {
     /// a tombstone — the apple-container pattern (same id, new address) still
     /// reconnects.
     forgotten: parking_lot::Mutex<HashSet<NodeId>>,
+    /// What each peer announced in its Hello: `(proto, features)`. Senders
+    /// consult this before emitting anything a peer might not merge (P0).
+    caps: parking_lot::Mutex<HashMap<NodeId, (u16, u32)>>,
     /// (peer, msg) stream consumed by the ReplEngine — latency-sensitive
     /// lane (Repl/Ack/Fetch/Check/Interest/Publish).
     pub incoming_tx: mpsc::Sender<(NodeId, PeerMsg)>,
@@ -119,6 +122,7 @@ impl Mesh {
             peers: RwLock::new(HashMap::new()),
             dial_addrs: parking_lot::Mutex::new(HashMap::new()),
             forgotten: parking_lot::Mutex::new(HashSet::new()),
+            caps: parking_lot::Mutex::new(HashMap::new()),
             incoming_tx,
             ae_tx,
             events_tx,
@@ -199,7 +203,15 @@ impl Mesh {
             if let Some((msg, consumed)) = decode(&buf)? {
                 buf.drain(..consumed);
                 match msg {
-                    PeerMsg::Hello { node, kind } => break (node, kind),
+                    PeerMsg::Hello {
+                        node,
+                        kind,
+                        proto,
+                        features,
+                    } => {
+                        self.note_peer_caps(node, proto, features);
+                        break (node, kind);
+                    }
                     other => anyhow::bail!("expected Hello, got {other:?}"),
                 }
             }
@@ -232,6 +244,8 @@ impl Mesh {
                             let hello = encode(&PeerMsg::Hello {
                                 node: mesh.node_id,
                                 kind,
+                                proto: marekvs_proto::PROTO_VERSION,
+                                features: marekvs_proto::features::ALL,
                             })
                             .expect("encode hello");
                             if stream.write_all(&hello).await.is_ok() {
@@ -252,6 +266,30 @@ impl Mesh {
                 }
             });
         }
+    }
+
+    fn note_peer_caps(&self, peer: NodeId, proto: u16, features: u32) {
+        let prev = self.caps.lock().insert(peer, (proto, features));
+        if prev.map(|(p, f)| (p, f)) != Some((proto, features)) {
+            tracing::info!(peer, proto, features, "peer capabilities");
+        }
+    }
+
+    /// Feature bits `peer` announced, or `None` if it has not said Hello yet.
+    pub fn peer_features(&self, peer: NodeId) -> Option<u32> {
+        self.caps.lock().get(&peer).map(|(_, f)| *f)
+    }
+
+    /// True when **every** currently connected peer announces `bit`.
+    ///
+    /// Conservative by construction: a peer that has connected but not yet
+    /// said Hello counts as lacking the feature, so a capability can only be
+    /// used once the whole mesh has demonstrably agreed to it.
+    pub fn all_peers_support(&self, bit: u32) -> bool {
+        let caps = self.caps.lock();
+        self.connected_peers()
+            .iter()
+            .all(|p| caps.get(p).is_some_and(|(_, f)| f & bit != 0))
     }
 
     fn dropped(&self, peer: NodeId) -> bool {
@@ -277,6 +315,7 @@ impl Mesh {
         self.forgotten.lock().insert(peer);
         self.dial_addrs.lock().remove(&peer);
         let had_conn = self.peers.write().remove(&peer).is_some();
+        self.caps.lock().remove(&peer);
         // Let the engine tear down cursors/interest exactly as it would for a
         // disconnect, so a later reappearance re-inits via ResumeFrom.
         if had_conn {
