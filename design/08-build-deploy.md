@@ -32,8 +32,10 @@ strip = "symbols"
 
 Target `x86_64-unknown-linux-musl` (and `aarch64-unknown-linux-musl` for
 multi-arch). Everything in the dependency tree is pure Rust (ondaDB is
-`#![forbid(unsafe_code)]` by default; lz4/zstd compression crates have pure-Rust
-or vendored-static builds), so a fully static musl link is straightforward.
+`#![deny(unsafe_code)]` by default, with one audited `#[allow]` for the Linux
+coarse-clock `clock_gettime` on the TTL read path; lz4/zstd compression crates
+have pure-Rust or vendored-static builds), so a fully static musl link is
+straightforward.
 
 Note: musl's default allocator is slow under multithreaded load — we link
 **mimalloc** (`#[global_allocator]`, pure-Rust build mode) to avoid the musl
