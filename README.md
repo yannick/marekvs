@@ -181,6 +181,8 @@ what `just apple-up` automates via `tests/apple_cluster.sh`).
 | `MAREKVS_ADVERTISE_IP` | `127.0.0.1` | IP/hostname peers should use |
 | `MAREKVS_SEEDS` | — | comma-separated gossip seeds (`host:7946`) |
 | `MAREKVS_REPLICAS_N` | `3` | home replicas per partition |
+| `MAREKVS_ZONE` | — | failure domain, gossiped for zone-aware placement |
+| `MAREKVS_ZONE_AWARE` | `0` | spread a partition's replicas across zones; **must be identical cluster-wide** |
 | `MAREKVS_REQUIREPASS` | — | optional AUTH password |
 
 ### Storage engine (ondaDB)

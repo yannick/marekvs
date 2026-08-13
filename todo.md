@@ -144,16 +144,22 @@ implicit (design-promised but absent, or stub/no-op in code).
       full AE cycle (`k8s/README.md` caveats).
 - [ ] **Hot-key H1 offload** — a single mega-hot key lands on one H1
       (risky assumption 5, `design/00:143`, `design/09:77`).
-- [ ] **Zone-aware HRW placement (T2-11)** — topology-blind v1; appears in
-      three docs (`design/07:115`, `design/09:77`, `design/12:147`). One epic,
-      and the plan sequences it last: it needs `Member.zone` gossiped as
-      chitchat KV, a zone-spread greedy pick over HRW-sorted candidates, and
-      **both** `View::with_tables` and `Cluster::future_owned_pids` routed
-      through the same zone-aware path — they compute ownership separately
-      today, so changing only one would make the join gate and the placement
-      tables disagree. Gate on `MAREKVS_ZONE_AWARE` with a regression-freeze
-      test (unset ⇒ byte-identical placement). Only worth building if you will
-      actually deploy multi-zone.
+- [x] **Zone-aware HRW placement (T2-11)** — `MAREKVS_ZONE` is gossiped and
+      `MAREKVS_ZONE_AWARE=1` makes `owners_for_zoned` walk HRW score order
+      greedily, taking a candidate only if its zone is not yet represented and
+      falling back to score order for the rest (so fewer zones than RF, or
+      unlabelled nodes, still fill every slot). Placement settings are hashed
+      into a gossiped `pcfg` key and a mismatch logs PLACEMENT CONFIG MISMATCH
+      on every view change. The candidate type changed from a tuple to
+      `Candidate` specifically so the compiler forced every ownership path —
+      `View::with_tables`, `View::owners`, `future_owned_pids`,
+      `future_co_owners`, `cluster_stats` — through the same function.
+      Regression-frozen: with the flag off, placement is identical to plain HRW
+      for all 4096 pids.
+      Remaining: no chaos `zone_loss` scenario yet (needs per-node zones in the
+      docker harness), and k8s has no downward API for node labels, so
+      `MAREKVS_ZONE` must come from a per-zone StatefulSet or an initContainer
+      (documented in `k8s/statefulset.yaml`).
 
 ## Operator / k8s (ops)
 
