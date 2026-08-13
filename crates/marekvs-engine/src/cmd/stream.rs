@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::cmd::{eq_ignore_case, parse_u64};
 use crate::reply::Reply;
 use crate::store::{
-    check_type, ensure_head, get_raw, key_type, new_lww, new_tombstone, now_ms, scan_prefix,
+    check_type, ensure_head, get_raw, key_type, new_lww, new_tombstone, now_ms, scan_prefix_cmd,
     visible, write_merged, ShardCtx,
 };
 use crate::Engine;
@@ -235,7 +235,7 @@ fn parse_range_id(b: &[u8], is_start: bool) -> Option<(u64, u64)> {
 fn collect_entries(ctx: &ShardCtx, key: &[u8], del: u64) -> Vec<(u64, u64, Vec<u8>)> {
     let now = now_ms();
     let mut out = Vec::new();
-    scan_prefix(
+    scan_prefix_cmd(
         ctx,
         &ikey::collection_prefix(Tag::StreamEntry, key),
         |k, v| {
@@ -256,7 +256,7 @@ fn collect_entries(ctx: &ShardCtx, key: &[u8], del: u64) -> Vec<(u64, u64, Vec<u
 /// monotonic-id enforcement and `$`.
 fn stream_last_id(ctx: &ShardCtx, key: &[u8]) -> Option<(u64, u64)> {
     let mut last = None;
-    scan_prefix(
+    scan_prefix_cmd(
         ctx,
         &ikey::collection_prefix(Tag::StreamEntry, key),
         |k, _v| {

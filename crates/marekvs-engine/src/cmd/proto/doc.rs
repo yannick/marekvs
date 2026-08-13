@@ -7,7 +7,7 @@
 use prost_reflect::{DynamicMessage, FieldDescriptor, Value};
 
 use crate::proto::fields::{self, pval_of};
-use crate::store::{get_raw, now_ms, scan_prefix, write_merged, ShardCtx};
+use crate::store::{get_raw, now_ms, scan_prefix_cmd, write_merged, ShardCtx};
 use marekvs_core::envelope::{Envelope, RecordType};
 use marekvs_core::merge::{element_dots, element_remove, element_set, Dot, ElementState};
 use marekvs_core::pdoc::{self, PArrElem, PNodeIn, PRecord, PSeg, PVal};
@@ -22,7 +22,7 @@ use marekvs_core::json::{Eid, EID_HEAD};
 pub(crate) fn load_pnodes(ctx: &ShardCtx, key: &[u8], del_hlc: u64) -> Vec<(Vec<u8>, PNodeIn)> {
     let mut nodes: Vec<(Vec<u8>, PNodeIn)> = Vec::new();
     let now = now_ms();
-    scan_prefix(
+    scan_prefix_cmd(
         ctx,
         &ikey::collection_prefix(ikey::Tag::ProtoField, key),
         |k, v| {
@@ -131,7 +131,7 @@ fn stored_elem(ctx: &ShardCtx, key: &[u8], path: &[u8]) -> Option<PArrElem> {
 pub(crate) fn cover_descendants(ctx: &ShardCtx, key: &[u8], node_path: &[u8], del_hlc: u64) {
     let mut kind_a: Vec<(Vec<u8>, Vec<Dot>)> = Vec::new();
     let mut kind_b: Vec<(Vec<u8>, PArrElem)> = Vec::new();
-    scan_prefix(ctx, &ikey::proto_field_key(key, node_path), |k, v| {
+    scan_prefix_cmd(ctx, &ikey::proto_field_key(key, node_path), |k, v| {
         let (p, (env, pay)) = match (ikey::parse(k), Envelope::decode(v)) {
             (Some(p), Some(d)) => (p, d),
             _ => return true,

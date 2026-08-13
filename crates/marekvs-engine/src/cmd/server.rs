@@ -474,7 +474,7 @@ pub async fn dbsize(engine: &Arc<Engine>) -> Reply {
         .run(0, |ctx| {
             let mut n = 0i64;
             let mut last: Option<Vec<u8>> = None;
-            crate::store::scan_prefix(ctx, &[], |k, v| {
+            crate::store::scan_prefix_cmd(ctx, &[], |k, v| {
                 if let Some(p) = marekvs_core::ikey::parse(k) {
                     if p.tag == b'Z' || p.userkey.first() == Some(&0) {
                         return true;
@@ -512,7 +512,7 @@ pub async fn flushall(engine: &Arc<Engine>) -> Reply {
         .run(0, |ctx| {
             let mut keys: Vec<Vec<u8>> = Vec::new();
             let mut last: Option<Vec<u8>> = None;
-            crate::store::scan_prefix(ctx, &[], |k, _| {
+            crate::store::scan_prefix_cmd(ctx, &[], |k, _| {
                 if let Some(p) = marekvs_core::ikey::parse(k) {
                     if p.tag != b'Z'
                         && p.userkey.first() != Some(&0)

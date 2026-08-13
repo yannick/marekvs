@@ -124,7 +124,8 @@ async fn read_doc(e: &Arc<Engine>, key: &[u8]) -> Option<serde_json::Value> {
                     }
                     true
                 },
-            );
+            )
+            .unwrap();
             build_doc(&nodes).map(|d| d.value)
         })
         .await
@@ -210,7 +211,8 @@ async fn rename_rebuilds_doc_cleanly() {
                     }
                     true
                 },
-            );
+            )
+            .unwrap();
             let (ik, elem) = target.expect("array element found");
             let tomb = Envelope::tombstone(RecordType::List, ctx.hlc.now(), ctx.node_id)
                 .encode_with(&elem.encode());
@@ -246,7 +248,8 @@ async fn rename_rebuilds_doc_cleanly() {
                     }
                     true
                 },
-            );
+            )
+            .unwrap();
             n
         })
         .await;
@@ -820,7 +823,8 @@ async fn replicate_json(src: &Arc<Engine>, dst: &Arc<Engine>, key: &[u8], revers
                     out.push((ik.to_vec(), v.to_vec()));
                     true
                 },
-            );
+            )
+            .unwrap();
             out
         })
         .await;

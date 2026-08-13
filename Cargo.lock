@@ -1257,9 +1257,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
-version = "0.2.186"
+version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "linux-raw-sys"
@@ -1496,7 +1496,6 @@ dependencies = [
  "marekvs-proto",
  "marekvs-repl",
  "marekvs-resp",
- "ondadb",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1645,19 +1644,21 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "ondadb"
-version = "0.2.0"
+version = "0.7.8"
 dependencies = [
  "crc32fast",
  "crossbeam-channel",
  "crossbeam-skiplist",
  "flate2",
  "hmac",
+ "libc",
  "lru",
  "lz4_flex",
  "parking_lot",
  "rust-ini",
  "self_cell",
  "sha2",
+ "smallvec",
  "snap",
  "xxhash-rust",
  "zstd",

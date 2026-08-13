@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use crate::reply::Reply;
 use crate::store::{
-    check_type, ensure_head, get_head, now_ms, scan_prefix, visible, write_merged, ShardCtx,
+    check_type, ensure_head, get_head, now_ms, scan_prefix_cmd, visible, write_merged, ShardCtx,
 };
 use crate::Engine;
 use marekvs_core::envelope::{head, Envelope, RecordType};
@@ -65,7 +65,7 @@ fn hll_del_hlc(ctx: &ShardCtx, key: &[u8]) -> Result<u64, ()> {
 /// Read all live registers into a dense array (0 = untouched).
 fn load_registers(ctx: &ShardCtx, key: &[u8], del: u64, regs: &mut [u8; M]) {
     let now = now_ms();
-    scan_prefix(
+    scan_prefix_cmd(
         ctx,
         &ikey::collection_prefix(ikey::Tag::HllRegister, key),
         |k, v| {

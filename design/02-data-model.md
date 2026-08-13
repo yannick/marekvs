@@ -53,8 +53,10 @@ entries):
 - Merkle anti-entropy digests at element granularity, so repair ships only
   divergent elements;
 - `HGETALL`/`SMEMBERS`/`ZRANGE` become prefix scans, which LSM iterators do
-  well (ondaDB has no range-bounded iterator: seek to prefix, walk, stop when
-  the prefix no longer matches).
+  well. Since ondaDB 0.7 these are *range-bounded*: `store::scan_prefix` builds
+  a `new_iterator_bounded` over `[prefix, prefix-successor)`, so SSTables whose
+  key range cannot match are skipped at construction instead of being opened and
+  seeked. The `starts_with(prefix)` break is retained as a cheap guard.
 
 The **zset score index** is a second key per member maintained transactionally
 with the member key (one ondaDB `Txn`): member key holds the score (source of

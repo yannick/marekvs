@@ -16,7 +16,8 @@ use crate::cmd::{eq_ignore_case, fmt_f64, parse_f64, parse_i64};
 use crate::pubsub::glob_match;
 use crate::reply::Reply;
 use crate::store::{
-    check_type, del_raw, ensure_head, get_raw, now_ms, scan_prefix, visible, write_merged, ShardCtx,
+    check_type, del_raw, ensure_head, get_raw, now_ms, scan_prefix_cmd, visible, write_merged,
+    ShardCtx,
 };
 use crate::Engine;
 use marekvs_core::envelope::{head, Envelope, RecordType};
@@ -133,7 +134,7 @@ fn scored_members_limited(
     if limit == 0 {
         return out;
     }
-    scan_prefix(
+    scan_prefix_cmd(
         ctx,
         &ikey::collection_prefix(Tag::ZsetScore, key),
         |k, _v| {
@@ -195,14 +196,14 @@ fn pop_scored_candidates(
     match crate::store::get_pop_hint(ctx, &prefix) {
         Some(crate::store::PopHint::Empty) => return Vec::new(), // known drained
         Some(crate::store::PopHint::At(hint)) => {
-            crate::store::scan_from(ctx, &hint, &prefix, |k, v| collect(k, v, &mut out));
+            crate::store::scan_from_cmd(ctx, &hint, &prefix, |k, v| collect(k, v, &mut out));
             if out.is_empty() {
                 crate::store::clear_pop_hint(ctx, &prefix);
-                crate::store::scan_prefix(ctx, &prefix, |k, v| collect(k, v, &mut out));
+                crate::store::scan_prefix_cmd(ctx, &prefix, |k, v| collect(k, v, &mut out));
             }
         }
         None => {
-            crate::store::scan_prefix(ctx, &prefix, |k, v| collect(k, v, &mut out));
+            crate::store::scan_prefix_cmd(ctx, &prefix, |k, v| collect(k, v, &mut out));
         }
     }
     if out.is_empty() {
@@ -218,7 +219,7 @@ fn pop_scored_candidates(
 fn zset_card(ctx: &ShardCtx, key: &[u8], del: u64) -> i64 {
     let now = now_ms();
     let mut n = 0i64;
-    scan_prefix(
+    scan_prefix_cmd(
         ctx,
         &ikey::collection_prefix(Tag::ZsetMember, key),
         |_k, v| {

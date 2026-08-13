@@ -603,7 +603,8 @@ async fn old_window_slots_are_garbage_collected() {
                     live += 1;
                 }
                 true
-            });
+            })
+            .unwrap();
             live
         })
         .await;

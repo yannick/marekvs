@@ -45,7 +45,21 @@ pub async fn dispatch(
              until space is freed (see marekvs_disk_* metrics)",
         );
     }
-    match name {
+    // Fence against silently-short reads. ondaDB ≥0.7 bounds open SSTable
+    // readers, so a reader is re-opened on the read path and can fail there;
+    // `new_iterator` cannot return a Result, so the failure surfaces only as an
+    // iterator that is *invalid* — which a `while it.valid()` walk cannot
+    // distinguish from a legitimately empty range. The scan primitives record
+    // every such failure (store::ScanIncomplete), and this fence turns one that
+    // happened while serving a command into a clean error rather than a reply
+    // computed from a partial view of the data.
+    //
+    // The counter is process-wide, so a *concurrent* command's failure can trip
+    // this one too. That false positive is deliberate: under a storage fault, a
+    // spurious error the client retries is strictly better than a short reply it
+    // believes is complete. Placed here so it also covers the EXEC loop.
+    let scan_errors_before = crate::store::scan_errors_total();
+    let reply = match name {
         // --- connection / server ---
         "PING" => server::ping(&args),
         "ECHO" => server::echo(&args),
@@ -317,7 +331,17 @@ pub async fn dispatch(
             "ERR unknown command '{}'",
             String::from_utf8_lossy(&args[0])
         )),
+    };
+    if crate::store::scan_errors_total() != scan_errors_before {
+        // A write may already have been applied; the client must retry to learn
+        // the outcome, which is the same contract as a connection drop.
+        return Reply::err(
+            "MISCONF a storage scan did not complete, so this reply would be \
+             based on a partial view of the data; retry (see \
+             marekvs_scan_errors_total)",
+        );
     }
+    reply
 }
 
 // ---------------------------------------------------------------------------

@@ -14,7 +14,8 @@ members = [
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.85"
+# 1.89: ondaDB ≥0.7 uses std::fs::File advisory locking for its DB LOCK file.
+rust-version = "1.89"
 # Proprietary — all rights reserved. Not open-source licensed; no `license` field.
 
 [workspace.dependencies]

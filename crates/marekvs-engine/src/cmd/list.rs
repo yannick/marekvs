@@ -30,8 +30,8 @@ use std::sync::Arc;
 use crate::cmd::{eq_ignore_case, norm_index, parse_i64};
 use crate::reply::Reply;
 use crate::store::{
-    check_type, ensure_head, get_raw, new_lww, new_tombstone, now_ms, scan_from, scan_prefix,
-    visible, write_merged, ShardCtx,
+    check_type, ensure_head, get_raw, new_lww, new_tombstone, now_ms, scan_from_cmd,
+    scan_prefix_cmd, visible, write_merged, ShardCtx,
 };
 use crate::Engine;
 use marekvs_core::envelope::{head, Envelope, RecordType};
@@ -125,7 +125,7 @@ fn scan_minmax(ctx: &ShardCtx, key: &[u8], del: u64) -> Option<(u64, u64)> {
     let now = now_ms();
     let mut lo: Option<u64> = None;
     let mut hi = 0u64;
-    scan_prefix(ctx, &hint_key(key), |k, v| {
+    scan_prefix_cmd(ctx, &hint_key(key), |k, v| {
         if let (Some(p), Some((env, pay))) = (ikey::parse(k), Envelope::decode(v)) {
             if visible(&env, pay, del, now).is_some() {
                 if let Some(pos) = ikey::list_pos(p.suffix) {
@@ -181,7 +181,7 @@ fn find_front(ctx: &ShardCtx, key: &[u8], from: u64, del: u64) -> Option<(u64, V
     let prefix = hint_key(key);
     let start = ikey::list_elem_key(key, from);
     let mut found = None;
-    scan_from(ctx, &start, &prefix, |k, v| {
+    scan_from_cmd(ctx, &start, &prefix, |k, v| {
         if let (Some(p), Some((env, pay))) = (ikey::parse(k), Envelope::decode(v)) {
             if visible(&env, pay, del, now).is_some() {
                 if let Some(pos) = ikey::list_pos(p.suffix) {
@@ -203,7 +203,7 @@ fn find_back(ctx: &ShardCtx, key: &[u8], tail: u64, del: u64) -> Option<(u64, Ve
     }
     let now = now_ms();
     let mut last = None;
-    scan_prefix(ctx, &hint_key(key), |k, v| {
+    scan_prefix_cmd(ctx, &hint_key(key), |k, v| {
         if let (Some(p), Some((env, pay))) = (ikey::parse(k), Envelope::decode(v)) {
             if visible(&env, pay, del, now).is_some() {
                 if let Some(pos) = ikey::list_pos(p.suffix) {
@@ -220,7 +220,7 @@ fn find_back(ctx: &ShardCtx, key: &[u8], tail: u64, del: u64) -> Option<(u64, Ve
 fn live_items(ctx: &ShardCtx, key: &[u8], del: u64) -> Vec<Vec<u8>> {
     let now = now_ms();
     let mut out = Vec::new();
-    scan_prefix(ctx, &hint_key(key), |_k, v| {
+    scan_prefix_cmd(ctx, &hint_key(key), |_k, v| {
         if let Some((env, pay)) = Envelope::decode(v) {
             if visible(&env, pay, del, now).is_some() {
                 out.push(pay.to_vec());
@@ -236,7 +236,7 @@ fn live_items(ctx: &ShardCtx, key: &[u8], del: u64) -> Vec<Vec<u8>> {
 fn live_pairs(ctx: &ShardCtx, key: &[u8], del: u64) -> Vec<(u64, Vec<u8>)> {
     let now = now_ms();
     let mut out = Vec::new();
-    scan_prefix(ctx, &hint_key(key), |k, v| {
+    scan_prefix_cmd(ctx, &hint_key(key), |k, v| {
         if let (Some(p), Some((env, pay))) = (ikey::parse(k), Envelope::decode(v)) {
             if visible(&env, pay, del, now).is_some() {
                 if let Some(pos) = ikey::list_pos(p.suffix) {
@@ -254,7 +254,7 @@ fn live_pairs(ctx: &ShardCtx, key: &[u8], del: u64) -> Vec<(u64, Vec<u8>)> {
 fn live_items_bounded(ctx: &ShardCtx, key: &[u8], del: u64, stop_incl: usize) -> Vec<Vec<u8>> {
     let now = now_ms();
     let mut out = Vec::new();
-    scan_prefix(ctx, &hint_key(key), |_k, v| {
+    scan_prefix_cmd(ctx, &hint_key(key), |_k, v| {
         if let Some((env, pay)) = Envelope::decode(v) {
             if visible(&env, pay, del, now).is_some() {
                 out.push(pay.to_vec());
@@ -271,7 +271,7 @@ fn live_items_bounded(ctx: &ShardCtx, key: &[u8], del: u64, stop_incl: usize) ->
 fn live_count(ctx: &ShardCtx, key: &[u8], del: u64) -> usize {
     let now = now_ms();
     let mut n = 0;
-    scan_prefix(ctx, &hint_key(key), |_k, v| {
+    scan_prefix_cmd(ctx, &hint_key(key), |_k, v| {
         if let Some((env, pay)) = Envelope::decode(v) {
             if visible(&env, pay, del, now).is_some() {
                 n += 1;

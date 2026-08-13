@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::cmd::{eq_ignore_case, fmt_f64, parse_f64, parse_i64, parse_u64};
 use crate::reply::Reply;
 use crate::store::{
-    check_type, ensure_head, get_raw, now_ms, read_element, scan_prefix, visible, write_merged,
+    check_type, ensure_head, get_raw, now_ms, read_element, scan_prefix_cmd, visible, write_merged,
     ShardCtx,
 };
 use crate::Engine;
@@ -24,7 +24,7 @@ pub(crate) fn hash_del_hlc(ctx: &ShardCtx, key: &[u8]) -> Result<u64, ()> {
 pub(crate) fn hash_entries(ctx: &ShardCtx, key: &[u8], del: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
     let now = now_ms();
     let mut out = Vec::new();
-    scan_prefix(
+    scan_prefix_cmd(
         ctx,
         &ikey::collection_prefix(ikey::Tag::HashField, key),
         |k, v| {
