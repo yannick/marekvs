@@ -191,15 +191,21 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # `gh release` resolves the repo from git remotes, and this job has
+          # no checkout — without GH_REPO it dies with
+          # "failed to run git: fatal: not a git repository".
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           # Read the annotated tag's message over the API — this job has no
           # checkout (it only merges manifest lists), and cloning just to read
           # one tag body would be wasteful.
-          SHA=$(gh api "repos/${{ github.repository }}/git/ref/tags/$TAG" --jq '.object.sha')
-          MSG=$(gh api "repos/${{ github.repository }}/git/tags/$SHA" --jq '.message' 2>/dev/null \
-                || gh api "repos/${{ github.repository }}/commits/$SHA" --jq '.commit.message')
+          SHA=$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq '.object.sha')
+          # Annotated tag → tag object carries the message; lightweight tag →
+          # fall back to the commit message.
+          MSG=$(gh api "repos/$GH_REPO/git/tags/$SHA" --jq '.message' 2>/dev/null \
+                || gh api "repos/$GH_REPO/commits/$SHA" --jq '.commit.message')
           TITLE=$(head -1 <<< "$MSG")
           tail -n +2 <<< "$MSG" > /tmp/notes.md
           {
