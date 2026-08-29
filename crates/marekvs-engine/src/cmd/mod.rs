@@ -92,6 +92,14 @@ pub async fn dispatch(
         "REPLICAOF" | "SLAVEOF" => server::replicaof(engine, &args),
         "SHUTDOWN" => {
             sess.should_close = true;
+            // `process::exit` runs no destructors, so `Store::drop` — and with
+            // it `db.close()` — would never run. Close explicitly, exactly as
+            // the SIGTERM path does, or the memtable goes unflushed and the
+            // next open pays a WAL replay for a shutdown the operator asked
+            // for politely. `DB::close` is idempotent and takes `&self`.
+            if let Err(e) = engine.store.db.close() {
+                tracing::error!(?e, "storage close failed on SHUTDOWN; exiting anyway");
+            }
             std::process::exit(0)
         }
         "DEBUG" => server::debug(engine, &args).await,

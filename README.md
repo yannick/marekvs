@@ -201,6 +201,7 @@ and they move with ondaDB releases. Defaults below are ondaDB 0.8.0's.
 | `MAREKVS_FINISH_COMPACTIONS_ON_CLOSE` | `0` | drain the compaction backlog during shutdown |
 | `MAREKVS_COMPACTION_DEBT_HIGH_BYTES` | `6442450944` (6 GiB) | refuse client writes above this compaction backlog; `0` disables the guard |
 | `MAREKVS_COMPACTION_DEBT_LOW_BYTES` | `4294967296` (4 GiB) | accept them again below this (clamped under high) |
+| `MAREKVS_CLOSE_TIMEOUT_SECS` | `30` | budget for `db.close()` during shutdown; overrunning it exits and leaves the WAL to replay |
 
 Reader memory is the one to watch: before ondaDB 0.7 it was unbounded and grew
 with *total stored bytes* rather than working set. `marekvs_db_reader_resident_bytes`
@@ -217,13 +218,17 @@ writes with a `MISCONF` one step earlier, at
 `marekvs_db_compaction_write_stopped`. Replication, anti-entropy and bootstrap
 keep applying throughout — refusing a merge is divergence, not backpressure.
 
-`MAREKVS_FINISH_COMPACTIONS_ON_CLOSE` is a shutdown/restart trade. Off (the
-default) shutdown is prompt and safely within
-`terminationGracePeriodSeconds: 60`; the restarted pod then serves reads over a
-deeper L0, and because L0 files overlap, every one of them is probed per point
-read. Turn it on where a fully merged restart matters more than a fast
-shutdown — but budget the close time against the grace period first, or k8s
-SIGKILLs the process in the middle of it.
+`MAREKVS_FINISH_COMPACTIONS_ON_CLOSE` is a shutdown/restart trade, and the
+numbers are lopsided. Measured on 10M x 400 B records with ~2 GB of compaction
+debt outstanding: **off** (the default) closes in **0.58 s**; **on** was still
+draining after **30 s** and hit `MAREKVS_CLOSE_TIMEOUT_SECS`. Off, the restarted
+pod serves reads over a deeper L0, and because L0 files overlap every one of
+them is probed per point read — that is what you buy for the prompt shutdown.
+Turn it on only where a fully merged restart matters more, and only after
+checking the close fits `terminationGracePeriodSeconds: 60` minus the ~9 s the
+SIGTERM handler already spends gossiping and draining. The close is bounded
+precisely so overrunning that budget costs a WAL replay instead of a SIGKILL
+landing mid-close.
 
 ## Workspace layout
 

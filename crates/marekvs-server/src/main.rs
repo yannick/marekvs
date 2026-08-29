@@ -318,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let cluster = cluster.clone();
         let repl = repl.clone();
+        let engine = engine.clone();
         tokio::spawn(async move {
             let mut sigterm =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -336,6 +337,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
+            close_storage(&engine).await;
             std::process::exit(0);
         });
     }
@@ -417,6 +419,57 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Batchable = parallel-safe data command (see `Engine::parallel_safe`).
+/// Close ondaDB cleanly before the process exits.
+///
+/// **Both exit paths in this binary are `std::process::exit`, which runs no
+/// destructors** — so `Store::drop`, and with it `db.close()`, never ran. Every
+/// shutdown therefore left the memtable unflushed and the manifest unpersisted,
+/// relying on WAL replay at the next open, and made
+/// `MAREKVS_FINISH_COMPACTIONS_ON_CLOSE` a setting with nothing to act on.
+/// Measured before this: a node holding 1.97 GB of compaction debt with the
+/// flag ON shut down in 2.02 s, exactly like the flag off — draining 2 GB
+/// cannot happen in 20 ms.
+///
+/// `DB::close` takes `&self` and is idempotent (an internal `closing` swap), so
+/// calling it here is safe even though `Store::drop` may also run later.
+///
+/// Bounded, because the close is what the k8s grace period has to accommodate:
+/// `terminationGracePeriodSeconds: 60` less the ~9 s this handler already spends
+/// gossiping and draining. Overrunning the budget and being SIGKILLed mid-close
+/// is worse than abandoning the close — an abandoned one costs a WAL replay,
+/// which is what happened on every shutdown before this anyway.
+async fn close_storage(engine: &Arc<Engine>) {
+    // Refuse client writes first so the flush this close is about is not racing
+    // a fresh stream of commits. Peers, AE and bootstrap are already handled by
+    // the Leaving phase and the ring drain above.
+    engine
+        .write_stopped
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let secs = env_or("MAREKVS_CLOSE_TIMEOUT_SECS", "30")
+        .parse::<u64>()
+        .unwrap_or(30);
+    let store = engine.store.clone();
+    let started = std::time::Instant::now();
+    // spawn_blocking: DB::close parks on the flush queue and joins the ondaDB
+    // worker threads, which must not happen on a runtime worker.
+    let close = tokio::task::spawn_blocking(move || store.db.close());
+    match tokio::time::timeout(Duration::from_secs(secs), close).await {
+        Ok(Ok(Ok(()))) => {
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "storage closed"
+            )
+        }
+        Ok(Ok(Err(e))) => tracing::error!(?e, "storage close failed; exiting anyway"),
+        Ok(Err(e)) => tracing::error!(%e, "storage close task panicked; exiting anyway"),
+        Err(_) => tracing::warn!(
+            timeout_secs = secs,
+            "storage close exceeded its budget; exiting and leaving the WAL to replay"
+        ),
+    }
+}
+
 fn is_batchable(args: &[Vec<u8>]) -> bool {
     let Some(name) = args.first() else {
         return false;
