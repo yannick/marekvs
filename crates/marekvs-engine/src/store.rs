@@ -50,6 +50,17 @@ fn env_bytes(var: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Boolean knob. Accepts the usual spellings; anything else keeps `default`
+/// rather than silently reading as false — a typo in a durability-adjacent
+/// setting must not quietly pick the other behaviour.
+fn env_bool(var: &str, default: bool) -> bool {
+    match std::env::var(var).ok().as_deref().map(str::trim) {
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("on") => true,
+        Some("0") | Some("false") | Some("FALSE") | Some("no") | Some("off") => false,
+        _ => default,
+    }
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -365,11 +376,35 @@ impl Store {
         opts.max_open_reader_bytes =
             env_bytes("MAREKVS_MAX_OPEN_READER_BYTES", opts.max_open_reader_bytes);
         opts.num_flush_threads = env_usize("MAREKVS_FLUSH_THREADS", opts.num_flush_threads);
+        // ondaDB 0.8.0 made compaction jobs *bounded* (one source file plus the
+        // target files it overlaps) and replaced the CF-wide `compact_mu` with
+        // range locks, so jobs on disjoint key ranges now genuinely run at once.
+        // Before that, raising this bought little; the default of 2 predates the
+        // change and is low for a node whose shard threads are all writing.
+        opts.num_compaction_threads =
+            env_usize("MAREKVS_COMPACTION_THREADS", opts.num_compaction_threads);
+        // Whether `db.close()` (from `Store::drop`) drains the compaction
+        // backlog before returning. ondaDB declared this before 0.8.0 but read
+        // it nowhere: close always drained, which on a large data directory cost
+        // seconds to tens of seconds — against `terminationGracePeriodSeconds:
+        // 60` (k8s/statefulset.yaml) that risked a SIGKILL *during* close.
+        //
+        // Default `false` (ondaDB's): leftover debt is legal LSM state the next
+        // open resumes from. The cost lands on the restarted pod, which serves
+        // reads over a deeper L0 until compaction catches up — and L0 files
+        // overlap, so a point read probes every one of them. Set this true where
+        // a fast, fully-merged restart matters more than a fast shutdown.
+        opts.finish_compactions_on_close = env_bool(
+            "MAREKVS_FINISH_COMPACTIONS_ON_CLOSE",
+            opts.finish_compactions_on_close,
+        );
         tracing::info!(
             block_cache_bytes = opts.block_cache_size,
             max_open_readers = opts.max_open_readers,
             max_open_reader_bytes = opts.max_open_reader_bytes,
             flush_threads = opts.num_flush_threads,
+            compaction_threads = opts.num_compaction_threads,
+            finish_compactions_on_close = opts.finish_compactions_on_close,
             "ondaDB options"
         );
         let db = DB::open(opts)?;
@@ -1079,4 +1114,36 @@ pub fn new_lww(ctx: &ShardCtx, rtype: RecordType, payload: &[u8], ttl_deadline_m
 /// New LWW tombstone from this node, now.
 pub fn new_tombstone(ctx: &ShardCtx, rtype: RecordType) -> Vec<u8> {
     Envelope::tombstone(rtype, ctx.hlc.now(), ctx.node_id).encode_with(&[])
+}
+
+#[cfg(test)]
+mod env_knob_tests {
+    use super::env_bool;
+
+    /// `env_bool` reads a *process-global*, so these cases share one test to
+    /// keep cargo's thread-per-test from racing on the same variable.
+    #[test]
+    fn unset_and_unparseable_keep_the_default() {
+        const VAR: &str = "MAREKVS_TEST_ENV_BOOL";
+        std::env::remove_var(VAR);
+        assert!(env_bool(VAR, true));
+        assert!(!env_bool(VAR, false));
+
+        for on in ["1", "true", "TRUE", "yes", "on", " true "] {
+            std::env::set_var(VAR, on);
+            assert!(env_bool(VAR, false), "{on:?} should read as true");
+        }
+        for off in ["0", "false", "FALSE", "no", "off"] {
+            std::env::set_var(VAR, off);
+            assert!(!env_bool(VAR, true), "{off:?} should read as false");
+        }
+        // A typo must not silently pick the other behaviour: durability-adjacent
+        // knobs fail towards the configured default, not towards false.
+        for junk in ["ture", "", "2", "enabled"] {
+            std::env::set_var(VAR, junk);
+            assert!(env_bool(VAR, true), "{junk:?} should keep default true");
+            assert!(!env_bool(VAR, false), "{junk:?} should keep default false");
+        }
+        std::env::remove_var(VAR);
+    }
 }

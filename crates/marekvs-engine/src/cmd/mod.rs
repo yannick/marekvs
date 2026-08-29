@@ -30,20 +30,31 @@ pub async fn dispatch(
     args: Vec<Vec<u8>>,
     out: &mut ReplyBuf,
 ) -> Reply {
-    // Disk high-water guard: refuse client writes cleanly instead of letting
-    // ondadb hit ENOSPC mid-compaction (which wedges the node). Sits here so
-    // it also covers the EXEC loop; internal sessions (REPLICAOF apply) are
-    // exempt — refusing merges would silently diverge a follower.
-    if !sess.internal
-        && engine
-            .write_stopped
-            .load(std::sync::atomic::Ordering::Relaxed)
-        && Engine::is_write_command(name)
-    {
-        return Reply::err(
-            "MISCONF disk usage above high-water mark; write commands are rejected \
-             until space is freed (see marekvs_disk_* metrics)",
-        );
+    // Write-stop guards: refuse client writes cleanly rather than let the
+    // storage engine fail or block in a way the client cannot read.
+    //
+    //   - disk:      ondadb hitting ENOSPC mid-compaction wedges the node.
+    //   - compaction: past `hard_pending_compaction_bytes` ondaDB blocks the
+    //                 commit — on a shard thread, which head-of-line blocks
+    //                 every key on that shard (see Engine::compaction_stopped).
+    //
+    // Sits here so it also covers the EXEC loop; internal sessions (REPLICAOF
+    // apply) are exempt — refusing merges would silently diverge a follower.
+    if !sess.internal && Engine::is_write_command(name) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if engine.write_stopped.load(Relaxed) {
+            return Reply::err(
+                "MISCONF disk usage above high-water mark; write commands are rejected \
+                 until space is freed (see marekvs_disk_* metrics)",
+            );
+        }
+        if engine.compaction_stopped.load(Relaxed) {
+            return Reply::err(
+                "MISCONF compaction backlog above high-water mark; write commands are \
+                 rejected until compaction catches up (see \
+                 marekvs_db_compaction_debt_bytes)",
+            );
+        }
     }
     // Fence against silently-short reads. ondaDB ≥0.7 bounds open SSTable
     // readers, so a reader is re-opened on the read path and can fail there;

@@ -61,7 +61,24 @@ Verified per release by the benchmark plan below; regressions >10 % fail CI.
 | `block_cache_size` | ~50 % of container memory | main read accelerator; env-tunable |
 | `write_buffer_size` | 128 MiB | fewer, larger L0 files under write bursts |
 | `unified_memtable` | off | only two CFs (`data`, `meta`) — not needed |
-| feature `unsafe-fastpath` | **benchmark, then decide** | mmap reads + arena memtable ≈ C-class perf; costs `forbid(unsafe)` purity. Ship default-safe, offer a `-fast` image variant if the delta is ≥ 20 %. |
+| feature `unsafe-fastpath` | **benchmark, then decide** | mmap reads + arena memtable ≈ C-class perf; lifts the crate's `deny(unsafe_code)` (0.8.0 relaxed this from `forbid`, which made the default build fail to compile on Linux). Ship default-safe, offer a `-fast` image variant if the delta is ≥ 20 %. |
+
+### Compaction and backpressure (ondaDB ≥ 0.8.0)
+
+0.8.0 bounded compaction jobs (one source file plus the target files it
+overlaps) and split `target_file_size` / `l1_base_bytes` out of
+`write_buffer_size`. Before that, L1's capacity *was* `write_buffer_size`, so L1
+held exactly one file spanning the keyspace and every push-down rewrote the
+level below — work per job grew with the dataset. That is why the
+`write_buffer_size = 128 MiB` above was never applied in code: under 0.7.x it
+would have made the geometry worse, not better. It is now decoupled and safe to
+raise; measure before doing so.
+
+| Knob | Value | Why |
+|---|---|---|
+| `num_compaction_threads` | default 2, `MAREKVS_COMPACTION_THREADS` | jobs are range-locked and disjoint ones now run concurrently; 2 predates that change |
+| `finish_compactions_on_close` | off, `MAREKVS_FINISH_COMPACTIONS_ON_CLOSE` | prompt shutdown inside the 60 s k8s grace, at the cost of a deeper L0 on the restarted pod |
+| debt write-stop | 6 GiB / 4 GiB | marekvs refuses client writes below ondaDB's 8 GiB hard pacing ceiling, which blocks the commit *on a shard thread* — see `Engine::compaction_stopped` |
 
 ### Memory
 

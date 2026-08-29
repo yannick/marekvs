@@ -81,6 +81,22 @@ pub struct Metrics {
     /// L0 files in the `data` CF. A climbing value means compaction is not
     /// keeping up and reads are probing more tables each level.
     pub db_l0_files: IntGauge,
+    /// Bytes by which the `data` CF's levels exceed their capacities — the
+    /// backlog compaction still owes (ondaDB ≥0.8 `CfStats::compaction_debt`).
+    ///
+    /// This is the signal `db_l0_files` cannot give on its own: L0 depth shows
+    /// flush outrunning L0→L1, while debt accumulates across *every* level and
+    /// is what ondaDB paces and then blocks writers against. A value climbing
+    /// towards `marekvs_db_compaction_debt_high_bytes` means ingest is
+    /// outrunning compaction and the sustained write rate is lower than
+    /// whatever a burst just reported.
+    pub db_compaction_debt_bytes: IntGauge,
+    /// The debt at which client writes are refused — the guard's high-water
+    /// mark (`MAREKVS_COMPACTION_DEBT_HIGH_BYTES`), exported so an alert can be
+    /// written as a ratio instead of hardcoding the deployment's threshold.
+    pub db_compaction_debt_high_bytes: IntGauge,
+    /// 1 while client write commands are refused for compaction backlog.
+    pub db_compaction_write_stopped: IntGauge,
     /// SSTable probes skipped by a bloom-filter negative, and probes actually
     /// issued. The ratio is the direct check that ondaDB 0.7.1's bloom-sizing
     /// fix is live — before it, compacted tables measured **zero** skips.
@@ -330,6 +346,21 @@ impl Metrics {
                 registry,
                 "marekvs_db_l0_files",
                 "L0 SSTable count in the data column family (compaction backlog)"
+            ),
+            db_compaction_debt_bytes: gauge!(
+                registry,
+                "marekvs_db_compaction_debt_bytes",
+                "Bytes by which the data column family exceeds its level capacities"
+            ),
+            db_compaction_debt_high_bytes: gauge!(
+                registry,
+                "marekvs_db_compaction_debt_high_bytes",
+                "Compaction debt at which client write commands are refused"
+            ),
+            db_compaction_write_stopped: gauge!(
+                registry,
+                "marekvs_db_compaction_write_stopped",
+                "1 while client write commands are refused (compaction backlog above high-water)"
             ),
             db_bloom_skips_total: gauge!(
                 registry,

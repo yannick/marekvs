@@ -189,7 +189,7 @@ what `just apple-up` automates via `tests/apple_cluster.sh`).
 
 marekvs is disk-native — the memtable, the block cache and the OS page cache are
 its only memory tiers — so these are pinned explicitly rather than inherited,
-and they move with ondaDB releases. Defaults below are ondaDB 0.7.8's.
+and they move with ondaDB releases. Defaults below are ondaDB 0.8.0's.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -197,12 +197,33 @@ and they move with ondaDB releases. Defaults below are ondaDB 0.7.8's.
 | `MAREKVS_MAX_OPEN_READERS` | `512` | SSTable readers held open (the `max_open_files` analogue) |
 | `MAREKVS_MAX_OPEN_READER_BYTES` | `1073741824` (1 GiB) | resident ceiling for those readers' index + bloom; `0` disables the byte bound |
 | `MAREKVS_FLUSH_THREADS` | `4` | ondaDB background flush threads |
+| `MAREKVS_COMPACTION_THREADS` | `2` | ondaDB background compaction threads |
+| `MAREKVS_FINISH_COMPACTIONS_ON_CLOSE` | `0` | drain the compaction backlog during shutdown |
+| `MAREKVS_COMPACTION_DEBT_HIGH_BYTES` | `6442450944` (6 GiB) | refuse client writes above this compaction backlog; `0` disables the guard |
+| `MAREKVS_COMPACTION_DEBT_LOW_BYTES` | `4294967296` (4 GiB) | accept them again below this (clamped under high) |
 
 Reader memory is the one to watch: before ondaDB 0.7 it was unbounded and grew
 with *total stored bytes* rather than working set. `marekvs_db_reader_resident_bytes`
 against `marekvs_db_reader_budget_bytes` shows the headroom, and
 `marekvs_db_bloom_skips_total` / `marekvs_db_sst_probes_total` show whether bloom
 filters are actually filtering (the ratio should be high, not zero).
+
+**Compaction backlog** is the second. ondaDB 0.8.0 paces writers against
+`marekvs_db_compaction_debt_bytes` and, at its own hard ceiling (8 GiB), blocks
+the commit outright — on a shard thread, which head-of-line blocks every key on
+that shard with no timeout anywhere above it. marekvs therefore refuses client
+writes with a `MISCONF` one step earlier, at
+`MAREKVS_COMPACTION_DEBT_HIGH_BYTES`, and says so on
+`marekvs_db_compaction_write_stopped`. Replication, anti-entropy and bootstrap
+keep applying throughout — refusing a merge is divergence, not backpressure.
+
+`MAREKVS_FINISH_COMPACTIONS_ON_CLOSE` is a shutdown/restart trade. Off (the
+default) shutdown is prompt and safely within
+`terminationGracePeriodSeconds: 60`; the restarted pod then serves reads over a
+deeper L0, and because L0 files overlap, every one of them is probed per point
+read. Turn it on where a fully merged restart matters more than a fast
+shutdown — but budget the close time against the grace period first, or k8s
+SIGKILLs the process in the middle of it.
 
 ## Workspace layout
 

@@ -216,6 +216,22 @@ pub struct Engine {
     /// replication, AE and bootstrap apply via `apply_op_from` (bypasses
     /// dispatch) and REPLICAOF applies with `Session.internal`.
     pub write_stopped: std::sync::atomic::AtomicBool,
+    /// Compaction-debt write stop. Same mechanism and the same exemptions as
+    /// [`write_stopped`](Self::write_stopped), a different cause.
+    ///
+    /// ondaDB 0.8.0 paces writers against compaction debt: past
+    /// `soft_pending_compaction_bytes` each commit is delayed, and past
+    /// `hard_pending_compaction_bytes` a commit **blocks until a compaction
+    /// completes**. That block lands inside `db.put`/commit on a *shard thread*,
+    /// which is marekvs' serialization point — so it head-of-line blocks every
+    /// pid on that shard, `Store::run` awaits its oneshot with no timeout, and
+    /// once the shard's bounded queue fills, `Store::spawn_on` blocks a tokio
+    /// worker too. Correct backpressure, but it reaches clients as an opaque
+    /// latency cliff.
+    ///
+    /// So marekvs stops client writes cleanly *below* ondaDB's hard ceiling and
+    /// says why. Set/cleared with hysteresis by the repl stats task.
+    pub compaction_stopped: std::sync::atomic::AtomicBool,
     /// Every peer in the current view announces `features::COUNTER_FIELD`
     /// (T2-12), so HINCRBY may write counter-valued hash fields.
     ///
@@ -291,6 +307,7 @@ impl Engine {
             cluster_topology: parking_lot::RwLock::new(None),
             replicaof: parking_lot::RwLock::new(None),
             write_stopped: std::sync::atomic::AtomicBool::new(false),
+            compaction_stopped: std::sync::atomic::AtomicBool::new(false),
             counter_fields: std::sync::atomic::AtomicBool::new(false),
             tcp_port: std::sync::atomic::AtomicU16::new(6379),
             clients: std::sync::atomic::AtomicI64::new(0),

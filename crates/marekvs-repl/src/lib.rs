@@ -271,6 +271,42 @@ fn disk_min_avail_bytes() -> u64 {
     })
 }
 
+/// Compaction-debt write-stop thresholds in bytes: (high, low), with the same
+/// hysteresis as [`disk_water_marks`] so the guard cannot flap.
+///
+/// Both sit **below** ondaDB's `hard_pending_compaction_bytes` (default 8 GiB)
+/// on purpose. Reaching that ceiling is not an error — it is ondaDB blocking
+/// the commit until a compaction finishes — but the block happens on a shard
+/// thread and so stalls every key on that shard behind it, with no timeout
+/// anywhere in `Store::run`. Refusing the write one step earlier turns an
+/// unbounded, unexplained stall into a MISCONF the client can retry and an
+/// operator can see. `0` for high disables the guard, leaving ondaDB's own
+/// pacing as the only backpressure.
+fn compaction_debt_water_marks() -> (u64, u64) {
+    static V: OnceLock<(u64, u64)> = OnceLock::new();
+    *V.get_or_init(|| {
+        let bytes = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
+        resolve_debt_water_marks(
+            bytes("MAREKVS_COMPACTION_DEBT_HIGH_BYTES"),
+            bytes("MAREKVS_COMPACTION_DEBT_LOW_BYTES"),
+        )
+    })
+}
+
+/// The rule behind [`compaction_debt_water_marks`], split out so the clamp is
+/// testable without the process environment. Defaults are 6 GiB / 4 GiB.
+fn resolve_debt_water_marks(high: Option<u64>, low: Option<u64>) -> (u64, u64) {
+    let high = high.unwrap_or(6 << 30);
+    if high == 0 {
+        return (0, 0); // guard disabled
+    }
+    // Resume well below the stop so a single compaction completing cannot flap
+    // the guard. Clamped under `high` however it is configured: a low-water set
+    // at or above high-water would release the guard on the very tick that
+    // engaged it, which reads as "the guard is working" while it does nothing.
+    (high, low.unwrap_or(4 << 30).min(high - 1))
+}
+
 /// Refresh even clean cached AE roots this often: ondadb's TTL backstop
 /// purges expired records/tombstones WITHOUT a commit hook, so a purely
 /// dirty-driven cache could hold a stale root forever on a quiescent pid.
@@ -850,6 +886,10 @@ impl ReplEngine {
         let cf = self.store.data.stats();
         m.db_bloom_skips_total.set(cf.bloom_skips as i64);
         m.db_sst_probes_total.set(cf.sst_probes as i64);
+        // `data` only, like the gauges above it: `meta` holds the store epoch
+        // and budget slots, so its levels never approach a capacity worth
+        // pacing against, and mixing the two would hide which one is behind.
+        self.update_compaction_guard(cf.compaction_debt);
         let Some((total, avail)) = store::fs_usage(&self.store.data_dir) else {
             if !*fs_warned {
                 *fs_warned = true;
@@ -887,6 +927,50 @@ impl ReplEngine {
                 used_pct,
                 low,
                 "disk back below low-water mark: accepting writes"
+            );
+        }
+    }
+
+    /// Publish the compaction backlog and stop client writes before ondaDB's
+    /// hard pacing ceiling blocks a shard thread (see
+    /// [`compaction_debt_water_marks`] and `Engine::compaction_stopped`).
+    ///
+    /// Deliberately asymmetric in the same way the disk guard is: only client
+    /// writes are refused. Replication, anti-entropy and bootstrap apply
+    /// through `apply_op_from`, which bypasses `cmd::dispatch` — refusing a
+    /// merge is divergence, and a follower must converge even while it is
+    /// telling its own clients to back off.
+    fn update_compaction_guard(&self, debt: u64) {
+        let m = &self.engine.metrics;
+        m.db_compaction_debt_bytes.set(debt as i64);
+        let (high, low) = compaction_debt_water_marks();
+        m.db_compaction_debt_high_bytes.set(high as i64);
+        if high == 0 {
+            return; // guard disabled; the gauge is still published
+        }
+        let stopped = self
+            .engine
+            .compaction_stopped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if !stopped && debt >= high {
+            self.engine
+                .compaction_stopped
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            m.db_compaction_write_stopped.set(1);
+            tracing::error!(
+                debt_bytes = debt,
+                high_bytes = high,
+                "compaction backlog above high-water mark: refusing client write commands"
+            );
+        } else if stopped && debt <= low {
+            self.engine
+                .compaction_stopped
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            m.db_compaction_write_stopped.set(0);
+            tracing::info!(
+                debt_bytes = debt,
+                low_bytes = low,
+                "compaction backlog back below low-water mark: accepting writes"
             );
         }
     }
@@ -3004,5 +3088,43 @@ mod join_gate_tests {
     #[test]
     fn alone_is_ready_immediately() {
         assert!(join_ready(0, 0, false, false, false, false, false));
+    }
+}
+
+#[cfg(test)]
+mod compaction_guard_tests {
+    use super::resolve_debt_water_marks;
+
+    #[test]
+    fn defaults_sit_below_ondadbs_hard_pacing_ceiling() {
+        // ondaDB's `hard_pending_compaction_bytes` defaults to 8 GiB, where a
+        // commit blocks on a shard thread. Both marks must engage first, or the
+        // guard never gets to convert that stall into a MISCONF.
+        let (high, low) = resolve_debt_water_marks(None, None);
+        assert_eq!(high, 6 << 30);
+        assert_eq!(low, 4 << 30);
+        assert!(high < 8 << 30);
+        assert!(low < high);
+    }
+
+    #[test]
+    fn low_water_is_clamped_under_high_water() {
+        // A low-water at or above high-water would clear the stop on the same
+        // tick that set it: the guard would flap instead of holding.
+        let (high, low) = resolve_debt_water_marks(Some(1000), Some(1000));
+        assert_eq!((high, low), (1000, 999));
+        let (high, low) = resolve_debt_water_marks(Some(1000), Some(5000));
+        assert_eq!((high, low), (1000, 999));
+    }
+
+    #[test]
+    fn zero_high_water_disables_the_guard() {
+        assert_eq!(resolve_debt_water_marks(Some(0), Some(4 << 30)), (0, 0));
+    }
+
+    #[test]
+    fn high_water_of_one_still_yields_a_usable_pair() {
+        // The clamp must not underflow at the smallest legal high-water.
+        assert_eq!(resolve_debt_water_marks(Some(1), None), (1, 0));
     }
 }
