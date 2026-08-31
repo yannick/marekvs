@@ -74,6 +74,26 @@ Adopted so far:
 | `CAP_RANGE_DELETES` | the cold-partition purge drops `[pid, pid+1)` in one record instead of a scan plus a tombstone per key, and range deletes are structurally invisible to commit hooks so the local-only guarantee stops depending on a `suppress_commit_hook()` guard | once taken, the data directory can no longer be opened by ondaDB < 0.9.0 |
 | `CAP_PERIODIC_AGE` | a size trigger never fires on a family that has stopped being written, so gc_grace tombstones and head-tombstone-shadowed collection elements accumulate indefinitely on an idle node. Needs a durable `SstMeta::last_compaction_time` to measure age against | same |
 
+**Prefix-delta data blocks: measured, and left off.** `MAREKVS_PREFIX_DELTA_KEYS`
+exists and works, but the default stays `0` and `CAP_PREFIX_DELTA` stays
+unclaimed unless it is switched on.
+
+The hypothesis was that marekvs would beat ondaDB's own 12.8%, because its keys
+are far more prefix-redundant than the corpus ondaDB measured: every element
+record of a collection repeats `[pid][tag][varint klen][userkey]` and differs
+only in its suffix. **That was wrong.** On 100 hashes x 200 fields with
+incompressible 32-byte values — a shape chosen to be maximally favourable —
+the store went 730,862 -> 696,776 bytes, a saving of **4.66%**
+(`tests/prefix_delta.rs`, run it with `--nocapture`).
+
+The reason is that lz4 is already exploiting that redundancy inside each block.
+Prefix-delta removes it again *before* compression, so it only collects what lz4
+left behind. Under 5% is not worth a per-block CPU cost on every read plus a
+one-way capability bit that removes the rollback path to ondaDB < 0.9.0.
+
+Worth re-measuring if `compression` ever moves to `None`, where lz4 is not
+doing that work.
+
 Deliberately **not** adopted, with reasons, so nobody re-runs the analysis:
 
 - **Merge operators.** `write_merged` is literally read-modify-write and marekvs

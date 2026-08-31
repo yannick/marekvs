@@ -433,9 +433,11 @@ impl Store {
         // compaction needs a durable `SstMeta::last_compaction_time` to measure
         // a table's age against, so the interval below is a setting with
         // nothing behind it until the bit is taken.
-        db.enable_format_capabilities(
-            ondadb::format::CAP_RANGE_DELETES | ondadb::format::CAP_PERIODIC_AGE,
-        )?;
+        let mut caps = ondadb::format::CAP_RANGE_DELETES | ondadb::format::CAP_PERIODIC_AGE;
+        if env_bool("MAREKVS_PREFIX_DELTA_KEYS", false) {
+            caps |= ondadb::format::CAP_PREFIX_DELTA;
+        }
+        db.enable_format_capabilities(caps)?;
         // Idle families never reclaim on a size trigger, and marekvs has two
         // sources of dead-but-resident data that only compaction removes:
         // gc_grace tombstones, and collection elements shadowed by a head
@@ -445,6 +447,17 @@ impl Store {
         // them. A 24 h age trigger bounds how long they stay resident.
         // `0` disables (ondaDB's own default).
         let periodic = env_secs("MAREKVS_PERIODIC_COMPACTION_SECS", 86_400);
+        // Prefix-delta data blocks (ondaDB 2.1): store each data-block user key
+        // as the bytes it does not share with its predecessor. marekvs keys are
+        // unusually redundant for this — every element record of one collection
+        // repeats `[pid][tag][varint klen][userkey]` and differs only in the
+        // suffix, so a 1000-field hash writes that prefix 1000 times.
+        //
+        // Off by default: it is a space-for-CPU trade, and CAP_PREFIX_DELTA is
+        // ONE-WAY. Taking the bit on every database just in case would strand
+        // anyone who wanted to roll back, so it is claimed only when the knob
+        // is actually switched on.
+        let prefix_delta = env_bool("MAREKVS_PREFIX_DELTA_KEYS", false);
         tracing::info!(
             periodic_compaction_secs = periodic.as_secs(),
             "ondaDB column-family options"
@@ -453,6 +466,7 @@ impl Store {
             sync_mode: cfg.sync_mode,
             compression: Compression::Lz4,
             periodic_compaction_interval: periodic,
+            enable_prefix_delta_keys: prefix_delta,
             ..ColumnFamilyConfig::default()
         };
         let data = match db.get_column_family("data") {
