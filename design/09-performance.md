@@ -111,6 +111,18 @@ merely on average positive, and because `read_lww_batch` is the primitive the
 anti-entropy and bootstrap fetch paths would want. Re-measure with
 `cargo test --release -p marekvs-engine --test mget_batch -- --ignored --nocapture`.
 
+**PerfContext: `DEBUG PERFCTX <key> [<key>...]`.** Reports ondaDB's read-path
+counters for reading those keys — bloom probes and negatives, memtable and
+SSTable probes, index seeks, block-cache hits and misses, bytes decompressed,
+vlog reads and cache hits, and `multiget_blocks_deduped`. One key uses the point
+path, several the batched one.
+
+This is the instrument for the L0-depth question left open by the 0.8.x
+benchmarking: it attributes a slow read to a mechanism instead of inferring it
+from wall time. The scope opens on the shard thread because PerfContext is
+thread-affine and counts into whatever scope is open on the thread doing the
+work.
+
 Deliberately **not** adopted, with reasons, so nobody re-runs the analysis:
 
 - **Merge operators.** `write_merged` is literally read-modify-write and marekvs

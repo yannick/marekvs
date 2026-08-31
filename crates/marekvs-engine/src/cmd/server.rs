@@ -550,6 +550,56 @@ pub fn time() -> Reply {
 }
 
 pub async fn debug(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    // DEBUG PERFCTX <key> [<key>...]: ondaDB read-path counters (0.9.0 feature
+    // 0.10) for reading those keys, so a latency claim can be attributed to a
+    // MECHANISM instead of inferred from wall time. One key reads through the
+    // point path, several through the batched one — which is also how
+    // `multiget_blocks_deduped` becomes observable, i.e. whether a batch's keys
+    // actually shared blocks.
+    //
+    // The scope must open on the shard thread: PerfContext is thread-affine and
+    // counts into whatever scope is open on the thread doing the work.
+    if args.len() >= 3 && eq_ignore_case(&args[1], "PERFCTX") {
+        let keys: Vec<Vec<u8>> = args[2..].to_vec();
+        for k in &keys {
+            engine.ensure_local(k).await;
+        }
+        return engine
+            .store
+            .run_key(&args[2], move |ctx| {
+                let ikeys: Vec<Vec<u8>> = keys
+                    .iter()
+                    .map(|k| marekvs_core::ikey::string_key(k))
+                    .collect();
+                let scope = ondadb::perf::enter();
+                if ikeys.len() == 1 {
+                    let _ = crate::store::read_lww(ctx, &ikeys[0], 0);
+                } else {
+                    let _ = crate::store::read_lww_batch(ctx, &ikeys, 0);
+                }
+                let p = scope.finish();
+                let mut out = Vec::new();
+                let mut kv = |name: &str, v: u64| {
+                    out.push(Reply::Bulk(name.as_bytes().to_vec()));
+                    out.push(Reply::Int(v as i64));
+                };
+                kv("keys", ikeys.len() as u64);
+                kv("bloom_probes", p.bloom_probes);
+                kv("bloom_negatives", p.bloom_negatives);
+                kv("memtable_probes", p.memtable_probes);
+                kv("sstable_probes", p.sstable_probes);
+                kv("index_seeks", p.index_seeks);
+                kv("block_cache_hits", p.block_cache_hits);
+                kv("block_misses", p.block_misses);
+                kv("block_read_bytes", p.block_read_bytes);
+                kv("bytes_decompressed", p.bytes_decompressed);
+                kv("vlog_reads", p.vlog_reads);
+                kv("vlog_cache_hits", p.vlog_cache_hits);
+                kv("multiget_blocks_deduped", p.multiget_blocks_deduped);
+                Reply::Array(out)
+            })
+            .await;
+    }
     // DEBUG COUNTERSTATE <key> <field>: the same for a counter-valued hash
     // field (T2-12). Reports every live dot separately AND the fold, because
     // the whole point is that the visible number is the fold — a per-dot view
