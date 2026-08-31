@@ -408,6 +408,16 @@ impl Store {
             "ondaDB options"
         );
         let db = DB::open(opts)?;
+        // Range deletes (ondaDB 0.9.0 feature 1.2) back the cold-partition
+        // purge: a rebalance drops this node's copy of an un-owned partition
+        // with one record over `[pid, pid+1)` instead of a scan plus a
+        // tombstone per key.
+        //
+        // The bit is ONE-WAY and changes stored bytes, so a database that has
+        // taken it can no longer be opened by ondaDB < 0.9.0. That is the
+        // rollback boundary for this feature, which is why it is enabled here
+        // explicitly rather than inferred from some config field.
+        db.enable_format_capabilities(ondadb::format::CAP_RANGE_DELETES)?;
         let cf_config = || ColumnFamilyConfig {
             sync_mode: cfg.sync_mode,
             compression: Compression::Lz4,
@@ -762,6 +772,32 @@ pub fn del_raw(ctx: &ShardCtx, ikey: &[u8]) {
             tracing::error!(?e, "ondadb delete failed");
         }
     }
+}
+
+/// Drop every record of one partition with a single range delete.
+///
+/// Internal keys lead with the partition id big-endian (see the [`ikey`] module
+/// docs), so a partition is exactly the half-open interval `[pid, pid + 1)` and
+/// one record at one sequence replaces a scan plus a tombstone per key.
+///
+/// **This never reaches the commit hook.** ondaDB does not surface range
+/// deletes to hooks at all — a range delete is two keys and no value, while
+/// `CommitOp` is one key and one value — which is what makes it safe for the
+/// caller that needs a purely LOCAL drop: discarding this node's copy of a
+/// partition it no longer owns must not replicate tombstones to the new owners.
+/// The scan-and-tombstone predecessor depended on a `suppress_commit_hook()`
+/// guard for that; here it is a property of the operation instead of something
+/// a future refactor has to remember.
+pub fn delete_partition_range(ctx: &ShardCtx, pid: Pid) -> anyhow::Result<()> {
+    // `Pid` is u16 and `ikey::PARTITIONS` is 4096, so `pid + 1` cannot overflow
+    // a u16 in practice — but compute in u32 and encode two bytes anyway,
+    // because a 4-byte end bound would sort BELOW every 2-byte key and silently
+    // delete nothing at all.
+    let end = u16::try_from(u32::from(pid) + 1)
+        .map_err(|_| anyhow::anyhow!("partition {pid} has no representable upper bound"))?;
+    ctx.db
+        .delete_range(&ctx.data, &pid.to_be_bytes(), &end.to_be_bytes())
+        .map_err(|e| anyhow::anyhow!("range delete for partition {pid} failed: {e:?}"))
 }
 
 pub(crate) fn onda_ttl_for(value: &[u8]) -> Duration {
