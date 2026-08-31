@@ -985,6 +985,49 @@ pub fn read_lww(ctx: &ShardCtx, ikey_bytes: &[u8], del_hlc: u64) -> Option<(Enve
     Some((env, pay.to_vec()))
 }
 
+/// [`read_lww`] for many keys of the data CF in one pass.
+///
+/// ondaDB resolves the batch under a single snapshot, with one block fetch and
+/// one decompression per distinct block however many of the keys land in it
+/// (0.9.0 feature 0.4). The decode is deliberately the same `Envelope::decode`
+/// + [`visible`] pair `read_lww` uses — a second copy of the tombstone and TTL
+/// checks is a correctness bug waiting to happen, since a batched read that
+/// forgot one would serve deleted or expired records.
+///
+/// Results are positional: `out[i]` corresponds to `ikeys[i]`, including for a
+/// key repeated in the batch.
+pub fn read_lww_batch(
+    ctx: &ShardCtx,
+    ikeys: &[Vec<u8>],
+    del_hlc: u64,
+) -> Vec<Option<(Envelope, Vec<u8>)>> {
+    if ikeys.is_empty() {
+        return Vec::new();
+    }
+    let refs: Vec<&[u8]> = ikeys.iter().map(|k| k.as_slice()).collect();
+    let mut txn = ctx.db.begin();
+    let now = now_ms();
+    txn.multi_get(&ctx.data, &refs)
+        .into_iter()
+        .map(|r| {
+            let raw = match r {
+                Ok(v) => v,
+                // NotFound is an ordinary miss; anything else is a storage
+                // fault, and a batched read must not report it as a miss any
+                // more quietly than `get_raw` does.
+                Err(ondadb::OndaError::NotFound) => return None,
+                Err(e) => {
+                    tracing::error!(?e, "ondadb multi_get failed");
+                    return None;
+                }
+            };
+            let (env, pay) = Envelope::decode(&raw)?;
+            visible(&env, pay, del_hlc, now)?;
+            Some((env, pay.to_vec()))
+        })
+        .collect()
+}
+
 /// Read a visible OR-element's current value.
 pub fn read_element(ctx: &ShardCtx, ikey_bytes: &[u8], del_hlc: u64) -> Option<Vec<u8>> {
     let v = get_raw(ctx, ikey_bytes)?;

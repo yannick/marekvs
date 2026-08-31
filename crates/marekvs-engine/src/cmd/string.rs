@@ -25,14 +25,37 @@ use marekvs_core::ikey;
 /// (profiling: the eager gate was the top marekvs cost under load).
 fn read_string(ctx: &ShardCtx, key: &[u8]) -> Result<Option<Vec<u8>>, ()> {
     if let Some((env, payload)) = read_lww(ctx, &ikey::string_key(key), 0) {
-        return Ok(if env.rtype() == RecordType::Counter {
-            CounterState::decode(&payload).and_then(|st| Some(st.value()?.to_string().into_bytes()))
-        } else {
-            Some(payload)
-        });
+        return Ok(materialize_string(env.rtype(), payload));
     }
     check_type(ctx, key, b's')?; // miss: WRONGTYPE if a collection holds the key
     Ok(None)
+}
+
+/// Render a decoded string record: counters become their decimal fold.
+///
+/// Shared by the single and batched read paths so there is exactly one place
+/// that knows a `Counter` record is not its own payload.
+fn materialize_string(rtype: RecordType, payload: Vec<u8>) -> Option<Vec<u8>> {
+    if rtype == RecordType::Counter {
+        CounterState::decode(&payload).and_then(|st| Some(st.value()?.to_string().into_bytes()))
+    } else {
+        Some(payload)
+    }
+}
+
+/// [`read_string`] for many keys at once, resolved in one ondaDB pass.
+///
+/// No `check_type` fallback, and that is not an omission: `read_string`
+/// consults it only to turn a miss into WRONGTYPE, and MGET has always reported
+/// a wrong-type key as nil (matching Redis). Every miss is nil here whatever
+/// caused it, so the type gate would be a per-key read whose result is
+/// discarded — which is the opposite of the point of batching.
+fn read_strings_batch(ctx: &ShardCtx, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+    let ikeys: Vec<Vec<u8>> = keys.iter().map(|k| ikey::string_key(k)).collect();
+    crate::store::read_lww_batch(ctx, &ikeys, 0)
+        .into_iter()
+        .map(|slot| slot.and_then(|(env, payload)| materialize_string(env.rtype(), payload)))
+        .collect()
 }
 
 fn write_string(ctx: &ShardCtx, key: &[u8], value: &[u8], ttl_deadline_ms: u64) {
@@ -460,14 +483,16 @@ pub async fn mget(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             engine
                 .store
                 .run(pid, move |ctx| {
-                    keys.into_iter()
-                        .map(|(i, k)| {
-                            let r = match read_string(ctx, &k) {
-                                Ok(Some(v)) => Reply::Bulk(v),
-                                _ => Reply::Null,
-                            };
-                            (i, r)
-                        })
+                    // One batched pass per shard instead of one point read per
+                    // key: ondaDB resolves them under a single snapshot and
+                    // pays one block fetch and one decompression per distinct
+                    // block, however many of the shard's keys land in it.
+                    let (indices, userkeys): (Vec<usize>, Vec<Vec<u8>>) = keys.into_iter().unzip();
+                    let values = read_strings_batch(ctx, &userkeys);
+                    indices
+                        .into_iter()
+                        .zip(values)
+                        .map(|(i, v)| (i, v.map_or(Reply::Null, Reply::Bulk)))
                         .collect::<Vec<_>>()
                 })
                 .await

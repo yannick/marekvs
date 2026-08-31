@@ -94,6 +94,23 @@ one-way capability bit that removes the rollback path to ondaDB < 0.9.0.
 Worth re-measuring if `compression` ever moves to `None`, where lz4 is not
 doing that work.
 
+**MultiGet: adopted, and the win is small.** MGET resolves each shard's keys
+through `Txn::multi_get` (`store::read_lww_batch`) instead of one point read per
+key. Measured storage-path-only, batch of 64, release build, 10 runs:
+**~1.09x**, range 0.98-1.22x, batched never meaningfully slower.
+
+That is far short of ondaDB's headline 2.4-3.4x, and the reason is structural:
+that figure comes from batches whose keys share blocks, and marekvs hashes the
+user key into the partition id, so one shard's keys scatter across the keyspace
+and mostly land in *different* blocks. The per-block fetch-and-decompress saving
+therefore never materialises; what is left is the shared snapshot and level-walk
+setup, paid once instead of N times.
+
+Kept rather than reverted because it is consistently non-negative rather than
+merely on average positive, and because `read_lww_batch` is the primitive the
+anti-entropy and bootstrap fetch paths would want. Re-measure with
+`cargo test --release -p marekvs-engine --test mget_batch -- --ignored --nocapture`.
+
 Deliberately **not** adopted, with reasons, so nobody re-runs the analysis:
 
 - **Merge operators.** `write_merged` is literally read-modify-write and marekvs
