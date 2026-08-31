@@ -44,7 +44,16 @@ pub struct Metrics {
     /// Records dropped by cold purge: this node's local copy of a partition it
     /// no longer owns, released after the delay and the clean-round evidence
     /// (T2-9). Reclaims the disk that every scale event used to strand.
+    ///
+    /// **Frozen since the purge became a range delete.** A range delete retires
+    /// a whole `[pid, pid+1)` interval as one record, so there is no record
+    /// count to report without reinstating the scan the range delete exists to
+    /// remove. Kept registered so existing dashboards and alerts do not break
+    /// on a missing series; `cold_purged_partitions_total` is the live signal
+    /// and `marekvs_db_excised_bytes` is the space actually reclaimed.
     pub cold_purged_records_total: IntCounter,
+    /// Partitions whose local copy cold purge dropped — the live purge signal.
+    pub cold_purged_partitions_total: IntCounter,
 
     // --- replication (repl) ---
     pub repl_batches_sent_total: IntCounter,
@@ -97,6 +106,22 @@ pub struct Metrics {
     pub db_compaction_debt_high_bytes: IntGauge,
     /// 1 while client write commands are refused for compaction backlog.
     pub db_compaction_write_stopped: IntGauge,
+    /// Range-delete records committed to the `data` CF, and the durable
+    /// fragments they still cost after flush and compaction have clipped them.
+    ///
+    /// One cold-partition purge is one range delete, so `db_range_deletes`
+    /// tracks `cold_purged_partitions_total`. `db_range_fragments` is the one
+    /// to alert on: fragments growing without bound mean purges are outrunning
+    /// compaction's ability to retire them, and every read pays for the
+    /// unretired spans.
+    pub db_range_deletes: IntGauge,
+    pub db_range_fragments: IntGauge,
+    /// Tables delete-only excise has retired, and the bytes they held — space
+    /// reclaimed **without reading or rewriting** the data, by catalog edit.
+    /// This is the real answer to "did the purge give the disk back", which is
+    /// why the frozen `cold_purged_records_total` was not worth preserving.
+    pub db_excised_tables: IntGauge,
+    pub db_excised_bytes: IntGauge,
     /// SSTable probes skipped by a bloom-filter negative, and probes actually
     /// issued. The ratio is the direct check that ondaDB 0.7.1's bloom-sizing
     /// fix is live — before it, compacted tables measured **zero** skips.
@@ -315,7 +340,12 @@ impl Metrics {
             cold_purged_records_total: counter!(
                 registry,
                 "marekvs_cold_purged_records_total",
-                "Records dropped from partitions this node no longer owns"
+                "Records dropped from partitions this node no longer owns (frozen; see cold_purged_partitions_total)"
+            ),
+            cold_purged_partitions_total: counter!(
+                registry,
+                "marekvs_cold_purged_partitions_total",
+                "Partitions whose local copy was dropped by cold purge"
             ),
             ae_scan_failures_total: counter!(
                 registry,
@@ -361,6 +391,26 @@ impl Metrics {
                 registry,
                 "marekvs_db_compaction_write_stopped",
                 "1 while client write commands are refused (compaction backlog above high-water)"
+            ),
+            db_range_deletes: gauge!(
+                registry,
+                "marekvs_db_range_deletes",
+                "Range-delete records committed to the data column family"
+            ),
+            db_range_fragments: gauge!(
+                registry,
+                "marekvs_db_range_fragments",
+                "Range-tombstone fragments across the data column family's tables"
+            ),
+            db_excised_tables: gauge!(
+                registry,
+                "marekvs_db_excised_tables",
+                "Tables retired by delete-only excise since the family was opened"
+            ),
+            db_excised_bytes: gauge!(
+                registry,
+                "marekvs_db_excised_bytes",
+                "Bytes held by tables retired by delete-only excise"
             ),
             db_bloom_skips_total: gauge!(
                 registry,

@@ -488,6 +488,24 @@ async fn published_ops_converge_in_any_order() {
 // Window mode (MODE WINDOW, design/13 fix 9)
 // ---------------------------------------------------------------------------
 
+/// Wait until just after the next boundary of a `period_ms` window.
+///
+/// Window labels are `hlc_phys_ms / period_ms` (`cmd::budget::current_window`)
+/// — aligned to ABSOLUTE time, not to when the budget was created. A test that
+/// starts near the end of a window therefore fills it, and then makes its
+/// "now exhausted" assertion in the NEXT window, where the allowance has
+/// refilled and the reserve legitimately succeeds. That is a flaky failure with
+/// nothing wrong underneath it, and widening the window does not fix it: it
+/// makes the landing zone bigger but leaves the boundary just as crossable.
+///
+/// Starting at a known offset does fix it, by buying the assertions a full
+/// period of headroom.
+async fn align_to_window_start(period_ms: u64) {
+    let now = marekvs_engine::store::now_ms();
+    let until_boundary = period_ms - (now % period_ms);
+    tokio::time::sleep(std::time::Duration::from_millis(until_boundary + 50)).await;
+}
+
 #[tokio::test]
 async fn window_mode_refills_each_period() {
     let (_d, e) = engine();
@@ -505,8 +523,9 @@ async fn window_mode_refills_each_period() {
         ]),
     )
     .await);
-    // Fill this window completely. (Wide window: the exhaustion assert runs
-    // well inside it even when parallel-test fsyncs slow things down.)
+    // Both asserts below must land in ONE window, so start at the top of one.
+    align_to_window_start(2000).await;
+    // Fill this window completely.
     let g = reserve(&e, b"w", "100", &[b"TTL", b"500"]).await;
     assert_eq!(int(map_get(&g, "amount")), 100);
     assert_err_contains(
