@@ -1387,7 +1387,7 @@ dependencies = [
 
 [[package]]
 name = "marekvs-cluster"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "chitchat",
@@ -1401,7 +1401,7 @@ dependencies = [
 
 [[package]]
 name = "marekvs-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "proptest",
  "serde_json",
@@ -1411,7 +1411,7 @@ dependencies = [
 
 [[package]]
 name = "marekvs-engine"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1439,7 +1439,7 @@ dependencies = [
 
 [[package]]
 name = "marekvs-operator"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "futures",
@@ -1457,7 +1457,7 @@ dependencies = [
 
 [[package]]
 name = "marekvs-proto"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "postcard",
  "serde",
@@ -1466,7 +1466,7 @@ dependencies = [
 
 [[package]]
 name = "marekvs-repl"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "marekvs-cluster",
@@ -1483,11 +1483,11 @@ dependencies = [
 
 [[package]]
 name = "marekvs-resp"
-version = "0.3.1"
+version = "0.3.2"
 
 [[package]]
 name = "marekvs-server"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "marekvs-cluster",
