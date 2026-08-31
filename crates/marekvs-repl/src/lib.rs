@@ -886,6 +886,12 @@ impl ReplEngine {
         let cf = self.store.data.stats();
         m.db_bloom_skips_total.set(cf.bloom_skips as i64);
         m.db_sst_probes_total.set(cf.sst_probes as i64);
+        // Cold-purge reclamation: one purge is one range delete, and excise is
+        // what turns the masked interval back into free disk.
+        m.db_range_deletes.set(cf.range_deletes as i64);
+        m.db_range_fragments.set(cf.range_fragments as i64);
+        m.db_excised_tables.set(cf.excised_tables as i64);
+        m.db_excised_bytes.set(cf.excised_bytes as i64);
         // `data` only, like the gauges above it: `meta` holds the store epoch
         // and budget slots, so its levels never approach a capacity worth
         // pacing against, and mixing the two would hide which one is behind.
@@ -1571,21 +1577,16 @@ impl ReplEngine {
                     }
 
                     match self.purge_partition(pid).await {
-                        Ok(0) => {}
-                        Ok(purged) => {
-                            self.engine
-                                .metrics
-                                .cold_purged_records_total
-                                .inc_by(purged as u64);
+                        Ok(()) => {
+                            self.engine.metrics.cold_purged_partitions_total.inc();
                             tracing::info!(
                                 pid,
-                                purged,
                                 rounds,
                                 "cold purge: dropped local copy of an un-owned partition"
                             );
                         }
                         Err(e) => {
-                            tracing::warn!(pid, error = %e, "cold purge scan incomplete");
+                            tracing::warn!(pid, error = %e, "cold purge range delete failed");
                         }
                     }
                 }
@@ -1593,39 +1594,46 @@ impl ReplEngine {
         });
     }
 
-    /// Physically drop this node's records for `pid`, in bounded chunks.
+    /// Physically drop this node's records for `pid` with a single range delete.
     ///
-    /// Deliberately a *local* delete with the commit hook suppressed: this node
-    /// is dropping its own copy, not deleting the record cluster-wide. Letting
-    /// these reach the ring would replicate tombstones to the very owners the
-    /// data was handed to.
-    async fn purge_partition(&self, pid: Pid) -> Result<usize, store::ScanIncomplete> {
-        const CHUNK: usize = 512;
-        let mut total = 0usize;
-        loop {
-            let batch = self
-                .store
-                .run(pid, move |ctx| {
-                    let mut keys: Vec<Vec<u8>> = Vec::new();
-                    store::scan_prefix(ctx, &ikey::partition_prefix(pid), |k, _| {
-                        keys.push(k.to_vec());
-                        keys.len() < CHUNK
-                    })?;
-                    let _g = store::suppress_commit_hook();
-                    for k in &keys {
-                        store::del_raw(ctx, k);
-                    }
-                    Ok::<usize, store::ScanIncomplete>(keys.len())
-                })
-                .await?;
-            total += batch;
-            if batch < CHUNK {
-                return Ok(total);
+    /// Deliberately a *local* drop: this node is discarding its own copy of a
+    /// partition it no longer owns, not deleting the records cluster-wide.
+    /// ondaDB never surfaces a range delete to a commit hook, so — unlike the
+    /// scan-and-tombstone predecessor, which needed an explicit
+    /// `suppress_commit_hook()` guard for exactly this — nothing here can reach
+    /// the replication ring even by accident.
+    ///
+    /// There is no chunking and no inter-chunk yield any more, because there is
+    /// no per-record work to spread out. The commit does take ondaDB's
+    /// database-wide commit lock (a range commit is atomic against every
+    /// isolation level), which is why this is only ever called for a whole cold
+    /// partition and never on a client path.
+    async fn purge_partition(&self, pid: Pid) -> anyhow::Result<()> {
+        self.store
+            .run(pid, move |ctx| store::delete_partition_range(ctx, pid))
+            .await?;
+
+        // Reclaim eagerly. A purge is exactly what delete-only excise is for:
+        // a whole interval proven deleted, so a table lying entirely inside it
+        // can be unlinked by catalog edit without reading a byte of it. The
+        // range delete alone only masks the records; this is what returns the
+        // space.
+        //
+        // Best-effort by design — excise declines whenever a table is busy (an
+        // overlapping compaction, an in-flight part move, a foreign mount), and
+        // that is a skip rather than an error. A failure here must not fail a
+        // purge that has already succeeded.
+        let db = self.store.db.clone();
+        let data = self.store.data.clone();
+        match tokio::task::spawn_blocking(move || db.excise_covered(&data)).await {
+            Ok(Ok(n)) if n > 0 => {
+                tracing::info!(pid, tables = n, "excise retired tables after purge")
             }
-            // Yield between chunks so a large partition cannot monopolize the
-            // shard thread against client traffic.
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(pid, error = ?e, "excise pass failed after purge"),
+            Err(e) => tracing::warn!(pid, error = %e, "excise task panicked after purge"),
         }
+        Ok(())
     }
 
     fn complete_rejoin_pid(&self, pid: Pid) {
