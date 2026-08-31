@@ -892,6 +892,8 @@ impl ReplEngine {
         m.db_range_fragments.set(cf.range_fragments as i64);
         m.db_excised_tables.set(cf.excised_tables as i64);
         m.db_excised_bytes.set(cf.excised_bytes as i64);
+        m.db_periodic_compactions
+            .set(cf.periodic_compactions as i64);
         // `data` only, like the gauges above it: `meta` holds the store epoch
         // and budget slots, so its levels never approach a capacity worth
         // pacing against, and mixing the two would hide which one is behind.

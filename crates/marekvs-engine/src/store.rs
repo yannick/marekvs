@@ -50,6 +50,17 @@ fn env_bytes(var: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Seconds-valued knob parsed as `u64`. `0` is meaningful — it is how ondaDB
+/// spells "disabled" for `periodic_compaction_interval`.
+fn env_secs(var: &str, default: u64) -> Duration {
+    Duration::from_secs(
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(default),
+    )
+}
+
 /// Boolean knob. Accepts the usual spellings; anything else keeps `default`
 /// rather than silently reading as false — a typo in a durability-adjacent
 /// setting must not quietly pick the other behaviour.
@@ -417,10 +428,31 @@ impl Store {
         // taken it can no longer be opened by ondaDB < 0.9.0. That is the
         // rollback boundary for this feature, which is why it is enabled here
         // explicitly rather than inferred from some config field.
-        db.enable_format_capabilities(ondadb::format::CAP_RANGE_DELETES)?;
-        let cf_config = || ColumnFamilyConfig {
+        //
+        // `CAP_PERIODIC_AGE` rides along for the same reason: periodic
+        // compaction needs a durable `SstMeta::last_compaction_time` to measure
+        // a table's age against, so the interval below is a setting with
+        // nothing behind it until the bit is taken.
+        db.enable_format_capabilities(
+            ondadb::format::CAP_RANGE_DELETES | ondadb::format::CAP_PERIODIC_AGE,
+        )?;
+        // Idle families never reclaim on a size trigger, and marekvs has two
+        // sources of dead-but-resident data that only compaction removes:
+        // gc_grace tombstones, and collection elements shadowed by a head
+        // tombstone's del_hlc (design/02) — deleting a collection is O(1)
+        // writes precisely because its elements are left in place and masked.
+        // On a family that has stopped being written, nothing ever revisits
+        // them. A 24 h age trigger bounds how long they stay resident.
+        // `0` disables (ondaDB's own default).
+        let periodic = env_secs("MAREKVS_PERIODIC_COMPACTION_SECS", 86_400);
+        tracing::info!(
+            periodic_compaction_secs = periodic.as_secs(),
+            "ondaDB column-family options"
+        );
+        let cf_config = move || ColumnFamilyConfig {
             sync_mode: cfg.sync_mode,
             compression: Compression::Lz4,
+            periodic_compaction_interval: periodic,
             ..ColumnFamilyConfig::default()
         };
         let data = match db.get_column_family("data") {

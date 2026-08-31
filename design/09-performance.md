@@ -72,6 +72,7 @@ Adopted so far:
 | Capability | Why | Rollback boundary |
 |---|---|---|
 | `CAP_RANGE_DELETES` | the cold-partition purge drops `[pid, pid+1)` in one record instead of a scan plus a tombstone per key, and range deletes are structurally invisible to commit hooks so the local-only guarantee stops depending on a `suppress_commit_hook()` guard | once taken, the data directory can no longer be opened by ondaDB < 0.9.0 |
+| `CAP_PERIODIC_AGE` | a size trigger never fires on a family that has stopped being written, so gc_grace tombstones and head-tombstone-shadowed collection elements accumulate indefinitely on an idle node. Needs a durable `SstMeta::last_compaction_time` to measure age against | same |
 
 Deliberately **not** adopted, with reasons, so nobody re-runs the analysis:
 

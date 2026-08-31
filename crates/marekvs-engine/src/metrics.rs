@@ -122,6 +122,16 @@ pub struct Metrics {
     /// why the frozen `cold_purged_records_total` was not worth preserving.
     pub db_excised_tables: IntGauge,
     pub db_excised_bytes: IntGauge,
+    /// Compactions the periodic (age) trigger picked rather than a capacity
+    /// trigger — the subset of compaction work that exists to reclaim rather
+    /// than to reshape.
+    ///
+    /// This is how idle reclamation becomes visible at all. gc_grace tombstones
+    /// and collection elements shadowed by a head tombstone's del_hlc are only
+    /// removed by compaction, and a size trigger never fires on a family that
+    /// has stopped being written; a flat zero here on an idle node means they
+    /// are accumulating.
+    pub db_periodic_compactions: IntGauge,
     /// SSTable probes skipped by a bloom-filter negative, and probes actually
     /// issued. The ratio is the direct check that ondaDB 0.7.1's bloom-sizing
     /// fix is live — before it, compacted tables measured **zero** skips.
@@ -411,6 +421,11 @@ impl Metrics {
                 registry,
                 "marekvs_db_excised_bytes",
                 "Bytes held by tables retired by delete-only excise"
+            ),
+            db_periodic_compactions: gauge!(
+                registry,
+                "marekvs_db_periodic_compactions",
+                "Compactions picked by the age trigger rather than a capacity trigger"
             ),
             db_bloom_skips_total: gauge!(
                 registry,

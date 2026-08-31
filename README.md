@@ -202,6 +202,7 @@ and they move with ondaDB releases. Defaults below are ondaDB 0.8.0's.
 | `MAREKVS_COMPACTION_DEBT_HIGH_BYTES` | `6442450944` (6 GiB) | refuse client writes above this compaction backlog; `0` disables the guard |
 | `MAREKVS_COMPACTION_DEBT_LOW_BYTES` | `4294967296` (4 GiB) | accept them again below this (clamped under high) |
 | `MAREKVS_CLOSE_TIMEOUT_SECS` | `30` | budget for `db.close()` during shutdown; overrunning it exits and leaves the WAL to replay |
+| `MAREKVS_PERIODIC_COMPACTION_SECS` | `86400` (24 h) | revisit a table this long after its last compaction so an idle family still reclaims; `0` disables |
 
 Reader memory is the one to watch: before ondaDB 0.7 it was unbounded and grew
 with *total stored bytes* rather than working set. `marekvs_db_reader_resident_bytes`
