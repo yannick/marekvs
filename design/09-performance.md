@@ -63,6 +63,30 @@ Verified per release by the benchmark plan below; regressions >10 % fail CI.
 | `unified_memtable` | off | only two CFs (`data`, `meta`) — not needed |
 | feature `unsafe-fastpath` | **benchmark, then decide** | mmap reads + arena memtable ≈ C-class perf; lifts the crate's `deny(unsafe_code)` (0.8.0 relaxed this from `forbid`, which made the default build fail to compile on Linux). Ship default-safe, offer a `-fast` image variant if the delta is ≥ 20 %. |
 
+### ondaDB 0.9.0 adoption
+
+Every 0.9.0 format feature sits behind a **one-way** manifest capability bit
+that defaults off, so a database enabling nothing is byte-identical to 0.8.2.
+Adopted so far:
+
+| Capability | Why | Rollback boundary |
+|---|---|---|
+| `CAP_RANGE_DELETES` | the cold-partition purge drops `[pid, pid+1)` in one record instead of a scan plus a tombstone per key, and range deletes are structurally invisible to commit hooks so the local-only guarantee stops depending on a `suppress_commit_hook()` guard | once taken, the data directory can no longer be opened by ondaDB < 0.9.0 |
+
+Deliberately **not** adopted, with reasons, so nobody re-runs the analysis:
+
+- **Merge operators.** `write_merged` is literally read-modify-write and marekvs
+  is a CRDT store, so it looks like a perfect fit. It is not: `write_merged`
+  returns *whether the stored bytes changed* and Redis replies depend on that
+  (SADD's count, DEL's true/false), which a merge operand cannot answer without
+  the read it was meant to remove. ondaDB's headline gain is contention (3.02x,
+  zero retries) and marekvs has none by construction — one thread per shard.
+  Uncontended it is 1.15x.
+- **Pessimistic locking / prepared transactions.** No conflicts to eliminate and
+  no coordinator; ondaDB itself reports the 3.3 throughput case as not made.
+- **Tailing iterators.** Replication uses the commit hook and ring, not
+  iteration, and it is explicitly not a change feed.
+
 ### Compaction and backpressure (ondaDB ≥ 0.8.0)
 
 0.8.0 bounded compaction jobs (one source file plus the target files it
