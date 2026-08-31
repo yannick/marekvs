@@ -123,6 +123,25 @@ from wall time. The scope opens on the shard thread because PerfContext is
 thread-affine and counts into whatever scope is open on the thread doing the
 work.
 
+**Background IO limits and the vlog value cache: knobs only, all default off.**
+`MAREKVS_BACKGROUND_IO_BPS` / `_BURST_BYTES` / `MAREKVS_OBSOLETE_DELETE_BPS`
+bound background bandwidth so flush and compaction cannot monopolise a shared
+PVC; `MAREKVS_VLOG_VALUE_CACHE_BYTES` caches decoded vlog values, which is where
+every value above `klog_value_threshold` (512 B) lives.
+
+Both ship off, and deliberately **unmeasured here**, because ondaDB ships them
+off too and did not validate either: 0.6's acceptance benchmark is one of
+several it records as run under load it does not trust, and 0.5's arm was
+S3-gated and never ran at all. Adopting an unvalidated default on the strength
+of a plausible mechanism is how a regression gets shipped. Turn them on against
+a measurement on the bench box — and use a bracketed A-B-A there, since that box
+drifts +/-15% run to run and an ordered sweep has already produced one false
+result in this project's history.
+
+The block-cache `BlockDomain` fix that shipped alongside the vlog cache — a klog
+block and a vlog frame at the same offset of the same file could alias — is
+unconditional and arrived with the 0.9.0 upgrade itself, not with this knob.
+
 Deliberately **not** adopted, with reasons, so nobody re-runs the analysis:
 
 - **Merge operators.** `write_merged` is literally read-modify-write and marekvs

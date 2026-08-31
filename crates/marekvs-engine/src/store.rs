@@ -61,6 +61,15 @@ fn env_secs(var: &str, default: u64) -> Duration {
     )
 }
 
+/// `u64` knob. `0` is meaningful — it is how ondaDB spells "no limit" for the
+/// background IO rates.
+fn env_u64(var: &str, default: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
 /// Boolean knob. Accepts the usual spellings; anything else keeps `default`
 /// rather than silently reading as false — a typo in a durability-adjacent
 /// setting must not quietly pick the other behaviour.
@@ -405,6 +414,24 @@ impl Store {
         // reads over a deeper L0 until compaction catches up — and L0 files
         // overlap, so a point read probes every one of them. Set this true where
         // a fast, fully-merged restart matters more than a fast shutdown.
+        // Background IO classes and rate limiter (ondaDB 0.9.0 feature 0.6).
+        // Bounds background bandwidth so flush and compaction cannot monopolise
+        // the device — the shape of problem a shared k8s PVC has. All default
+        // to 0 = off, matching ondaDB, whose own acceptance benchmark for this
+        // feature was not validated; turn them on against a measurement, not on
+        // principle.
+        opts.background_io_bytes_per_second = env_u64(
+            "MAREKVS_BACKGROUND_IO_BPS",
+            opts.background_io_bytes_per_second,
+        );
+        opts.background_io_burst_bytes = env_u64(
+            "MAREKVS_BACKGROUND_IO_BURST_BYTES",
+            opts.background_io_burst_bytes,
+        );
+        opts.obsolete_delete_bytes_per_second = env_u64(
+            "MAREKVS_OBSOLETE_DELETE_BPS",
+            opts.obsolete_delete_bytes_per_second,
+        );
         opts.finish_compactions_on_close = env_bool(
             "MAREKVS_FINISH_COMPACTIONS_ON_CLOSE",
             opts.finish_compactions_on_close,
@@ -416,6 +443,8 @@ impl Store {
             flush_threads = opts.num_flush_threads,
             compaction_threads = opts.num_compaction_threads,
             finish_compactions_on_close = opts.finish_compactions_on_close,
+            background_io_bps = opts.background_io_bytes_per_second,
+            obsolete_delete_bps = opts.obsolete_delete_bytes_per_second,
             "ondaDB options"
         );
         let db = DB::open(opts)?;
@@ -458,6 +487,16 @@ impl Store {
         // anyone who wanted to roll back, so it is claimed only when the knob
         // is actually switched on.
         let prefix_delta = env_bool("MAREKVS_PREFIX_DELTA_KEYS", false);
+        // vlog value cache (ondaDB 0.9.0 feature 0.5). klog_value_threshold is
+        // 512 B, so every larger Redis string lives in the vlog and is re-read
+        // per access; this caches the decoded value. Default 0 = off, as
+        // ondaDB ships it — its acceptance arm was S3-gated and never run.
+        //
+        // The correctness fix that shipped alongside it (block-cache keys now
+        // name a BlockDomain, so a klog block and a vlog frame at the same
+        // offset can no longer alias) is unconditional and arrived with the
+        // 0.9.0 upgrade itself, not with this knob.
+        let vlog_cache = env_bytes("MAREKVS_VLOG_VALUE_CACHE_BYTES", 0);
         tracing::info!(
             periodic_compaction_secs = periodic.as_secs(),
             "ondaDB column-family options"
@@ -467,6 +506,7 @@ impl Store {
             compression: Compression::Lz4,
             periodic_compaction_interval: periodic,
             enable_prefix_delta_keys: prefix_delta,
+            max_cached_vlog_value_bytes: vlog_cache,
             ..ColumnFamilyConfig::default()
         };
         let data = match db.get_column_family("data") {
@@ -989,10 +1029,10 @@ pub fn read_lww(ctx: &ShardCtx, ikey_bytes: &[u8], del_hlc: u64) -> Option<(Enve
 ///
 /// ondaDB resolves the batch under a single snapshot, with one block fetch and
 /// one decompression per distinct block however many of the keys land in it
-/// (0.9.0 feature 0.4). The decode is deliberately the same `Envelope::decode`
-/// + [`visible`] pair `read_lww` uses — a second copy of the tombstone and TTL
-/// checks is a correctness bug waiting to happen, since a batched read that
-/// forgot one would serve deleted or expired records.
+/// (0.9.0 feature 0.4). The decode deliberately reuses the same
+/// `Envelope::decode` and [`visible`] pair that `read_lww` uses — a second copy
+/// of the tombstone and TTL checks is a correctness bug waiting to happen,
+/// since a batched read that forgot one would serve deleted or expired records.
 ///
 /// Results are positional: `out[i]` corresponds to `ikeys[i]`, including for a
 /// key repeated in the batch.

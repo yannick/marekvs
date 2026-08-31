@@ -71,3 +71,52 @@ async fn open_enables_the_periodic_age_capability() {
         "CAP_PERIODIC_AGE must be enabled at open"
     );
 }
+
+/// The vlog value cache is per-family and durable, so like the periodic
+/// interval it must survive a reopen. Default `0` = off, matching ondaDB —
+/// whose acceptance arm for this feature was S3-gated and never run, so there
+/// is no validated benefit to turn it on for.
+///
+/// This is the ONLY test in this binary that touches
+/// `MAREKVS_VLOG_VALUE_CACHE_BYTES`, which is what makes it safe to set a
+/// process-global here — see the flake fixed in 5988044 for what happens when
+/// two tests share one. Keep it that way.
+#[tokio::test]
+async fn vlog_value_cache_defaults_off_and_is_configurable() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = store(&dir);
+        let cfg = store.db.column_family_config("data").unwrap();
+        assert_eq!(
+            cfg.max_cached_vlog_value_bytes, 0,
+            "the vlog value cache must be off unless asked for"
+        );
+    }
+
+    std::env::set_var("MAREKVS_VLOG_VALUE_CACHE_BYTES", "1048576");
+    let dir2 = tempfile::tempdir().unwrap();
+    {
+        let store = store(&dir2);
+        assert_eq!(
+            store
+                .db
+                .column_family_config("data")
+                .unwrap()
+                .max_cached_vlog_value_bytes,
+            1_048_576
+        );
+    }
+    // Reopen with the variable cleared: the value is durable in the manifest,
+    // so it must come back from there rather than from the environment.
+    std::env::remove_var("MAREKVS_VLOG_VALUE_CACHE_BYTES");
+    let store = store(&dir2);
+    assert_eq!(
+        store
+            .db
+            .column_family_config("data")
+            .unwrap()
+            .max_cached_vlog_value_bytes,
+        1_048_576,
+        "a configured vlog cache size must survive a reopen"
+    );
+}

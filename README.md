@@ -204,6 +204,10 @@ and they move with ondaDB releases. Defaults below are ondaDB 0.8.0's.
 | `MAREKVS_CLOSE_TIMEOUT_SECS` | `30` | budget for `db.close()` during shutdown; overrunning it exits and leaves the WAL to replay |
 | `MAREKVS_PERIODIC_COMPACTION_SECS` | `86400` (24 h) | revisit a table this long after its last compaction so an idle family still reclaims; `0` disables |
 | `MAREKVS_PREFIX_DELTA_KEYS` | `0` | store data-block keys as deltas against their predecessor; measured at only ~4.7% on a hash-heavy store, and the capability it claims is one-way |
+| `MAREKVS_BACKGROUND_IO_BPS` | `0` (off) | ceiling on background (flush + compaction) IO, so it cannot monopolise a shared device |
+| `MAREKVS_BACKGROUND_IO_BURST_BYTES` | `0` (off) | burst allowance for the above |
+| `MAREKVS_OBSOLETE_DELETE_BPS` | `0` (off) | ceiling on the paced obsolete-file deletion worker |
+| `MAREKVS_VLOG_VALUE_CACHE_BYTES` | `0` (off) | cache decoded vlog values; values above `klog_value_threshold` (512 B) live there |
 
 Reader memory is the one to watch: before ondaDB 0.7 it was unbounded and grew
 with *total stored bytes* rather than working set. `marekvs_db_reader_resident_bytes`
