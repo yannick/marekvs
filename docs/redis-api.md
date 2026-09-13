@@ -62,7 +62,7 @@ A few settings are live-reconfigurable via `CONFIG SET`: `requirepass`,
 ```success
 `INCR` / `DECR` / `INCRBY` / `DECRBY` are backed by **PN-counters**: concurrent
 increments on different nodes are all preserved, never lost. An explicit `SET`
-resets the counter. See [counters](../data-model/#counters).
+resets the counter. See [counters](../data-model/#counters-pn-counters).
 ```
 
 ## Hashes
@@ -214,6 +214,26 @@ last-writer-wins on whole documents. Full guide: [JSON documents](../json/).
 
 `TYPE` reports `ReJSON-RL` (module-compat); `OBJECT ENCODING` reports `json`;
 TTL and RENAME/COPY behave like other collection types.
+
+## Document comparison (marekvs extension)
+
+`DIFF.*` compares canonical document trees stored with `JSON.*`. It creates
+reviewable suggestions, replicates per-change decisions, and applies accepted
+changes to immutable snapshots. Full guide and runnable walkthrough:
+[Document comparison](../diff/).
+
+| Commands | Purpose |
+|---|---|
+| `DIFF.SNAPSHOT` `DIFF.FORK` | Save a semantic version and create an editable branch. |
+| `DIFF.COMPARE` `DIFF.MERGE3` | Build two-way or three-way suggestion graphs. |
+| `DIFF.DECIDE` `DIFF.DECISIONS` | Record attributed decisions; inspect revisions and unresolved groups. |
+| `DIFF.APPLY` | Apply the accepted selection with a retryable request token. |
+| `DIFF.IMPORT` | Update a branch from a complete tree while preserving supported identities. |
+| `DIFF.HASH` `DIFF.STATS` | Inspect subtree hashes and local resource counters. |
+
+Inputs share one hash tag. Snapshot, graph, and result keys are immutable to
+ordinary client writers. These commands are experimental marekvs extensions
+and are unavailable inside Lua scripts.
 
 ## Protobuf values (marekvs extension)
 

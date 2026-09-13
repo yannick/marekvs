@@ -9,6 +9,31 @@ produces an immutable graph of suggested changes. Reviewers accept or reject
 individual changes, and `DIFF.APPLY` creates an immutable result snapshot.
 Working branches remain editable; application does not replace a branch.
 
+## Choose the workflow
+
+Use this extension for document review, version comparison, and reconciling two
+sets of edits to a shared base. Inputs are canonical document trees, so a
+converter must turn Word, Markdown, or another source format into the model
+below. The server does not parse those file formats or provide a review UI.
+
+| You want to… | Start with | Then |
+|---|---|---|
+| Compare two versions | `DIFF.COMPARE` | Review change IDs, record decisions, apply |
+| Reconcile two edited branches | `DIFF.MERGE3` | Review alternatives and default accepts, apply |
+| Save a version before editing | `DIFF.SNAPSHOT` | `DIFF.FORK` the snapshot into a branch |
+| Upload a new full document | `DIFF.IMPORT` | Continue editing the branch or review its returned graph |
+
+The review flow is **branch versions → immutable graph → decisions → immutable
+result snapshot → optional new branch**. Only accepted suggestions contribute
+to the result. IMPORT updates its destination immediately; use a separate
+proposal branch when an upload needs approval before changing a working copy.
+
+```note Experimental extension
+`DIFF.*` is a marekvs extension, not a Redis command family. Suggestions and
+replicated decisions are available now; production resource limits remain
+provisional. The measured corpus and validation scope are linked at the end.
+```
+
 ## Documents and keys
 
 A document has a `doc` root. Containers use `c` for children; `sen` and `code`
@@ -138,23 +163,81 @@ Repeated equal imports can produce zero branch delta writes. The first raw
 upload has no carried identity evidence; later branch comparisons can use the
 identities retained by import.
 
-## Example
+## Try a complete review
 
-```text
-JSON.SET doc:{agreement}:b:original $ '{"t":"doc","c":[{"t":"sen","x":"Pay in thirty days."}]}'
-DIFF.FORK doc:{agreement}:b:original doc:{agreement}:b:proposal
-JSON.SET doc:{agreement}:b:proposal $.c[0].x '"Pay in sixty days."'
-DIFF.COMPARE doc:{agreement}:b:original doc:{agreement}:b:proposal LEVEL word
+Start a local server using the [Quickstart](../quickstart/). This Bash example
+requires `redis-cli` with RESP3/JSON output and `jq`. It uses disposable
+`{diff-demo}` branches; choose a different tag if those names hold useful data.
+Set `DIFF_DEMO_PORT` if your server uses a port other than 6379.
+
+```bash
+set -euo pipefail
+r() { redis-cli -h 127.0.0.1 -p "${DIFF_DEMO_PORT:-6379}" -3 --json "$@"; }
+
+r JSON.SET 'doc:{diff-demo}:b:base' '$' \
+  '{"t":"doc","c":[{"t":"sen","x":"Pay in thirty days."}]}'
+r DIFF.FORK 'doc:{diff-demo}:b:base' 'doc:{diff-demo}:b:proposal' REPLACE
+r JSON.SET 'doc:{diff-demo}:b:proposal' '$.c[0].x' '"Pay in sixty days."'
+
+comparison=$(r DIFF.COMPARE 'doc:{diff-demo}:b:base' 'doc:{diff-demo}:b:proposal')
+graph=$(jq -er '.[0]' <<< "$comparison")
+# Graph JSON is itself a string inside the RESP array. Inspect before accepting.
+jq '.[1] | fromjson | .changes' <<< "$comparison"
+change=$(jq -er '.[1] | fromjson | .changes[0].id' <<< "$comparison")
+r DIFF.DECIDE "$graph" BY reviewer "$change" accept
+
+view=$(r DIFF.DECISIONS "$graph")
+revision=$(jq -er '.drev' <<< "$view")
+# A fresh token starts a new application; keep this token for exact retries.
+request="review-$(date +%s)-$$-$RANDOM"
+result=$(r DIFF.APPLY "$graph" REQUEST "$request" DECISIONS "$revision")
+sid=$(jq -er '.sid' <<< "$result")
+r JSON.GET "doc:{diff-demo}:s:$sid" '.' | jq -r 'fromjson | .c[0].x'
 ```
 
-Use the returned full graph key and a change's `id` in the next calls:
+The final line prints `Pay in sixty days.` The base branch still contains
+`Pay in thirty days.` Rejecting or leaving the suggestion pending would retain
+the base text. This fixture has one change; in a real graph, inspect and choose
+each ID rather than accepting the first entry automatically.
 
-```text
-DIFF.DECIDE <graph-key> BY reviewer <change-id> accept
-DIFF.DECISIONS <graph-key>
-DIFF.APPLY <graph-key> REQUEST review-1 DECISIONS <drev>
-JSON.GET doc:{agreement}:s:<returned-sid> .
+To continue editing the approved result, use the same shell variables:
+
+```bash
+r DIFF.FORK "doc:{diff-demo}:s:$sid" 'doc:{diff-demo}:b:approved' REPLACE
 ```
+
+### Review a three-way merge
+
+Create left and right branches from the same base with `DIFF.FORK`, edit each,
+then call `DIFF.MERGE3 base left right` with their full keys. Keep all three
+under one tag. Read the returned wrapper's `graph.changes` and `origins` to
+show who proposed each suggestion, then call `DIFF.DECISIONS` for the effective
+selection.
+
+| Situation | Initial decision | Reviewer action |
+|---|---|---|
+| Independent suggestions | Accepted | Keep or explicitly reject/pause them |
+| Competing alternatives | Pending | Accept the intended alternative; reject the other |
+| Current selection has a structural conflict | Returned in `unresolved` | Adjust its decisions and inspect again |
+
+Pending alternatives are omitted from the result; APPLY can succeed while
+some changes remain pending. An empty `unresolved` list means the **accepted
+selection is valid**, not that every suggestion has been reviewed. A UI that
+requires a complete review should additionally check for pending decisions.
+
+### Retry without applying a different review
+
+| Response or situation | Next step |
+|---|---|
+| Connection lost during APPLY | Resend the same graph, token, and revision to retrieve any recorded result |
+| `DIFFSTALE` for a fresh application | Fetch decisions again, review them, and submit their revision |
+| `{unresolved: [...]}` | Adjust the selected changes; no request result was stored |
+| Successful application, then more decisions | Use a new request token to apply the new view |
+| `DIFFREQUEST` | The token belongs to another graph; choose a new token |
+
+Retain the returned snapshot key in your application. Reading a stored request
+can return its original result even if an operator has since removed that
+snapshot; retrying is not a snapshot recovery operation.
 
 ## Limits, immutability, and consistency
 
@@ -181,7 +264,7 @@ the admission reservation until their allocations finish, so a timeout does
 not immediately make the same capacity available to another caller. The
 semantic-only LRU cache defaults to 256 MiB and never carries branch bindings.
 All environment settings and aliases are listed in the
-[authoritative defaults table](../design/05-consistency-anti-entropy.md#defaults-table).
+[authoritative defaults table](https://github.com/yannick/marekvs/blob/main/design/05-consistency-anti-entropy.md#defaults-table).
 
 Ordinary client mutation commands cannot modify snapshot, graph, or result
 prefixes, even when the suffix is malformed. The guard covers JSON/string
@@ -232,8 +315,8 @@ Prometheus exposes `marekvs_diff_operations_total{op,result}`,
 queue wait, and rejection counters. `DIFF.STATS` returns local counters without
 requiring the metrics endpoint.
 
-The [design](../design/19-diff.md) explains matching and publication. The
-[measurements](superpowers/plans/2026-09-13-diff-commands-measurements.md)
+The [design](https://github.com/yannick/marekvs/blob/main/design/19-diff.md) explains matching and publication. The
+[measurements](https://github.com/yannick/marekvs/blob/main/docs/superpowers/plans/2026-09-13-diff-commands-measurements.md)
 record synthetic correspondence recall and warm scan/decode samples. Limits
 remain provisional: those samples do not establish cold-storage or production
 tail latency. The partition negotiation scenario is
