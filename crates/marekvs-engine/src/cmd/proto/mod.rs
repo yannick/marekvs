@@ -1152,7 +1152,7 @@ async fn field_rmw(engine: &Arc<Engine>, key: &[u8], op: FieldOp) -> Reply {
 /// `PROTO.SETFIELD key path value [path value…]` — per-field CRDT writes;
 /// scalar values from strings, message/repeated/map values from JSON.
 pub async fn setfield(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
-    if args.len() < 4 || (args.len() - 2) % 2 != 0 {
+    if args.len() < 4 || !(args.len() - 2).is_multiple_of(2) {
         return Reply::wrong_args("proto.setfield");
     }
     let mut ops: Vec<(Vec<String>, Vec<u8>)> = Vec::with_capacity((args.len() - 2) / 2);
@@ -1247,7 +1247,7 @@ pub async fn hset(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         Err(r) => return r,
     };
     let rest = &args[rest_at..];
-    if rest.is_empty() || rest.len() % 2 != 0 {
+    if rest.is_empty() || !rest.len().is_multiple_of(2) {
         return Reply::wrong_args("proto.hset");
     }
     let resolved =

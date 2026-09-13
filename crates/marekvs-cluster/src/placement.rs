@@ -74,7 +74,7 @@ pub fn owners_for_zoned(
         .collect();
     // Descending by (score, node): the node id breaks score ties so every
     // replica derives the identical order.
-    scored.sort_unstable_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+    scored.sort_unstable_by_key(|b| std::cmp::Reverse((b.0, b.1)));
 
     if !zone_spread {
         scored.truncate(n);

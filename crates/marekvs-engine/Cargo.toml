@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 marekvs-core.workspace = true
+marekvs-diff.workspace = true
 marekvs-resp.workspace = true
 ondadb.workspace = true
 tokio.workspace = true

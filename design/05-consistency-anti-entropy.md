@@ -237,3 +237,34 @@ config).
 | blocking-list poll | 50 ms | const (marekvs-engine `POLL_MS`) | no | BLPOP/BRPOP wakeup granularity |
 | ondaDB sync_mode | Interval, 128 ms | ondadb default | no | durability window per node |
 | log level | `info,chitchat=warn` | env `RUST_LOG` | **yes** — `CONFIG SET loglevel` | Redis levels map to tracing (`debug`→trace, `verbose`→debug, `notice`→info, `warning`→warn, `nothing`→off); any other value is a raw tracing filter spec |
+
+
+### Structured document comparison
+
+All DIFF settings are read once when the engine starts. Positive integer values
+are accepted; missing, malformed, or zero values fall back to defaults. Values
+are node-local, so use the same deterministic work limits on nodes where equal
+comparison requests should produce equal graph identities. Products used for
+default in-flight capacity and cache MiB conversion use checked arithmetic;
+overflow is a configuration error at startup. These limits are provisional;
+see the [scan/decode measurements](../docs/superpowers/plans/2026-09-13-diff-commands-measurements.md).
+
+| Parameter | Default | Where set | Runtime | Notes |
+|---|---|---|---|---|
+| DIFF workers | floor(available CPUs / 4), min 1, max 8 | env `MAREKVS_DIFF_CONCURRENCY` | no | explicit override capped at 256; dedicated CPU threads, not Tokio workers |
+| DIFF per-input scanned bytes | 16 MiB | env `MAREKVS_DIFF_MAX_BYTES` | no | also canonical-model, graph and artifact byte budget; physical record bytes include internal keys/envelopes |
+| DIFF total input reservations | `3 × MAX_BYTES × CONCURRENCY` | env `MAREKVS_DIFF_INFLIGHT_BYTES` | no | checked default product admits a three-input request; separate from bounded trees/graphs/candidates/cache, not an RSS limit |
+| DIFF admitted requests | `2 × CONCURRENCY` | derived | no | admission rejects immediately when request or byte capacity is exhausted |
+| DIFF worker queue | `CONCURRENCY` jobs | derived | no | bounded nonblocking queue; saturation returns `DIFFBUSY` |
+| DIFF queue deadline | 2,000 ms | env `MAREKVS_DIFF_QUEUE_MS` | no | max wait to start a worker; request deadline may expire earlier |
+| DIFF request deadline | 5,000 ms | env `MAREKVS_DIFF_TIME_LIMIT_MS` | no | starts at admission; cancellation checks around synchronous shard work and within algorithms |
+| DIFF live scan records | 50,000 | env `MAREKVS_DIFF_MAX_RECORDS` | no | live candidate records before parent/RGA materialization; also import delta-record cap |
+| DIFF physical scan records | 200,000 | env `MAREKVS_DIFF_MAX_PHYSICAL` | no | includes tombstones/invisible records; `MAREKVS_DIFF_MAX_PHYSICAL_RECORDS` is a lower-priority alias |
+| DIFF semantic nodes | 50,000 | env `MAREKVS_DIFF_MAX_NODES` | no | canonical document model bound |
+| DIFF tree depth | 64 | env `MAREKVS_DIFF_MAX_DEPTH` | no | validated before recursive model parsing |
+| DIFF tokens per leaf | 8,192 | env `MAREKVS_DIFF_MAX_LEAF_TOKENS` | no | bounds individual text leaves |
+| DIFF candidate pairs | 50,000 | env `MAREKVS_DIFF_MAX_CANDIDATES` | no | bounded near matching |
+| DIFF edit/graph work | 2,000,000 | env `MAREKVS_DIFF_MAX_ND` | no | deterministic work bound; also bounds anchors and planning work |
+| DIFF emitted changes | 100,000 | env `MAREKVS_DIFF_MAX_CHANGES` | no | graph construction and decision-batch count bound |
+| DIFF semantic cache | 256 MiB | env `MAREKVS_DIFF_CACHE_MB` | no | `MAREKVS_DIFF_CACHE_BYTES` overrides this in bytes; conservative LRU accounting, excludes source identity bindings |
+| DIFF default compare level / threshold | word / 0.5 | per-command `LEVEL` / `THETA` | per call | MERGE3 uses these library defaults; IMPORT defaults to threshold 0.7 |

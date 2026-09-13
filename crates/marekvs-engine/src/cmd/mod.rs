@@ -3,6 +3,7 @@
 pub mod budget;
 pub mod cluster;
 pub mod command_docs;
+pub mod diff;
 pub mod generic;
 pub mod hash;
 pub mod hll;
@@ -30,6 +31,44 @@ pub async fn dispatch(
     args: Vec<Vec<u8>>,
     out: &mut ReplyBuf,
 ) -> Reply {
+    let started = std::time::Instant::now();
+    let reply = diff::keys::INTERNAL
+        .scope(sess.internal, dispatch_inner(engine, sess, name, args, out))
+        .await;
+    if name.starts_with("DIFF.") && command_docs::find(name).is_some() {
+        let result = if matches!(reply, Reply::Err(_)) {
+            "error"
+        } else {
+            "ok"
+        };
+        engine
+            .diff
+            .metrics
+            .operations
+            .with_label_values(&[name, result])
+            .inc();
+        engine
+            .diff
+            .metrics
+            .duration
+            .with_label_values(&["command"])
+            .observe(started.elapsed().as_secs_f64());
+    }
+    reply
+}
+
+async fn dispatch_inner(
+    engine: &Arc<Engine>,
+    sess: &mut Session,
+    name: &str,
+    args: Vec<Vec<u8>>,
+    out: &mut ReplyBuf,
+) -> Reply {
+    if !sess.internal {
+        if let Err(reply) = diff::keys::guard_command(name, &args) {
+            return reply;
+        }
+    }
     // Write-stop guards: refuse client writes cleanly rather than let the
     // storage engine fail or block in a way the client cannot read.
     //
@@ -117,6 +156,16 @@ pub async fn dispatch(
         "BG.INFO" => budget::info(engine, &args).await,
         "BG.RECLAIM" => budget::reclaim(engine, &args).await,
 
+        "DIFF.SNAPSHOT" => diff::snapshot::snapshot(engine, &args).await,
+        "DIFF.FORK" => diff::fork::fork(engine, &args).await,
+        "DIFF.COMPARE" => diff::compare::compare(engine, &args).await,
+        "DIFF.HASH" => diff::compare::hash(engine, &args).await,
+        "DIFF.STATS" => diff::compare::stats(engine, &args),
+        "DIFF.IMPORT" => diff::import::import(engine, &args).await,
+        "DIFF.DECIDE" => diff::decide::decide(engine, &args).await,
+        "DIFF.DECISIONS" => diff::decide::decisions(engine, &args).await,
+        "DIFF.APPLY" => diff::apply::apply(engine, &args).await,
+        "DIFF.MERGE3" => diff::apply::merge3(engine, &args).await,
         // --- JSON documents (JSON.*, design/16) ---
         "JSON.SET" => json::set(engine, &args).await,
         "JSON.GET" => json::get(engine, &args).await,

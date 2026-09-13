@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/marekvs-diff",
     "crates/marekvs-core",
     "crates/marekvs-resp",
     "crates/marekvs-proto",
@@ -47,6 +48,7 @@ prost-types = "0.14"
 prost-reflect = { version = "0.16", features = ["serde"] }
 protox = "0.9"
 
+marekvs-diff = { path = "crates/marekvs-diff" }
 marekvs-core = { path = "crates/marekvs-core" }
 marekvs-resp = { path = "crates/marekvs-resp" }
 marekvs-proto = { path = "crates/marekvs-proto" }

@@ -1,0 +1,19 @@
+[package]
+name = "marekvs-diff"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+marekvs-core.workspace = true
+xxhash-rust.workspace = true
+smallvec.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[[bench]]
+name = "recall"
+harness = false

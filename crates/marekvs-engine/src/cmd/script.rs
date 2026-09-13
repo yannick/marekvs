@@ -72,7 +72,7 @@ fn script_safe(name: &str) -> bool {
     // PROTO.* is excluded wholesale in v1: typed handlers consult the
     // hidden registry (a different partition) and may spawn_blocking —
     // both suspend inside the poll-once script driver.
-    if name.starts_with("PROTO.") {
+    if name.starts_with("PROTO.") || name.starts_with("DIFF.") {
         return false;
     }
     Engine::parallel_safe(name) || matches!(name, "PING" | "ECHO" | "TIME")

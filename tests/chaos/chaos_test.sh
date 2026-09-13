@@ -19,7 +19,7 @@ SCENARIOS=("$@")
 [ ${#SCENARIOS[@]} -gt 0 ] || {
   SCENARIOS=(crash_restart freeze_thaw rolling_churn wipe_replace membership_churn join_empty_reads interest_flood bank budget_no_overspend budget_pvc_wipe)
   [ "$BACKEND" = docker ] && SCENARIOS+=(disk_guard gc_grace_rejoin)
-  [ "$BACKEND" = docker ] && SCENARIOS+=(partition_divergence partition_no_resurrect budget_partition json_convergence proto_partition proto_field_partition)
+  [ "$BACKEND" = docker ] && SCENARIOS+=(partition_divergence partition_no_resurrect budget_partition json_convergence proto_partition proto_field_partition diff_negotiation)
 }
 
 trap cluster_down EXIT
@@ -599,6 +599,133 @@ json_convergence() {
     *'"i1","i2"'*) chk 0 "island append run contiguous" ;;
     *) chk 1 "island append run" "doc [$d]" ;;
   esac
+  check_replication_healed 60
+}
+
+# ── scenario: diff_negotiation (docker) ──────────────────────────────────
+# Concurrent choices are replicated scalar records. Opposing acceptances
+# must converge to the same unresolved group; rejecting one then permits
+# identical application on independently contacted nodes.
+diff_json() { # <graph|pending|conflict|resolved|unresolved|applied|doc> [left right]
+  python3 -c '
+import json,re,sys
+mode=sys.argv[1]
+v=json.load(sys.stdin)
+def mapping(x):
+    if isinstance(x,dict): return x
+    assert isinstance(x,list) and len(x)%2==0, "expected map reply"
+    return dict(zip(x[::2],x[1::2]))
+def groups(x): return sorted(sorted(group) for group in x)
+if mode=="graph":
+    assert isinstance(v,list) and len(v)==2, "expected graph key and JSON"
+    key,raw=v; g=json.loads(raw)
+    assert re.fullmatch(r"diff:\{negotiation\}:g:[0-9a-f]{32}",key)
+    origins=g["origins"]
+    left=[k for k,side in origins.items() if side=="l"]
+    right=[k for k,side in origins.items() if side=="r"]
+    assert len(left)==len(right)==1 and len(g["graph"]["changes"])==2, "fixture must produce two opposing changes"
+    assert sorted([left[0],right[0]]) in groups(g["conflicts"]), "fixture must conflict"
+    print(key); print(left[0]); print(right[0])
+elif mode in ("pending","conflict","resolved"):
+    v=mapping(v); decisions=json.loads(v["decisions"])
+    left,right=sys.argv[2:4]
+    expected=("pending","pending") if mode=="pending" else (("accepted","accepted") if mode=="conflict" else ("accepted","rejected"))
+    assert (decisions[left]["state"],decisions[right]["state"])==expected, "decision states have not converged"
+    v["unresolved"]=groups(v["unresolved"])
+    if mode=="conflict": assert sorted([left,right]) in v["unresolved"], "missing opposing acceptance conflict"
+    elif mode=="resolved": assert not v["unresolved"], "rejected alternative still unresolved"
+    assert re.fullmatch(r"[0-9a-f]{32}",v["drev"])
+    v["decisions"]=decisions
+    print(json.dumps(v,sort_keys=True,separators=(",",":")))
+elif mode=="unresolved":
+    v=mapping(v); left,right=sys.argv[2:4]
+    assert sorted([left,right]) in groups(v["unresolved"])
+    assert "sid" not in v and "rid" not in v, "unresolved apply published a result"
+    print(json.dumps(groups(v["unresolved"])))
+elif mode=="applied":
+    v=mapping(v); assert not v["unresolved"]
+    assert re.fullmatch(r"[0-9a-f]{32}",v["sid"])
+    print(v["sid"])
+elif mode=="doc":
+    v=json.loads(v)
+    assert v["t"]=="doc" and v["c"][0]["x"]=="one red three", "applied wrong alternative"
+    print(json.dumps(v,sort_keys=True,separators=(",",":")))
+else: raise AssertionError("unknown oracle mode")
+' "$@"
+}
+
+diff_wait_view() { # <graph key> <left id> <right id> <pending|conflict|resolved>
+  local key=$1 left=$2 right=$3 mode=$4 deadline=$((SECONDS + 90)) i baseline value good
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    baseline=""; good=1
+    for i in $(seq 0 $((N - 1))); do
+      rcli "$i" -2 --json diff.decisions "$key" > "$CHAOS_DIR/view.$mode.node$i.json" 2>&1 || true
+      if ! value=$(diff_json "$mode" "$left" "$right" < "$CHAOS_DIR/view.$mode.node$i.json" 2> "$CHAOS_DIR/view.$mode.node$i.error"); then
+        good=0; break
+      fi
+      if [ -z "$baseline" ]; then baseline=$value; elif [ "$value" != "$baseline" ]; then good=0; break; fi
+    done
+    if [ "$good" = 1 ]; then chk 0 "DIFF $mode decisions and groups converge on all nodes"; return 0; fi
+    sleep 0.5
+  done
+  chk 1 "DIFF $mode decision convergence" "timed out; replies and oracle errors in $CHAOS_DIR"
+  return 1
+}
+
+diff_negotiation() {
+  [ "$BACKEND" = docker ] || { echo "  (skipped: diff_negotiation requires Docker network partitions)"; return 0; }
+  [ "$N" -ge 3 ] || { chk 1 "DIFF topology" "requires at least three nodes"; return 0; }
+  fresh_cluster
+  local branch base='doc:{negotiation}:b:base' left='doc:{negotiation}:b:left' right='doc:{negotiation}:b:right' reply parsed gkey lid rid i result sid0 sid1 doc0 doc1
+  for branch in "$base" "$left" "$right"; do
+    reply=$(rcli 0 json.set "$branch" '$' '{"t":"doc","c":[{"t":"sen","x":"one two three"}]}')
+    [ "$reply" = OK ] || { chk 1 "DIFF branch seed" "$reply"; return 0; }
+  done
+  rcli 0 json.set "$left" '$.c[0].x' '"one red three"' >/dev/null
+  rcli 0 json.set "$right" '$.c[0].x' '"one blue three"' >/dev/null
+  rcli 0 -2 --json diff.merge3 "$base" "$left" "$right" > "$CHAOS_DIR/merge.json"
+  if ! parsed=$(diff_json graph < "$CHAOS_DIR/merge.json" 2> "$CHAOS_DIR/merge.error"); then
+    chk 1 "DIFF merge fixture" "invalid graph; see $CHAOS_DIR/merge.json"; return 0
+  fi
+  gkey=$(printf '%s\n' "$parsed" | sed -n '1p')
+  lid=$(printf '%s\n' "$parsed" | sed -n '2p')
+  rid=$(printf '%s\n' "$parsed" | sed -n '3p')
+  diff_wait_view "$gkey" "$lid" "$rid" pending || return 0
+  partition 0
+  if docker network inspect "$MESH_NET" | grep -q '"chaos-0"'; then
+    heal 0; chk 1 "DIFF partition applied" "node 0 remains on mesh"; return 0
+  fi
+  reply=$(rcli 0 diff.decide "$gkey" BY 'island|left' "$lid" accept)
+  result=$(rcli 1 diff.decide "$gkey" BY 'majority|right' "$rid" accept)
+  printf '%s\n%s\n' "$reply" "$result" > "$CHAOS_DIR/partition-decisions.txt"
+  heal 0
+  [ "$reply" = OK ] && [ "$result" = OK ] || { chk 1 "DIFF partition decisions accepted" "[$reply] [$result]"; return 0; }
+  diff_wait_view "$gkey" "$lid" "$rid" conflict || return 0
+  for i in $(seq 0 $((N - 1))); do
+    rcli "$i" -2 --json diff.apply "$gkey" REQUEST "blocked-$i" > "$CHAOS_DIR/blocked.node$i.json"
+    if ! diff_json unresolved "$lid" "$rid" < "$CHAOS_DIR/blocked.node$i.json" >/dev/null; then
+      chk 1 "DIFF unresolved apply on node $i" "unexpected result"; return 0
+    fi
+    result=$(rcli "$i" exists "diff:{negotiation}:r:blocked-$i")
+    [ "$result" = 0 ] || { chk 1 "DIFF unresolved apply writes nothing" "request record exists on node $i"; return 0; }
+  done
+  chk 0 "DIFF opposing decisions refuse application everywhere"
+  reply=$(rcli 2 diff.decide "$gkey" BY 'reviewer|resolved' "$rid" reject)
+  [ "$reply" = OK ] || { chk 1 "DIFF alternative rejection" "$reply"; return 0; }
+  diff_wait_view "$gkey" "$lid" "$rid" resolved || return 0
+  for i in 0 1; do
+    rcli "$i" -2 --json diff.apply "$gkey" REQUEST "resolved-$i" > "$CHAOS_DIR/applied.node$i.json"
+  done
+  if ! sid0=$(diff_json applied < "$CHAOS_DIR/applied.node0.json") || ! sid1=$(diff_json applied < "$CHAOS_DIR/applied.node1.json"); then
+    chk 1 "DIFF resolved apply" "invalid result replies"; return 0
+  fi
+  [ "$sid0" = "$sid1" ] || { chk 1 "DIFF result SIDs" "$sid0 != $sid1"; return 0; }
+  rcli 0 -2 --json json.get "doc:{negotiation}:s:$sid0" . > "$CHAOS_DIR/result.node0.json"
+  rcli 1 -2 --json json.get "doc:{negotiation}:s:$sid1" . > "$CHAOS_DIR/result.node1.json"
+  if ! doc0=$(diff_json doc < "$CHAOS_DIR/result.node0.json") || ! doc1=$(diff_json doc < "$CHAOS_DIR/result.node1.json"); then
+    chk 1 "DIFF result documents" "missing or incorrect chosen alternative"; return 0
+  fi
+  [ "$doc0" = "$doc1" ] && chk 0 "DIFF independent requests yield identical SIDs and chosen documents" || chk 1 "DIFF result documents" "node documents differ"
   check_replication_healed 60
 }
 

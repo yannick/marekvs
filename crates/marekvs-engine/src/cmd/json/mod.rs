@@ -253,6 +253,9 @@ fn set_in(ctx: &ShardCtx, key: &[u8], pp: &ParsedPath, value: &Value, nx: bool, 
 }
 
 pub async fn set(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() < 4 || args.len() > 5 {
         return Reply::wrong_args("json.set");
     }
@@ -283,7 +286,12 @@ pub async fn set(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
 }
 
 pub async fn mset(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
-    if args.len() < 4 || (args.len() - 1) % 3 != 0 {
+    if let Err(reply) =
+        crate::cmd::diff::keys::guard(args.iter().skip(1).step_by(3).map(Vec::as_slice))
+    {
+        return reply;
+    }
+    if args.len() < 4 || !(args.len() - 1).is_multiple_of(3) {
         return Reply::wrong_args("json.mset");
     }
     // validate everything up front; the writes are still per-key only
@@ -435,6 +443,9 @@ pub async fn mget(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
 // ---------------------------------------------------------------------------
 
 pub async fn del(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() < 2 || args.len() > 3 {
         return Reply::wrong_args("json.del");
     }
@@ -550,6 +561,9 @@ fn num_apply(cur: &Value, delta: &Value, mult: bool) -> Option<Value> {
 }
 
 pub async fn numop(engine: &Arc<Engine>, args: &[Vec<u8>], mult: bool) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() != 4 {
         return Reply::wrong_args(if mult {
             "json.nummultby"
@@ -602,6 +616,9 @@ pub async fn numop(engine: &Arc<Engine>, args: &[Vec<u8>], mult: bool) -> Reply 
 // ---------------------------------------------------------------------------
 
 pub async fn strappend(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() < 3 || args.len() > 4 {
         return Reply::wrong_args("json.strappend");
     }
@@ -684,6 +701,9 @@ pub async fn strlen(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
 }
 
 pub async fn toggle(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() != 3 {
         return Reply::wrong_args("json.toggle");
     }
@@ -740,6 +760,9 @@ fn path_arg_or_root(args: &[Vec<u8>], i: usize) -> Result<ParsedPath, Reply> {
 const NOT_ARRAY: &str = "ERR path does not hold an array";
 
 pub async fn arrappend(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() < 4 {
         return Reply::wrong_args("json.arrappend");
     }
@@ -857,6 +880,9 @@ pub async fn arrindex(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
 }
 
 pub async fn arrinsert(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() < 5 {
         return Reply::wrong_args("json.arrinsert");
     }
@@ -958,6 +984,9 @@ pub async fn arrlen(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
 }
 
 pub async fn arrpop(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() < 2 || args.len() > 4 {
         return Reply::wrong_args("json.arrpop");
     }
@@ -1013,6 +1042,9 @@ pub async fn arrpop(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
 }
 
 pub async fn arrtrim(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() != 5 {
         return Reply::wrong_args("json.arrtrim");
     }
@@ -1137,6 +1169,9 @@ pub async fn objlen(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
 // ---------------------------------------------------------------------------
 
 pub async fn clear(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() < 2 || args.len() > 3 {
         return Reply::wrong_args("json.clear");
     }
@@ -1231,6 +1266,9 @@ fn apply_merge(
 }
 
 pub async fn merge(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() != 4 {
         return Reply::wrong_args("json.merge");
     }

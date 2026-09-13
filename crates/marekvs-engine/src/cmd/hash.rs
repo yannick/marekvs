@@ -204,7 +204,7 @@ fn remove_field(ctx: &ShardCtx, key: &[u8], field: &[u8], del: u64) -> bool {
 }
 
 pub async fn hset(engine: &Arc<Engine>, args: &[Vec<u8>], hmset_reply: bool) -> Reply {
-    if args.len() < 4 || args.len() % 2 != 0 {
+    if args.len() < 4 || !args.len().is_multiple_of(2) {
         return Reply::wrong_args("hset");
     }
     let key = args[1].clone();

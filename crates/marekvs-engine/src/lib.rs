@@ -178,6 +178,7 @@ impl Session {
 }
 
 pub struct Engine {
+    pub diff: cmd::diff::pool::DiffState,
     pub store: Arc<Store>,
     pub pubsub: Arc<PubSub>,
     pub read_through: parking_lot::RwLock<Option<Arc<dyn ReadThrough>>>,
@@ -288,6 +289,7 @@ impl Engine {
             store.node_id as u32
         );
         Arc::new(Engine {
+            diff: cmd::diff::pool::DiffState::new(&metrics.registry),
             store,
             pubsub: PubSub::new(),
             read_through: parking_lot::RwLock::new(None),
@@ -398,7 +400,14 @@ impl Engine {
     pub fn is_write_command(name: &str) -> bool {
         matches!(
             name,
-            "SET"
+            "DIFF.SNAPSHOT"
+                | "DIFF.FORK"
+                | "DIFF.COMPARE"
+                | "DIFF.IMPORT"
+                | "DIFF.DECIDE"
+                | "DIFF.APPLY"
+                | "DIFF.MERGE3"
+                | "SET"
                 | "SETNX"
                 | "SETEX"
                 | "PSETEX"

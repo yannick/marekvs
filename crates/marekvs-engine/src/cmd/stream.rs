@@ -356,7 +356,7 @@ pub async fn xadd(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
     };
     i += 1;
     let rest = &args[i..];
-    if rest.is_empty() || rest.len() % 2 != 0 {
+    if rest.is_empty() || !rest.len().is_multiple_of(2) {
         return Reply::wrong_args("xadd");
     }
     let fields: Vec<(Vec<u8>, Vec<u8>)> = rest
@@ -547,7 +547,7 @@ pub async fn xread(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         return Reply::syntax();
     };
     let tail = &args[streams_at..];
-    if tail.is_empty() || tail.len() % 2 != 0 {
+    if tail.is_empty() || !tail.len().is_multiple_of(2) {
         return Reply::err(
             "ERR Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified.",
         );
