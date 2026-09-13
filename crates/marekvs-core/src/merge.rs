@@ -193,7 +193,18 @@ fn encode_element(
 
 /// A fresh single-add element record.
 pub fn element_add(rtype: RecordType, hlc: u64, origin: NodeId, value: &[u8]) -> Vec<u8> {
-    let dot = Dot { hlc, origin };
+    element_add_with_dot(rtype, hlc, origin, Dot { hlc, origin }, value)
+}
+
+/// A fresh envelope with a caller-supplied stable add identity. The identity
+/// is payload only and must never be observed into the local HLC.
+pub fn element_add_with_dot(
+    rtype: RecordType,
+    hlc: u64,
+    origin: NodeId,
+    dot: Dot,
+    value: &[u8],
+) -> Vec<u8> {
     encode_element(
         rtype,
         (hlc, origin),
@@ -817,7 +828,7 @@ mod counter_field_tests {
     fn repeated_same_node_increments_do_not_accumulate_dots() {
         let mut rec = incr(None, 100, 1, 1);
         for hlc in 101..140 {
-            rec = incr(Some(&Envelope::decode(&rec).unwrap().1), hlc, 1, 1);
+            rec = incr(Some(Envelope::decode(&rec).unwrap().1), hlc, 1, 1);
         }
         let (_, pay) = Envelope::decode(&rec).unwrap();
         let st = ElementState::decode(pay).unwrap();
@@ -833,8 +844,8 @@ mod counter_field_tests {
         let mut b = incr(None, 100, 2, 1);
         let mut hlc = 200;
         for _ in 0..10 {
-            a = incr(Some(&Envelope::decode(&a).unwrap().1), hlc, 1, 1);
-            b = incr(Some(&Envelope::decode(&b).unwrap().1), hlc + 1, 2, 1);
+            a = incr(Some(Envelope::decode(&a).unwrap().1), hlc, 1, 1);
+            b = incr(Some(Envelope::decode(&b).unwrap().1), hlc + 1, 2, 1);
             hlc += 2;
             let m = merged(&a, &b);
             assert_eq!(m, merged(&b, &a));
@@ -923,5 +934,25 @@ mod counter_field_tests {
             ElementState::decode(mpay).unwrap().is_dead(),
             "HDEL must remove a counter field"
         );
+    }
+}
+
+#[cfg(test)]
+mod deterministic_dot_tests {
+    use super::*;
+    #[test]
+    fn deterministic_add_payload_and_merge_are_idempotent() {
+        let dot = Dot { hlc: 7, origin: 0 };
+        let a = element_add_with_dot(RecordType::HashField, 100, 1, dot, b"same");
+        let b = element_add_with_dot(RecordType::HashField, 200, 2, dot, b"same");
+        assert_eq!(
+            Envelope::decode(&a).unwrap().1,
+            Envelope::decode(&b).unwrap().1
+        );
+        let outcome = merge_values(&a, &b);
+        let merged = resolve(&a, &b, &outcome);
+        let state = ElementState::decode(Envelope::decode(merged).unwrap().1).unwrap();
+        assert_eq!(state.live, vec![(dot, b"same".to_vec())]);
+        assert_eq!(resolve(merged, &a, &merge_values(merged, &a)), merged);
     }
 }

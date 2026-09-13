@@ -308,7 +308,19 @@ pub fn decompose(
 ) -> Vec<JsonRecord> {
     let mut out = Vec::new();
     let mut path = encode_path(base);
-    decompose_into(&mut path, v, fresh, &mut out);
+    decompose_into(&mut path, v, &mut |_, _| fresh(), &mut out);
+    out
+}
+
+/// Flatten a value with identities selected from the encoded containing array
+/// path and zero-based ordinal. Other decomposition semantics are unchanged.
+pub fn decompose_with_paths(
+    base: &[Seg],
+    v: &serde_json::Value,
+    fresh: &mut dyn FnMut(&[u8], usize) -> Eid,
+) -> Vec<JsonRecord> {
+    let mut out = Vec::new();
+    decompose_into(&mut encode_path(base), v, fresh, &mut out);
     out
 }
 
@@ -331,7 +343,7 @@ pub fn jval_of(v: &serde_json::Value) -> JVal {
 fn decompose_into(
     path: &mut Vec<u8>,
     v: &serde_json::Value,
-    fresh: &mut dyn FnMut() -> Eid,
+    fresh: &mut dyn FnMut(&[u8], usize) -> Eid,
     out: &mut Vec<JsonRecord>,
 ) {
     out.push(JsonRecord::Map {
@@ -351,7 +363,7 @@ pub fn decompose_children_at(
 ) -> Vec<JsonRecord> {
     let mut out = Vec::new();
     let mut path = base_path.to_vec();
-    decompose_children(&mut path, v, fresh, &mut out);
+    decompose_children(&mut path, v, &mut |_, _| fresh(), &mut out);
     out
 }
 
@@ -361,7 +373,7 @@ pub fn decompose_children_at(
 fn decompose_children(
     path: &mut Vec<u8>,
     v: &serde_json::Value,
-    fresh: &mut dyn FnMut() -> Eid,
+    fresh: &mut dyn FnMut(&[u8], usize) -> Eid,
     out: &mut Vec<JsonRecord>,
 ) {
     match v {
@@ -375,8 +387,8 @@ fn decompose_children(
         }
         serde_json::Value::Array(a) => {
             let mut left = EID_HEAD;
-            for child in a {
-                let e = fresh();
+            for (ordinal, child) in a.iter().enumerate() {
+                let e = fresh(path, ordinal);
                 let len = path.len();
                 push_seg(path, &Seg::Elem(e));
                 out.push(JsonRecord::Arr {
@@ -946,5 +958,33 @@ mod tests {
         let info = &doc.index.arrays[&tags_path];
         assert_eq!(info.order, vec![eid(1, 1), eid(2, 1)]);
         assert_eq!(info.last, Some(eid(2, 1)));
+    }
+}
+
+#[cfg(test)]
+mod path_decompose_tests {
+    use super::*;
+    #[test]
+    fn path_callback_matches_existing_decomposition() {
+        let value = serde_json::json!({"outer":[[1,2],3]});
+        let mut n = 0;
+        let mut calls = vec![];
+        let paths = decompose_with_paths(&[], &value, &mut |path, ordinal| {
+            calls.push((path.to_vec(), ordinal));
+            n += 1;
+            Eid { hlc: n, origin: 1 }
+        });
+        let mut n = 0;
+        let plain = decompose(&[], &value, &mut || {
+            n += 1;
+            Eid { hlc: n, origin: 1 }
+        });
+        assert_eq!(paths, plain);
+        let outer = encode_path(&[Seg::Field(b"outer".to_vec())]);
+        assert_eq!(calls[0], (outer.clone(), 0));
+        assert_eq!(calls[3], (outer, 1));
+        assert_eq!(calls[1].1, 0);
+        assert_eq!(calls[2].1, 1);
+        assert_eq!(calls[1].0, calls[2].0);
     }
 }

@@ -1,0 +1,71 @@
+{
+  "t": "doc",
+  "c": [
+    {
+      "t": "sec",
+      "a": {
+        "title": "Definitions",
+        "level": 1
+      },
+      "c": [
+        {
+          "t": "par",
+          "c": [
+            {
+              "t": "sen",
+              "x": "The parties agree to the following definitions."
+            },
+            {
+              "t": "sen",
+              "x": "Each party will appoint one representative."
+            },
+            {
+              "t": "sen",
+              "x": "This Agreement may commence on the Effective Date."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "t": "sec",
+      "a": {
+        "title": "Payment",
+        "level": 1
+      },
+      "c": [
+        {
+          "t": "par",
+          "c": [
+            {
+              "t": "sen",
+              "x": "Payment is due within thirty days."
+            },
+            {
+              "t": "sen",
+              "x": "The fee includes reasonable travel expenses."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "t": "sec",
+      "a": {
+        "title": "Term",
+        "level": 1
+      },
+      "c": [
+        {
+          "t": "par",
+          "c": [
+            {
+              "t": "sen",
+              "x": "The initial term is twelve months."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -305,7 +305,7 @@ pub fn config(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
             // (config is env-driven — this keeps redis-benchmark & friends
             // working). Runtime changes are ephemeral: the env is the source
             // of truth again after a restart.
-            if args.len() < 4 || args.len() % 2 != 0 {
+            if args.len() < 4 || !args.len().is_multiple_of(2) {
                 return Reply::wrong_args("config|set");
             }
             for kv in args[2..].chunks(2) {

@@ -138,10 +138,42 @@
     </div>
   </section>
 
+  <!-- DOCUMENT REVIEW -->
+  <section class="band alt" id="document-review">
+    <div class="section-head">
+      <span class="sec-num">02</span><h2>Review document changes before applying them</h2><div class="rule"></div>
+    </div>
+    <p class="band-lede">The experimental <code>DIFF.*</code> extension turns
+    structured document versions into suggestions you can review individually,
+    using the same Redis connection.</p>
+    <div class="feature-grid">
+      <div class="feat card">
+        <div class="feat-ico" aria-hidden="true">⇄</div>
+        <h3>Compare versions</h3>
+        <p>Find insertions, deletions, moves, text edits, formatting and attribute
+        changes. Compare two versions or merge two edited branches against a shared base.</p>
+      </div>
+      <div class="feat card">
+        <div class="feat-ico" aria-hidden="true">✓</div>
+        <h3>Decide together</h3>
+        <p>Accept, reject or leave suggestions pending. Decisions replicate with
+        reviewer attribution; conflicting selections return the changes to resolve.</p>
+      </div>
+      <div class="feat card">
+        <div class="feat-ico" aria-hidden="true">◇</div>
+        <h3>Apply a reviewed selection</h3>
+        <p>Create an immutable result snapshot with a retryable request token,
+        then fork it into a branch when you are ready to keep editing.</p>
+      </div>
+    </div>
+    <p class="band-lede"><a href="{{base}}/docs/diff/#try-a-complete-review">Try a complete review →</a>
+    · <a href="{{base}}/docs/diff/#command-reference">Explore all ten commands</a></p>
+  </section>
+
   <!-- GUARANTEES -->
   <section class="band alt">
     <div class="section-head">
-      <span class="sec-num">02</span><h2>What we promise — and what we don't</h2><div class="rule"></div>
+      <span class="sec-num">03</span><h2>What we promise — and what we don't</h2><div class="rule"></div>
     </div>
     <p class="band-lede">marekvs is <strong>AP</strong>: available and partition-tolerant, eventually
     consistent. These are the guarantees the docs stand behind.</p>
@@ -169,7 +201,7 @@
   <!-- ARCHITECTURE -->
   <section class="band">
     <div class="section-head">
-      <span class="sec-num">03</span><h2>System shape at a glance</h2><div class="rule"></div>
+      <span class="sec-num">04</span><h2>System shape at a glance</h2><div class="rule"></div>
     </div>
     <div class="card diagram-card">
 <pre class="ascii"><code>          Redis clients (redis-cli, any RESP driver)
@@ -194,7 +226,7 @@
   <!-- PERFORMANCE -->
   <section class="band alt">
     <div class="section-head">
-      <span class="sec-num">04</span><h2>Honest about performance</h2><div class="rule"></div>
+      <span class="sec-num">05</span><h2>Honest about performance</h2><div class="rule"></div>
     </div>
     <div class="stat-row">
       <div class="stat card"><div class="stat-num">~100µs</div><div class="stat-lbl">GET p50 target</div></div>
@@ -214,7 +246,7 @@
   <!-- QUICKSTART -->
   <section class="band">
     <div class="section-head">
-      <span class="sec-num">05</span><h2>Up in one command</h2><div class="rule"></div>
+      <span class="sec-num">06</span><h2>Up in one command</h2><div class="rule"></div>
     </div>
     <div class="quick-grid">
       <div class="card quick-card">

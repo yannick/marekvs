@@ -54,6 +54,9 @@ pub fn del_key_hlc(ctx: &ShardCtx, key: &[u8]) -> Option<u64> {
 }
 
 pub async fn del(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.iter().skip(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() < 2 {
         return Reply::wrong_args("del");
     }
@@ -195,6 +198,9 @@ pub async fn expiremember(
     mut mult: u64,
     absolute: bool,
 ) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() < 4 || (absolute && args.len() != 4) || args.len() > 5 {
         return Reply::wrong_args("expiremember");
     }
@@ -349,6 +355,9 @@ fn set_deadline(ctx: &ShardCtx, key: &[u8], deadline: u64) -> bool {
 }
 
 pub async fn expire(engine: &Arc<Engine>, args: &[Vec<u8>], mult: u64, absolute: bool) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() < 3 {
         return Reply::wrong_args("expire");
     }
@@ -387,6 +396,9 @@ pub async fn expire(engine: &Arc<Engine>, args: &[Vec<u8>], mult: u64, absolute:
 }
 
 pub async fn persist(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() != 2 {
         return Reply::wrong_args("persist");
     }
@@ -558,6 +570,11 @@ async fn budget_move_fence(
 }
 
 pub async fn rename(engine: &Arc<Engine>, args: &[Vec<u8>], nx: bool) -> Reply {
+    if let Err(reply) =
+        crate::cmd::diff::keys::guard(args.iter().skip(1).take(2).map(Vec::as_slice))
+    {
+        return reply;
+    }
     if args.len() != 3 {
         return Reply::wrong_args("rename");
     }
@@ -614,6 +631,9 @@ pub async fn rename(engine: &Arc<Engine>, args: &[Vec<u8>], nx: bool) -> Reply {
 }
 
 pub async fn copy(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(2).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() < 3 {
         return Reply::wrong_args("copy");
     }
@@ -971,7 +991,7 @@ fn hex_encode(b: &[u8]) -> String {
 }
 
 fn hex_decode(s: &[u8]) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let s = std::str::from_utf8(s).ok()?;

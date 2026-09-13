@@ -27,6 +27,18 @@ merges. Any node can serve any key.
   scales the cluster without losing data.
 - **Tiny** — a static binary in a `FROM scratch` container image.
 
+## Document review over the Redis protocol
+
+The experimental [DIFF extension](../diff/) compares structured documents,
+separates moves from text edits, and lets reviewers accept changes individually.
+Two-way comparisons and three-way merges produce immutable suggestion graphs;
+decisions replicate as attributed records. Applying a valid selection creates
+a snapshot that can be forked for further editing.
+
+Use it for version review or reconciling edited branches. Start with the
+[complete review example](../diff/#try-a-complete-review), or browse the
+[command reference](../redis-api/#document-comparison-marekvs-extension).
+
 ## Goals
 
 1. **Redis-compatible API** — drop-in for the command subset we implement.

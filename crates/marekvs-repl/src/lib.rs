@@ -1963,7 +1963,7 @@ impl ReplEngine {
                 // with each other and the origin's copy is invisible forever.
                 // The exchange is push-only (no_backfill) so a non-owner
                 // never accumulates partition data it merely offered to.
-                if round % 3 == 0 && !self.rejoin.lock().active {
+                if round.is_multiple_of(3) && !self.rejoin.lock().active {
                     let owned_set: std::collections::HashSet<Pid> = owned.iter().copied().collect();
                     for pid in 0..marekvs_core::PARTITIONS as Pid {
                         if owned_set.contains(&pid) {

@@ -1,0 +1,17 @@
+{
+  "t": "doc",
+  "c": [
+    {
+      "t": "sen",
+      "x": "Repeated clause."
+    },
+    {
+      "t": "sen",
+      "x": "Repeated clause."
+    },
+    {
+      "t": "sen",
+      "x": "Unique clause."
+    }
+  ]
+}

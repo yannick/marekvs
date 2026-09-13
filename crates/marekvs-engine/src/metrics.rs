@@ -571,3 +571,87 @@ impl Metrics {
 
 /// A `Histogram` alias kept public for future direct use.
 pub type LatencyHistogram = Histogram;
+
+/// Dedicated DIFF admission, compute and cache measurements.
+#[derive(Clone)]
+pub struct DiffMetrics {
+    pub operations: IntCounterVec,
+    pub duration: HistogramVec,
+    pub records: IntCounterVec,
+    pub inflight_bytes: IntGauge,
+    pub inflight_requests: IntGauge,
+    pub cache_bytes: IntGauge,
+    pub cache_hits: IntCounter,
+    pub queue_seconds: Histogram,
+    pub rejections: IntCounterVec,
+}
+impl DiffMetrics {
+    pub fn new(registry: &Registry) -> Self {
+        let m = Self {
+            operations: IntCounterVec::new(
+                Opts::new(
+                    "marekvs_diff_operations_total",
+                    "DIFF operations by verb and result",
+                ),
+                &["op", "result"],
+            )
+            .unwrap(),
+            duration: HistogramVec::new(
+                HistogramOpts::new("marekvs_diff_stage_seconds", "DIFF stage duration"),
+                &["stage"],
+            )
+            .unwrap(),
+            records: IntCounterVec::new(
+                Opts::new("marekvs_diff_records_total", "DIFF scanned records"),
+                &["kind"],
+            )
+            .unwrap(),
+            inflight_bytes: IntGauge::new(
+                "marekvs_diff_inflight_bytes",
+                "Bytes reserved by DIFF admission",
+            )
+            .unwrap(),
+            inflight_requests: IntGauge::new(
+                "marekvs_diff_inflight_requests",
+                "Live DIFF admissions",
+            )
+            .unwrap(),
+            cache_bytes: IntGauge::new(
+                "marekvs_diff_cache_bytes",
+                "Conservative semantic cache bytes",
+            )
+            .unwrap(),
+            cache_hits: IntCounter::new(
+                "marekvs_diff_cache_hits_total",
+                "Semantic tree cache hits",
+            )
+            .unwrap(),
+            queue_seconds: Histogram::with_opts(HistogramOpts::new(
+                "marekvs_diff_queue_seconds",
+                "DIFF worker queue wait",
+            ))
+            .unwrap(),
+            rejections: IntCounterVec::new(
+                Opts::new("marekvs_diff_rejections_total", "DIFF rejections"),
+                &["reason"],
+            )
+            .unwrap(),
+        };
+        registry.register(Box::new(m.operations.clone())).unwrap();
+        registry.register(Box::new(m.duration.clone())).unwrap();
+        registry.register(Box::new(m.records.clone())).unwrap();
+        registry
+            .register(Box::new(m.inflight_bytes.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(m.inflight_requests.clone()))
+            .unwrap();
+        registry.register(Box::new(m.cache_bytes.clone())).unwrap();
+        registry.register(Box::new(m.cache_hits.clone())).unwrap();
+        registry
+            .register(Box::new(m.queue_seconds.clone()))
+            .unwrap();
+        registry.register(Box::new(m.rejections.clone())).unwrap();
+        m
+    }
+}

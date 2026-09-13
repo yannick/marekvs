@@ -968,6 +968,16 @@ static TABLE: &[CommandDoc] = &[
           Arg { token: Some("SEQ"), optional: true, ..arg("op-seq", "integer") }]),
 
     // --- JSON documents (JSON.*, design/16) ---
+    with_args(cmd("diff.snapshot", 2, CW, 1, 1, 1, "Creates an immutable content-addressed document snapshot.", "0.3.2", "diff"), ARGS_KEY),
+    with_args(cmd("diff.fork", -3, CW, 1, 2, 1, "Creates an identity-preserving working copy.", "0.3.2", "diff"), &[arg("source","key"),arg("destination","key"),Arg{optional:true,token:Some("REPLACE"),..arg("replace","pure-token")}]),
+    with_args(cmd("diff.compare", -3, CW, 1, 2, 1, "Compares document snapshots and stores a change graph.", "0.3.2", "diff"), &[arg("source","key"),arg("target","key"),Arg{optional:true,token:Some("LEVEL"),..arg("level","string")},Arg{optional:true,token:Some("THETA"),..arg("theta","double")}]),
+    with_args(cmd("diff.hash", -2, CRO, 1, 1, 1, "Returns subtree exact/content hashes and weight.", "0.3.2", "diff"), &[A_KEY,Arg{optional:true,..arg("path","string")}]),
+    with_args(cmd("diff.stats", 1, CRO, 0, 0, 0, "Reports comparison runtime counters.", "0.3.2", "diff"), &[]),
+    with_args(cmd("diff.decide", -4, CW, 1, 1, 1, "Records atomic per-change decisions with attribution.", "0.3.2", "diff"), &[arg("graph","key"),Arg{optional:true,token:Some("BY"),..arg("principal","string")},Arg{multiple:true,..arg("id-state","string")}]),
+    with_args(cmd("diff.decisions", 2, CRO, 1, 1, 1, "Returns decisions, revision and unresolved changes.", "0.3.2", "diff"), &[arg("graph","key")]),
+    with_args(cmd("diff.apply", -4, CW, 1, 1, 1, "Applies accepted suggestions to an immutable result snapshot.", "0.3.2", "diff"), &[arg("graph","key"),Arg{token:Some("REQUEST"),..arg("request","string")},Arg{optional:true,token:Some("DECISIONS"),..arg("revision","string")}]),
+    with_args(cmd("diff.merge3", 4, CW, 1, 3, 1, "Builds a three-way merge graph and default decisions.", "0.3.2", "diff"), &[arg("base","key"),arg("left","key"),arg("right","key")]),
+    with_args(cmd("diff.import", -3, CW, 1, 1, 1, "Imports a canonical tree with identity-preserving record deltas.", "0.3.2", "diff"), &[A_KEY,arg("tree","string"),Arg{optional:true,token:Some("FROM"),..arg("previous","key")},Arg{optional:true,token:Some("THETA"),..arg("theta","double")}]),
     with_args(cmd("json.set", -4, CW, 1, 1, 1, "Sets the JSON value at the path (per-path CRDT document).", "1.3.0", "json"),
         &[A_KEY, arg("path", "string"), arg("value", "string"),
           Arg { optional: true, args: SET_CONDITION, ..arg("condition", "oneof") }]),
@@ -1157,6 +1167,16 @@ fn arg_reply(a: &Arg) -> Reply {
 /// Raw key extraction via the first/last/step spec — shared by
 /// COMMAND GETKEYS and the script bridge's declared-key enforcement.
 pub fn extract_keys<'a>(d: &CommandDoc, argv: &'a [Vec<u8>]) -> Vec<&'a [u8]> {
+    if d.name == "diff.import" {
+        let mut keys = argv.get(1).map(|k| vec![k.as_slice()]).unwrap_or_default();
+        for pair in argv.get(3..).unwrap_or_default().chunks_exact(2) {
+            if pair[0].eq_ignore_ascii_case(b"FROM") {
+                keys.push(pair[1].as_slice());
+            }
+        }
+        return keys;
+    }
+
     if d.first_key == 0 {
         return Vec::new();
     }
@@ -1201,18 +1221,10 @@ pub fn getkeys(argv: &[Vec<u8>]) -> Reply {
     if d.first_key == 0 {
         return Reply::err("ERR The command has no key arguments");
     }
-    let last = if d.last_key < 0 {
-        argc + d.last_key
-    } else {
-        d.last_key
-    };
-    let step = if d.step <= 0 { 1 } else { d.step };
-    let mut keys = Vec::new();
-    let mut i = d.first_key;
-    while i <= last && (i as usize) < argv.len() {
-        keys.push(Reply::Bulk(argv[i as usize].clone()));
-        i += step;
-    }
+    let keys: Vec<_> = extract_keys(d, argv)
+        .into_iter()
+        .map(|k| Reply::Bulk(k.to_vec()))
+        .collect();
     if keys.is_empty() {
         return Reply::err("ERR Invalid arguments specified for command");
     }

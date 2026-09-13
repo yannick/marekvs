@@ -86,6 +86,9 @@ pub async fn get(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
 }
 
 pub async fn set(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() < 3 {
         return Reply::wrong_args("set");
     }
@@ -183,6 +186,9 @@ pub async fn set(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
 }
 
 pub async fn setnx(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() != 3 {
         return Reply::wrong_args("setnx");
     }
@@ -204,6 +210,9 @@ pub async fn setnx(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
 }
 
 pub async fn setex(engine: &Arc<Engine>, args: &[Vec<u8>], mult: u64) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() != 4 {
         return Reply::wrong_args("setex");
     }
@@ -225,6 +234,9 @@ pub async fn setex(engine: &Arc<Engine>, args: &[Vec<u8>], mult: u64) -> Reply {
 }
 
 pub async fn getset(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() != 3 {
         return Reply::wrong_args("getset");
     }
@@ -243,6 +255,9 @@ pub async fn getset(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
 }
 
 pub async fn getdel(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() != 2 {
         return Reply::wrong_args("getdel");
     }
@@ -263,6 +278,9 @@ pub async fn getdel(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
 }
 
 pub async fn getex(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() < 2 {
         return Reply::wrong_args("getex");
     }
@@ -310,6 +328,9 @@ pub async fn getex(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
 }
 
 pub async fn append(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() != 3 {
         return Reply::wrong_args("append");
     }
@@ -352,6 +373,9 @@ pub async fn incrby_cmd(
     sign: i64,
     takes_arg: bool,
 ) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     let want = if takes_arg { 3 } else { 2 };
     if args.len() != want {
         return Reply::wrong_args("incr");
@@ -420,6 +444,9 @@ pub async fn incrby_cmd(
 }
 
 pub async fn incrbyfloat(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() != 3 {
         return Reply::wrong_args("incrbyfloat");
     }
@@ -508,7 +535,12 @@ pub async fn mget(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
 }
 
 pub async fn mset(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
-    if args.len() < 3 || args.len() % 2 == 0 {
+    if let Err(reply) =
+        crate::cmd::diff::keys::guard(args.iter().skip(1).step_by(2).map(Vec::as_slice))
+    {
+        return reply;
+    }
+    if args.len() < 3 || args.len().is_multiple_of(2) {
         return Reply::wrong_args("mset");
     }
     // Group pairs by shard: ONE job and ONE ondadb transaction per shard
@@ -553,7 +585,12 @@ pub async fn mset(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
 }
 
 pub async fn msetnx(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
-    if args.len() < 3 || args.len() % 2 == 0 {
+    if let Err(reply) =
+        crate::cmd::diff::keys::guard(args.iter().skip(1).step_by(2).map(Vec::as_slice))
+    {
+        return reply;
+    }
+    if args.len() < 3 || args.len().is_multiple_of(2) {
         return Reply::wrong_args("msetnx");
     }
     // Check-then-set; atomic per shard only (documented cross-shard caveat).
@@ -581,6 +618,9 @@ pub async fn msetnx(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
 }
 
 pub async fn setrange(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
+    if let Err(reply) = crate::cmd::diff::keys::guard(args.get(1).map(Vec::as_slice)) {
+        return reply;
+    }
     if args.len() != 4 {
         return Reply::wrong_args("setrange");
     }

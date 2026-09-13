@@ -159,7 +159,7 @@ impl Mesh {
     }
 
     pub fn broadcast_ctl(&self, msg: &PeerMsg) {
-        for (_, h) in self.peers.read().iter() {
+        for h in self.peers.read().values() {
             if let Some(tx) = &h.ctl {
                 let _ = tx.try_send(msg.clone());
             }
@@ -270,7 +270,7 @@ impl Mesh {
 
     fn note_peer_caps(&self, peer: NodeId, proto: u16, features: u32) {
         let prev = self.caps.lock().insert(peer, (proto, features));
-        if prev.map(|(p, f)| (p, f)) != Some((proto, features)) {
+        if prev != Some((proto, features)) {
             tracing::info!(peer, proto, features, "peer capabilities");
         }
     }

@@ -1410,6 +1410,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "marekvs-diff"
+version = "0.3.2"
+dependencies = [
+ "marekvs-core",
+ "proptest",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "marekvs-engine"
 version = "0.3.2"
 dependencies = [
@@ -1417,6 +1429,7 @@ dependencies = [
  "crossbeam-channel",
  "libc",
  "marekvs-core",
+ "marekvs-diff",
  "marekvs-resp",
  "mlua",
  "ondadb",

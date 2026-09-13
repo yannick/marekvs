@@ -346,7 +346,7 @@ pub async fn zadd(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         return Reply::err("ERR GT, LT, and/or NX options at the same time are not compatible");
     }
     let rest = &args[i..];
-    if rest.is_empty() || rest.len() % 2 != 0 {
+    if rest.is_empty() || !rest.len().is_multiple_of(2) {
         return Reply::syntax();
     }
     if incr && rest.len() != 2 {

@@ -43,6 +43,10 @@ via the [ondaDB](https://github.com/yannick/ondadb) LSM engine — no in-memory 
 - **JSON documents** (`JSON.*`): the full RedisJSON v2 surface stored as a
   per-path CRDT — concurrent editors on different nodes merge structurally
   instead of clobbering whole documents ([JSON](design/16-json.md))
+- **Document comparison** (`DIFF.*`, experimental): immutable snapshots,
+  independent move/edit suggestions, replicated review decisions, three-way
+  merges, and identity-preserving import ([command reference](docs/diff.md),
+  [design](design/19-diff.md))
 - **Protobuf schema store** (`PROTO.*`): upload `.proto` schemas (compiled
   server-side), bind them to key prefixes, store validated messages with
   server-side field access, JSON projection, and **field-level CRDT merge** —
@@ -242,6 +246,7 @@ landing mid-close.
 |---|---|
 | `marekvs-core` | partitioning, HLC, envelopes, key layouts, merge rules (pure, property-tested) |
 | `marekvs-resp` | RESP2/3 parser + reply builder |
+| `marekvs-diff` | bounded structured-document comparison, merge and application |
 | `marekvs-proto` | peer wire messages (postcard) |
 | `marekvs-engine` | shard-threaded storage over ondaDB, command families, pub/sub |
 | `marekvs-cluster` | chitchat gossip, HRW placement |
