@@ -109,11 +109,17 @@ pub struct Metrics {
     /// Range-delete records committed to the `data` CF, and the durable
     /// fragments they still cost after flush and compaction have clipped them.
     ///
-    /// One cold-partition purge is one range delete, so `db_range_deletes`
-    /// tracks `cold_purged_partitions_total`. `db_range_fragments` is the one
-    /// to alert on: fragments growing without bound mean purges are outrunning
-    /// compaction's ability to retire them, and every read pays for the
-    /// unretired spans.
+    /// These CF counters cover committed range deletes and catalogued SST
+    /// fragments. They exclude live memtable spans; the DB range_memtable
+    /// and range_fragment_cache/retained metrics expose that memory separately.
+    pub cold_purge_empty_skips_total: IntCounter,
+    pub cold_purge_stale_proofs_total: IntCounter,
+    pub db_range_memtable_spans: IntGauge,
+    pub db_range_memtable_bytes: IntGauge,
+    pub db_range_fragment_cache_bytes: IntGauge,
+    pub db_range_fragment_retained_bytes: IntGauge,
+    pub db_range_fragment_cache_builds: IntGauge,
+    pub db_range_fragment_cache_hits: IntGauge,
     pub db_range_deletes: IntGauge,
     pub db_range_fragments: IntGauge,
     /// Tables delete-only excise has retired, and the bytes they held — space
@@ -402,6 +408,14 @@ impl Metrics {
                 "marekvs_db_compaction_write_stopped",
                 "1 while client write commands are refused (compaction backlog above high-water)"
             ),
+            cold_purge_empty_skips_total: counter!(registry, "marekvs_cold_purge_empty_skips_total", "Complete empty cold-partition probes skipped without issuing range deletes"),
+            cold_purge_stale_proofs_total: counter!(registry, "marekvs_cold_purge_stale_proofs_total", "Cold cleanup attempts rejected due to stale generation or ownership proof"),
+            db_range_memtable_spans: gauge!(registry, "marekvs_db_range_memtable_spans", "Live range-delete spans retained by memtables"),
+            db_range_memtable_bytes: gauge!(registry, "marekvs_db_range_memtable_bytes", "Bytes retained by live memtable range-delete spans"),
+            db_range_fragment_cache_bytes: gauge!(registry, "marekvs_db_range_fragment_cache_bytes", "Live current range-fragment snapshot bytes"),
+            db_range_fragment_retained_bytes: gauge!(registry, "marekvs_db_range_fragment_retained_bytes", "All live retained range-fragment snapshots including superseded generations"),
+            db_range_fragment_cache_builds: gauge!(registry, "marekvs_db_range_fragment_cache_builds", "Range-fragment snapshot builds across currently live memtable sets"),
+            db_range_fragment_cache_hits: gauge!(registry, "marekvs_db_range_fragment_cache_hits", "Range-fragment snapshot hits across currently live memtable sets"),
             db_range_deletes: gauge!(
                 registry,
                 "marekvs_db_range_deletes",

@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: marekvs
+      - name: resolve tested ondaDB revision
+        id: ondadb
+        working-directory: marekvs
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+          with open("Cargo.lock", "rb") as f:
+              lock = tomllib.load(f)
+          package = next(p for p in lock["package"] if p["name"] == "ondadb")
+          revision = package["source"].rsplit("#", 1)[1]
+          assert len(revision) == 40 and all(c in "0123456789abcdef" for c in revision)
+          print(f"ref={revision}")
+          PY
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/ondadb
+          ref: ${{ steps.ondadb.outputs.ref }}
+          path: ondadb
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            marekvs
+            ondadb
+      - name: marekvs formatting, lint and regression suites
+        working-directory: marekvs
+        run: |
+          cargo fmt --all --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace
+          python3 tests/chaos/grudge.py --test
+      - name: ondaDB regression suites (including range mask reuse)
+        working-directory: ondadb
+        run: |
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          cargo clippy --locked --all-targets --features unsafe-fastpath -- -D warnings
+          cargo test --locked --features unsafe-fastpath

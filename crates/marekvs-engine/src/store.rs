@@ -5,6 +5,8 @@
 //! atomic read-modify-write without locks. The tokio side submits closures
 //! and awaits a oneshot.
 
+pub mod expiry;
+
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -112,6 +114,9 @@ type Job = Box<dyn FnOnce(&ShardCtx) + Send>;
 
 /// Everything a storage job can touch. One per shard thread.
 pub struct ShardCtx {
+    /// Raw access for reads/maintenance. Every data mutation must execute
+    /// through run/run_key on its owning shard, including direct transactions.
+    /// Off-shard raw data writers violate expiry and cold-purge serialization.
     pub db: DB,
     pub data: Arc<ColumnFamily>,
     pub meta: Arc<ColumnFamily>,
@@ -122,6 +127,8 @@ pub struct ShardCtx {
     /// can never collide with the dead incarnation's escrow records.
     pub epoch: u64,
     pub shard: usize,
+    pub shard_count: usize,
+    pub maintenance: Arc<expiry::MaintenanceState>,
     /// Pop-front cursors: collection scan prefix → internal key of the last
     /// popped element. Pops (SPOP/ZPOPMIN) leave element tombstones at the
     /// scan front, so pop #k would otherwise skip k dead records — the LSM
@@ -314,6 +321,9 @@ pub fn scan_from(
 }
 
 pub struct Store {
+    /// Raw access for reads/maintenance. Every data mutation must execute
+    /// through run/run_key on its owning shard, including direct transactions.
+    /// Off-shard raw data writers violate expiry and cold-purge serialization.
     pub db: DB,
     pub data: Arc<ColumnFamily>,
     pub meta: Arc<ColumnFamily>,
@@ -327,6 +337,8 @@ pub struct Store {
     pub epoch_fresh: bool,
     /// Data directory, kept for filesystem usage stats (disk-full guard).
     pub data_dir: std::path::PathBuf,
+    pub maintenance: Arc<expiry::MaintenanceState>,
+    replication_observer: Arc<parking_lot::RwLock<Option<ondadb::CommitHookFn>>>,
     shards: Vec<Sender<Job>>,
     shard_handles: Vec<std::thread::JoinHandle<()>>,
 }
@@ -518,7 +530,6 @@ impl Store {
             None => db.create_column_family("meta", cf_config())?,
         };
         let hlc = Arc::new(Hlc::new());
-        SHARD_TOTAL.store(cfg.shard_threads, std::sync::atomic::Ordering::Relaxed);
 
         // Store epoch: minted only when absent; persisted in the meta CF so
         // it is stable across restarts of the same data directory.
@@ -555,6 +566,29 @@ impl Store {
 
         let mut shards = Vec::with_capacity(cfg.shard_threads);
         let mut shard_handles = Vec::with_capacity(cfg.shard_threads);
+        let maintenance = Arc::new(expiry::MaintenanceState::new());
+        let replication_observer = Arc::new(parking_lot::RwLock::new(None::<ondadb::CommitHookFn>));
+        let observed = maintenance.clone();
+        let replication = replication_observer.clone();
+        // Permanent local observer. A replacing/suppressed replication hook
+        // never suppresses maintenance, including budget and index commits.
+        // Hooks run after visibility but before commit returns. All production
+        // data writers and proof publication execute on the owning shard,
+        // so no proof can pass through the visible-before-hook gap. Public DB
+        // handles must not be used to introduce off-shard data writers.
+        data.set_commit_hook(Some(Arc::new(move |seq, ops| {
+            #[cfg(debug_assertions)]
+            observed.before_observer();
+            for op in ops {
+                if op.key.len() >= 2 {
+                    observed.invalidate(u16::from_be_bytes([op.key[0], op.key[1]]));
+                }
+            }
+            let callback = replication.read().clone();
+            if let Some(callback) = callback {
+                callback(seq, ops);
+            }
+        })));
         for shard in 0..cfg.shard_threads {
             let (tx, rx): (Sender<Job>, Receiver<Job>) = crossbeam_channel::bounded(4096);
             let ctx = ShardCtx {
@@ -565,6 +599,8 @@ impl Store {
                 node_id: cfg.node_id,
                 epoch,
                 shard,
+                shard_count: cfg.shard_threads,
+                maintenance: maintenance.clone(),
                 pop_hints: std::cell::RefCell::new(std::collections::HashMap::new()),
             };
             let handle = std::thread::Builder::new()
@@ -583,6 +619,8 @@ impl Store {
             epoch,
             epoch_fresh,
             data_dir: std::path::PathBuf::from(&cfg.data_dir),
+            maintenance,
+            replication_observer,
             shards,
             shard_handles,
         }))
@@ -634,9 +672,13 @@ impl Store {
         let _ = self.shards[self.shard_of(pid)].send(Box::new(f));
     }
 
-    /// Install the post-commit hook on the data CF (replication feed).
+    pub fn partition_generation(&self, pid: Pid) -> u64 {
+        self.maintenance.generation(pid)
+    }
+
+    /// Replace the replication observer; local maintenance remains installed.
     pub fn set_commit_hook(&self, hook: Option<ondadb::CommitHookFn>) {
-        self.data.set_commit_hook(hook);
+        *self.replication_observer.write() = hook;
     }
 }
 
@@ -669,93 +711,26 @@ pub fn with_inline_ctx<T>(shard_idx: usize, f: impl FnOnce(&ShardCtx) -> T) -> O
 fn shard_loop(ctx: ShardCtx, rx: Receiver<Job>) {
     let ctx = std::rc::Rc::new(ctx);
     CURRENT_SHARD_CTX.with(|c| *c.borrow_mut() = Some(ctx.clone()));
-    // Expiry sweeping (design/01): incremental cursor walk between jobs.
-    let mut sweep_cursor: Vec<u8> = Vec::new();
+    let mut scheduler =
+        expiry::ExpiryScheduler::new(ctx.maintenance.clone(), ctx.shard, ctx.shard_count);
+    let mut next_poll = std::time::Instant::now() + scheduler.next_wait(now_ms());
     loop {
-        match rx.recv_timeout(Duration::from_millis(100)) {
+        match rx.recv_timeout(next_poll.saturating_duration_since(std::time::Instant::now())) {
             Ok(job) => job(&ctx),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if let Err(e) = sweep_expired(&ctx, &mut sweep_cursor, 128) {
-                    // Passive ondaDB TTL is still the backstop, so a failed
-                    // sweep delays active expiry rather than losing it.
-                    tracing::warn!(shard = ctx.shard, error = %e, "expiry sweep incomplete");
-                }
-            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
         }
-    }
-}
-
-/// Walk up to `budget` records from the cursor; write expiry tombstones for
-/// records whose TTL deadline passed. Expiry tombstone HLC = deadline<<16 so
-/// every node converges on the identical tombstone (design/05).
-fn sweep_expired(
-    ctx: &ShardCtx,
-    cursor: &mut Vec<u8>,
-    budget: usize,
-) -> Result<(), ScanIncomplete> {
-    let now = now_ms();
-    let mut expired: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let outcome;
-    {
-        let txn = ctx.db.begin();
-        let mut it = txn.new_iterator(&ctx.data);
-        if cursor.is_empty() {
-            it.seek_to_first();
-        } else {
-            it.seek(cursor);
-        }
-        let mut n = 0;
-        while it.valid() && n < budget {
-            // Shard ownership check: this thread only touches its own pids.
-            if let Some(parsed) = ikey::parse(it.key()) {
-                // Budget records (tag 'b') NEVER expire generically: token
-                // deadlines live in the payload and only the issuing node
-                // may fold them — a replica-sweeper tombstone here would
-                // destroy pre-fold state the issuer's escrow credit needs
-                // (design/13). They carry no envelope TTL today; the skip is
-                // explicit so a future TTL use can't reintroduce the trace.
-                if parsed.tag != ikey::Tag::Budget as u8
-                    && parsed.pid as usize % shard_total(ctx) == ctx.shard
-                {
-                    if let Some((env, pay)) = Envelope::decode(it.value()) {
-                        if !env.is_tombstone() && env.is_expired(now) {
-                            expired.push((it.key().to_vec(), expiry_tombstone(&env, pay)));
-                        }
-                    }
-                }
+        if std::time::Instant::now() >= next_poll {
+            if let Err(e) = scheduler.poll(&ctx, now_ms(), 128, 8, Duration::from_millis(2)) {
+                tracing::warn!(shard = ctx.shard, error = %e, "expiry discovery incomplete");
             }
-            n += 1;
-            it.next();
-        }
-        outcome = scan_outcome(&it);
-        // A failed walk leaves the cursor where it was so the next tick retries
-        // the same ground. Treating the invalid iterator as "reached the end"
-        // would rewind the sweep to the start of the keyspace on every error.
-        if outcome.is_ok() {
-            *cursor = if it.valid() {
-                it.key().to_vec()
-            } else {
-                Vec::new()
-            };
+            // Never catch up unbounded work after a pause, and never let an
+            // always-ready foreground queue starve due maintenance.
+            next_poll = std::time::Instant::now()
+                + scheduler.next_wait(now_ms()).max(Duration::from_millis(1));
         }
     }
-    for (k, v) in expired {
-        // Normal merged write → commit hook fires → expiry replicates.
-        // These were genuinely observed, so they are written even if the walk
-        // was cut short.
-        write_merged(ctx, &k, &v);
-    }
-    outcome
 }
-
-fn shard_total(_ctx: &ShardCtx) -> usize {
-    // Each ShardCtx knows only its index; total is implied by construction.
-    // Stored once at startup in a global to keep ShardCtx Copy-free.
-    SHARD_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
-}
-pub(crate) static SHARD_TOTAL: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(1);
 
 fn expiry_tombstone(env: &Envelope, payload: &[u8]) -> Vec<u8> {
     let rtype = env.rtype();
@@ -874,7 +849,24 @@ pub fn del_raw(ctx: &ShardCtx, ikey: &[u8]) {
 /// The scan-and-tombstone predecessor depended on a `suppress_commit_hook()`
 /// guard for that; here it is a property of the operation instead of something
 /// a future refactor has to remember.
+pub fn partition_has_data(ctx: &ShardCtx, pid: Pid) -> Result<bool, ScanIncomplete> {
+    let txn = ctx.db.begin();
+    let lower = pid.to_be_bytes();
+    let upper = pid
+        .checked_add(1)
+        .ok_or_else(|| ScanIncomplete(format!("partition {pid} has no upper bound")))?
+        .to_be_bytes();
+    let mut it = bounded_iter(&txn, ctx, &lower, Some(&upper));
+    it.seek_to_first();
+    scan_outcome(&it)?;
+    Ok(it.valid())
+}
+
 pub fn delete_partition_range(ctx: &ShardCtx, pid: Pid) -> anyhow::Result<()> {
+    if !partition_has_data(ctx, pid)? {
+        return Ok(());
+    }
+
     // `Pid` is u16 and `ikey::PARTITIONS` is 4096, so `pid + 1` cannot overflow
     // a u16 in practice — but compute in u32 and encode two bytes anyway,
     // because a 4-byte end bound would sort BELOW every 2-byte key and silently
@@ -883,7 +875,9 @@ pub fn delete_partition_range(ctx: &ShardCtx, pid: Pid) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("partition {pid} has no representable upper bound"))?;
     ctx.db
         .delete_range(&ctx.data, &pid.to_be_bytes(), &end.to_be_bytes())
-        .map_err(|e| anyhow::anyhow!("range delete for partition {pid} failed: {e:?}"))
+        .map_err(|e| anyhow::anyhow!("range delete for partition {pid} failed: {e:?}"))?;
+    ctx.maintenance.invalidate(pid);
+    Ok(())
 }
 
 pub(crate) fn onda_ttl_for(value: &[u8]) -> Duration {
@@ -956,9 +950,29 @@ pub fn put_many_lww(ctx: &ShardCtx, items: &[(Vec<u8>, Vec<u8>)]) {
 /// Merge `incoming` into whatever is stored under `ikey`.
 /// Returns true when the stored bytes changed.
 pub fn write_merged(ctx: &ShardCtx, ikey: &[u8], incoming: &[u8]) -> bool {
-    let changed = match get_raw(ctx, ikey) {
+    match write_merged_checked(ctx, ikey, incoming) {
+        Ok(changed) => changed,
+        Err(e) => {
+            tracing::error!(?e, "merged write failed");
+            false
+        }
+    }
+}
+
+fn write_merged_checked(ctx: &ShardCtx, ikey: &[u8], incoming: &[u8]) -> anyhow::Result<bool> {
+    let local = match ctx.db.get(&ctx.data, ikey) {
+        Ok(value) => Some(value),
+        Err(ondadb::OndaError::NotFound) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let changed = match local {
         None => {
-            put_raw(ctx, ikey, incoming);
+            ctx.db.put(
+                &ctx.data,
+                ikey,
+                incoming,
+                onda_ttl_for_keyed(ikey, incoming),
+            )?;
             true
         }
         Some(local) => {
@@ -976,7 +990,8 @@ pub fn write_merged(ctx: &ShardCtx, ikey: &[u8], incoming: &[u8]) -> bool {
                 MergeOutcome::KeepLocal => false,
                 _ => {
                     let winner = resolve(&local, incoming, &outcome);
-                    put_raw(ctx, ikey, winner);
+                    ctx.db
+                        .put(&ctx.data, ikey, winner, onda_ttl_for_keyed(ikey, winner))?;
                     true
                 }
             }
@@ -997,7 +1012,7 @@ pub fn write_merged(ctx: &ShardCtx, ikey: &[u8], incoming: &[u8]) -> bool {
             }
         }
     }
-    changed
+    Ok(changed)
 }
 
 /// Collection head lookup: (envelope, ctype, del_hlc).

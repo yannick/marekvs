@@ -351,6 +351,154 @@ fn cold_ae_key(pid: Pid) -> Vec<u8> {
     format!("cold_ae:{pid}").into_bytes()
 }
 
+/// Nonces contain a fresh OS-random boot identifier and an incrementing
+/// sequence. No timestamp, reset generation, or restarted connection can
+/// accidentally turn a delayed response into proof for a newer request.
+#[derive(Clone, Copy, Debug)]
+struct PendingColdProof {
+    peer: NodeId,
+    nonce: [u8; 24],
+    root: u64,
+    generation: u64,
+    view_epoch: u64,
+}
+struct ColdProofRequests {
+    boot: Option<[u8; 16]>,
+    sequence: u64,
+    pending: HashMap<Pid, PendingColdProof>,
+}
+impl ColdProofRequests {
+    fn new() -> Self {
+        use std::io::Read;
+        let mut boot = [0u8; 16];
+        let random =
+            std::fs::File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut boot));
+        if let Err(error) = &random {
+            tracing::warn!(%error, "cold proof disabled: cannot obtain unique boot nonce");
+        }
+        Self {
+            boot: random.ok().map(|_| boot),
+            sequence: 0,
+            pending: HashMap::new(),
+        }
+    }
+    fn issue(
+        &mut self,
+        pid: Pid,
+        peer: NodeId,
+        root: u64,
+        generation: u64,
+        view_epoch: u64,
+    ) -> Option<[u8; 24]> {
+        let boot = self.boot?;
+        self.sequence = self.sequence.checked_add(1)?;
+        let mut nonce = [0u8; 24];
+        nonce[..16].copy_from_slice(&boot);
+        nonce[16..].copy_from_slice(&self.sequence.to_be_bytes());
+        self.pending.insert(
+            pid,
+            PendingColdProof {
+                peer,
+                nonce,
+                root,
+                generation,
+                view_epoch,
+            },
+        );
+        Some(nonce)
+    }
+    fn take(&mut self, pid: Pid, peer: NodeId, nonce: [u8; 24]) -> Option<PendingColdProof> {
+        if !self
+            .pending
+            .get(&pid)
+            .is_some_and(|pending| pending.peer == peer && pending.nonce == nonce)
+        {
+            return None;
+        }
+        self.pending.remove(&pid)
+    }
+}
+fn supports_cold_proof(features: Option<u32>) -> bool {
+    features.is_some_and(|bits| bits & marekvs_proto::features::COLD_PROOF != 0)
+}
+fn valid_message_partition(msg: &PeerMsg) -> bool {
+    let pid = match msg {
+        PeerMsg::InterestRenew { pid, .. }
+        | PeerMsg::MerkleRoot { pid, .. }
+        | PeerMsg::MerkleRootMatch { pid }
+        | PeerMsg::MerkleBuckets { pid, .. }
+        | PeerMsg::BucketKeys { pid, .. }
+        | PeerMsg::RepairOps { pid, .. }
+        | PeerMsg::RequestKeys { pid, .. }
+        | PeerMsg::BootstrapReq { pid }
+        | PeerMsg::BootstrapChunk { pid, .. }
+        | PeerMsg::BootstrapDone { pid, .. }
+        | PeerMsg::ColdProofRequest { pid, .. }
+        | PeerMsg::ColdProofResponse { pid, .. } => *pid,
+        _ => return true,
+    };
+    (pid as usize) < marekvs_core::PARTITIONS as usize
+}
+
+/// Runtime-only proof: generations restart at zero, so clean rounds must not
+/// survive restart. The persisted ownership-loss age is separate.
+#[derive(Debug, Clone, Copy)]
+struct ColdEvidence {
+    generation: u64,
+    view_epoch: u64,
+    rounds: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PurgeOutcome {
+    Purged,
+    Empty,
+    StaleEvidence,
+    Ineligible,
+}
+
+#[allow(clippy::too_many_arguments)] // one purge = one fully-specified eligibility check
+fn purge_if_eligible(
+    ctx: &store::ShardCtx,
+    pid: Pid,
+    now_ms: u64,
+    delay_ms: u64,
+    need_rounds: u64,
+    view_epoch: u64,
+    eligible: bool,
+    evidence: Option<&mut ColdEvidence>,
+) -> anyhow::Result<PurgeOutcome> {
+    if !eligible {
+        return Ok(PurgeOutcome::Ineligible);
+    }
+    let marked = match ctx.db.get(&ctx.meta, &cold_marker_key(pid)) {
+        Ok(v) if v.len() == 8 => u64::from_be_bytes(v.as_slice().try_into().unwrap()),
+        Ok(_) | Err(ondadb::OndaError::NotFound) => return Ok(PurgeOutcome::Ineligible),
+        Err(e) => return Err(e.into()),
+    };
+    if now_ms.saturating_sub(marked) < delay_ms {
+        return Ok(PurgeOutcome::Ineligible);
+    }
+    // Proving emptiness is safe even without AE evidence; no deletion occurs.
+    // Keeping this ahead of proof validation also makes repeated empty checks
+    // cheap after a successful purge has correctly cleared its clean rounds.
+    if !store::partition_has_data(ctx, pid)? {
+        return Ok(PurgeOutcome::Empty);
+    }
+    let Some(proof) = evidence else {
+        return Ok(PurgeOutcome::StaleEvidence);
+    };
+    if proof.generation != ctx.maintenance.generation(pid) || proof.view_epoch != view_epoch {
+        return Ok(PurgeOutcome::StaleEvidence);
+    }
+    if proof.rounds < need_rounds {
+        return Ok(PurgeOutcome::Ineligible);
+    }
+    store::delete_partition_range(ctx, pid)?;
+    proof.rounds = 0;
+    Ok(PurgeOutcome::Purged)
+}
+
 /// How long a partition must sit un-owned before its data may be purged.
 ///
 /// Generous by default: the data on an ex-owner is exactly what stranded-record
@@ -510,7 +658,9 @@ pub struct ReplEngine {
     /// the commit hook's dirty set; quiescent partitions cost NO scan per
     /// round (previously the whole keyspace was re-hashed every ~5 s —
     /// linear I/O in data size, Tier-2 #7).
-    ae_roots: Mutex<HashMap<Pid, (u64, Instant)>>,
+    ae_roots: Mutex<HashMap<Pid, (u64, u64, Instant)>>,
+    cold_evidence: Arc<Mutex<HashMap<Pid, ColdEvidence>>>,
+    cold_requests: Arc<Mutex<ColdProofRequests>>,
     /// Pids written since their root was last computed (set by the commit
     /// hook on every committed op, including AE repairs and rejoin drops).
     ae_dirty: Arc<Mutex<HashSet<Pid>>>,
@@ -647,6 +797,8 @@ impl ReplEngine {
             }),
             streams_served: Mutex::new(HashMap::new()),
             ae_roots: Mutex::new(HashMap::new()),
+            cold_evidence: Arc::new(Mutex::new(HashMap::new())),
+            cold_requests: Arc::new(Mutex::new(ColdProofRequests::new())),
             ae_dirty: ae_dirty.clone(),
             returning_member,
             started: Instant::now(),
@@ -890,6 +1042,19 @@ impl ReplEngine {
         // what turns the masked interval back into free disk.
         m.db_range_deletes.set(cf.range_deletes as i64);
         m.db_range_fragments.set(cf.range_fragments as i64);
+        let ranges = self.store.db.stats();
+        m.db_range_memtable_spans
+            .set(ranges.range_memtable_spans as i64);
+        m.db_range_memtable_bytes
+            .set(ranges.range_memtable_bytes as i64);
+        m.db_range_fragment_cache_bytes
+            .set(ranges.range_fragment_cache_bytes as i64);
+        m.db_range_fragment_retained_bytes
+            .set(ranges.range_fragment_retained_bytes as i64);
+        m.db_range_fragment_cache_builds
+            .set(ranges.range_fragment_cache_builds as i64);
+        m.db_range_fragment_cache_hits
+            .set(ranges.range_fragment_cache_hits as i64);
         m.db_excised_tables.set(cf.excised_tables as i64);
         m.db_excised_bytes.set(cf.excised_bytes as i64);
         m.db_periodic_compactions
@@ -1459,53 +1624,104 @@ impl ReplEngine {
     /// minutes would otherwise reset its clock forever and never reclaim the
     /// disk, which is the leak this exists to close.
     async fn track_ownership_loss(&self) {
-        let owned: HashSet<Pid> = self.cluster.owned_pids().into_iter().collect();
-        self.store
-            .run(0, move |ctx| {
-                for pid in 0..marekvs_core::PARTITIONS as Pid {
-                    let key = cold_marker_key(pid);
-                    let marked = matches!(ctx.db.get(&ctx.meta, &key), Ok(v) if v.len() == 8);
-                    if owned.contains(&pid) {
-                        // Owned again: drop the marker AND the evidence count,
-                        // so a later loss starts its delay and its clean-round
-                        // tally from scratch.
-                        if marked {
-                            let _ = ctx.db.delete(&ctx.meta, &key);
+        for pid in 0..marekvs_core::PARTITIONS as Pid {
+            let cluster = self.cluster.clone();
+            let evidence = self.cold_evidence.clone();
+            self.store
+                .run(pid, move |ctx| {
+                    cluster.with_view(|view| {
+                        let key = cold_marker_key(pid);
+                        let marked = match ctx.db.get(&ctx.meta, &key) {
+                            Ok(v) => v.len() == 8,
+                            Err(ondadb::OndaError::NotFound) => false,
+                            Err(e) => {
+                                tracing::warn!(pid, ?e, "cold marker read failed");
+                                return;
+                            }
+                        };
+                        if view.is_owner(pid, cluster.replicas_n, cluster.self_id) {
+                            evidence.lock().remove(&pid);
+                            if marked {
+                                let _ = ctx.db.delete(&ctx.meta, &key);
+                            }
+                            let _ = ctx.db.delete(&ctx.meta, &cold_ae_key(pid));
+                        } else if !marked {
+                            evidence.lock().remove(&pid);
+                            let _ = ctx.db.put(
+                                &ctx.meta,
+                                &key,
+                                &store::now_ms().to_be_bytes(),
+                                Duration::ZERO,
+                            );
                             let _ = ctx.db.delete(&ctx.meta, &cold_ae_key(pid));
                         }
-                    } else if !marked {
-                        let _ = ctx.db.put(
-                            &ctx.meta,
-                            &key,
-                            &store::now_ms().to_be_bytes(),
-                            Duration::ZERO,
-                        );
-                        let _ = ctx.db.delete(&ctx.meta, &cold_ae_key(pid));
-                    }
-                }
-            })
-            .await;
+                    })
+                })
+                .await;
+        }
     }
 
-    /// Record one clean stranded-AE exchange for a partition we no longer own:
-    /// an owner answered `MerkleRootMatch`, i.e. it holds exactly what we hold.
-    fn note_clean_cold_round(&self, pid: Pid) {
-        self.store.spawn_on(0, move |ctx| {
-            let key = cold_marker_key(pid);
-            // Only count while the partition is actually marked cold; a match
-            // for an owned pid says nothing about safe-to-purge.
-            if !matches!(ctx.db.get(&ctx.meta, &key), Ok(v) if v.len() == 8) {
-                return;
+    async fn offer_cold_proof(&self, pid: Pid, peer: NodeId) {
+        if !supports_cold_proof(self.mesh.peer_features(peer)) {
+            return;
+        }
+        let epoch = self.cluster.view().epoch;
+        let Ok((root, generation)) = self.partition_root_snapshot(pid).await else {
+            return;
+        };
+        if root == 0 {
+            return;
+        }
+        let cluster = self.cluster.clone();
+        let requests = self.cold_requests.clone();
+        let nonce = self
+            .store
+            .run(pid, move |ctx| {
+                cluster.with_view(|view| {
+                    if view.epoch != epoch
+                        || ctx.maintenance.generation(pid) != generation
+                        || view.is_owner(pid, cluster.replicas_n, cluster.self_id)
+                        || !view.owners(pid, cluster.replicas_n).contains(&peer)
+                        || !view.members.iter().any(|m| {
+                            m.node == peer && m.phase == marekvs_cluster::NodePhase::Active
+                        })
+                    {
+                        return None;
+                    }
+                    requests.lock().issue(pid, peer, root, generation, epoch)
+                })
+            })
+            .await;
+        if let Some(nonce) = nonce {
+            self.mesh
+                .send_ctl(peer, PeerMsg::ColdProofRequest { pid, nonce });
+        }
+    }
+
+    /// Only a consumed nonce-correlated proof can reach this path. Recheck
+    /// its send-time generation/epoch on the owning shard before counting.
+    async fn note_clean_cold_round(
+        &self,
+        pid: Pid,
+        peer: NodeId,
+        generation: u64,
+        view_epoch: u64,
+    ) {
+        let cluster = self.cluster.clone();
+        let evidence = self.cold_evidence.clone();
+        self.store.run(pid, move |ctx| cluster.with_view(|view| {
+            if view.epoch != view_epoch || ctx.maintenance.generation(pid) != generation
+                || view.is_owner(pid, cluster.replicas_n, cluster.self_id)
+                || !view.owners(pid, cluster.replicas_n).contains(&peer)
+                || !view.members.iter().any(|m| m.node == peer && m.phase == marekvs_cluster::NodePhase::Active)
+                || !matches!(ctx.db.get(&ctx.meta, &cold_marker_key(pid)), Ok(v) if v.len() == 8) { return; }
+            let mut entries = evidence.lock();
+            let proof = entries.entry(pid).or_insert(ColdEvidence { generation, view_epoch, rounds: 0 });
+            if proof.generation != generation || proof.view_epoch != view_epoch {
+                *proof = ColdEvidence { generation, view_epoch, rounds: 0 };
             }
-            let k = cold_ae_key(pid);
-            let n = match ctx.db.get(&ctx.meta, &k) {
-                Ok(v) if v.len() == 8 => u64::from_be_bytes(v.as_slice().try_into().unwrap()),
-                _ => 0,
-            };
-            let _ = ctx
-                .db
-                .put(&ctx.meta, &k, &(n + 1).to_be_bytes(), Duration::ZERO);
-        });
+            proof.rounds = proof.rounds.saturating_add(1);
+        })).await;
     }
 
     /// Slow reclaim loop: drop the local copy of partitions this node has not
@@ -1528,92 +1744,61 @@ impl ReplEngine {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                if self.rejoin.lock().active {
-                    continue;
-                }
-                let delay_ms = cold_purge_delay().as_millis() as u64;
-                let need_rounds = cold_purge_clean_rounds();
-                let n = self.cluster.replicas_n;
-                let view = self.cluster.view();
-                let owned: HashSet<Pid> = self.cluster.owned_pids().into_iter().collect();
-
                 for pid in 0..marekvs_core::PARTITIONS as Pid {
-                    if owned.contains(&pid) {
-                        continue;
-                    }
-                    // Never purge into a degraded cluster: if the owners are
-                    // not all Active we may be holding the redundancy.
-                    let owners = view.owners(pid, n);
-                    let healthy = owners.len() >= n
-                        && owners.iter().all(|o| {
-                            view.members.iter().any(|m| {
-                                m.node == *o && m.phase == marekvs_cluster::NodePhase::Active
-                            })
-                        });
-                    if !healthy {
-                        continue;
-                    }
-
-                    let (aged, rounds) = self
-                        .store
-                        .run(pid, move |ctx| {
-                            let marked = match ctx.db.get(&ctx.meta, &cold_marker_key(pid)) {
-                                Ok(v) if v.len() == 8 => {
-                                    Some(u64::from_be_bytes(v.as_slice().try_into().unwrap()))
-                                }
-                                _ => None,
-                            };
-                            let rounds = match ctx.db.get(&ctx.meta, &cold_ae_key(pid)) {
-                                Ok(v) if v.len() == 8 => {
-                                    u64::from_be_bytes(v.as_slice().try_into().unwrap())
-                                }
-                                _ => 0,
-                            };
-                            let aged = marked
-                                .is_some_and(|at| store::now_ms().saturating_sub(at) >= delay_ms);
-                            (aged, rounds)
-                        })
-                        .await;
-                    if !aged || rounds < need_rounds {
-                        continue;
-                    }
-
                     match self.purge_partition(pid).await {
-                        Ok(()) => {
-                            self.engine.metrics.cold_purged_partitions_total.inc();
-                            tracing::info!(
-                                pid,
-                                rounds,
-                                "cold purge: dropped local copy of an un-owned partition"
-                            );
+                        Ok(PurgeOutcome::Purged) => {
+                            self.engine.metrics.cold_purged_partitions_total.inc()
                         }
-                        Err(e) => {
-                            tracing::warn!(pid, error = %e, "cold purge range delete failed");
+                        Ok(PurgeOutcome::Empty) => {
+                            self.engine.metrics.cold_purge_empty_skips_total.inc()
                         }
+                        Ok(PurgeOutcome::StaleEvidence) => {
+                            self.engine.metrics.cold_purge_stale_proofs_total.inc()
+                        }
+                        Ok(PurgeOutcome::Ineligible) => {}
+                        Err(e) => tracing::warn!(pid, error = %e, "cold purge incomplete"),
                     }
                 }
             }
         });
     }
 
-    /// Physically drop this node's records for `pid` with a single range delete.
-    ///
-    /// Deliberately a *local* drop: this node is discarding its own copy of a
-    /// partition it no longer owns, not deleting the records cluster-wide.
-    /// ondaDB never surfaces a range delete to a commit hook, so — unlike the
-    /// scan-and-tombstone predecessor, which needed an explicit
-    /// `suppress_commit_hook()` guard for exactly this — nothing here can reach
-    /// the replication ring even by accident.
-    ///
-    /// There is no chunking and no inter-chunk yield any more, because there is
-    /// no per-record work to spread out. The commit does take ondaDB's
-    /// database-wide commit lock (a range commit is atomic against every
-    /// isolation level), which is why this is only ever called for a whole cold
-    /// partition and never on a client path.
-    async fn purge_partition(&self, pid: Pid) -> anyhow::Result<()> {
-        self.store
-            .run(pid, move |ctx| store::delete_partition_range(ctx, pid))
+    async fn purge_partition(self: &Arc<Self>, pid: Pid) -> anyhow::Result<PurgeOutcome> {
+        let repl = self.clone();
+        let outcome = self
+            .store
+            .run(pid, move |ctx| {
+                // Hold placement stable throughout proof, probe and commit. The
+                // shard excludes all audited same-partition production writers,
+                // including the visible-before-postcommit-observer window.
+                repl.cluster.with_view(|view| {
+                    let rejoin = repl.rejoin.lock();
+                    let owners = view.owners(pid, repl.cluster.replicas_n);
+                    let eligible = !rejoin.active
+                        && !owners.contains(&repl.store.node_id)
+                        && owners.len() >= repl.cluster.replicas_n
+                        && owners.iter().all(|owner| {
+                            view.members.iter().any(|m| {
+                                m.node == *owner && m.phase == marekvs_cluster::NodePhase::Active
+                            })
+                        });
+                    let mut evidence = repl.cold_evidence.lock();
+                    purge_if_eligible(
+                        ctx,
+                        pid,
+                        store::now_ms(),
+                        cold_purge_delay().as_millis() as u64,
+                        cold_purge_clean_rounds(),
+                        view.epoch,
+                        eligible,
+                        evidence.get_mut(&pid),
+                    )
+                })
+            })
             .await?;
+        if outcome != PurgeOutcome::Purged {
+            return Ok(outcome);
+        }
 
         // Reclaim eagerly. A purge is exactly what delete-only excise is for:
         // a whole interval proven deleted, so a table lying entirely inside it
@@ -1635,7 +1820,7 @@ impl ReplEngine {
             Ok(Err(e)) => tracing::warn!(pid, error = ?e, "excise pass failed after purge"),
             Err(e) => tracing::warn!(pid, error = %e, "excise task panicked after purge"),
         }
-        Ok(())
+        Ok(outcome)
     }
 
     fn complete_rejoin_pid(&self, pid: Pid) {
@@ -1982,6 +2167,7 @@ impl ReplEngine {
                         }
                         let peer = owners[(self.pseudo_rand() % owners.len() as u64) as usize];
                         self.mesh.send_ctl(peer, PeerMsg::MerkleRoot { pid, root });
+                        self.offer_cold_proof(pid, peer).await;
                     }
                 }
             }
@@ -1998,16 +2184,25 @@ impl ReplEngine {
     /// hook). Quiescent partitions cost no I/O per AE round — previously
     /// the full keyspace was re-hashed every ~5 s.
     async fn partition_root_cached(&self, pid: Pid) -> ae::AeResult<u64> {
+        self.partition_root_snapshot(pid)
+            .await
+            .map(|(root, _)| root)
+    }
+
+    async fn partition_root_snapshot(&self, pid: Pid) -> ae::AeResult<(u64, u64)> {
         if !self.ae_dirty.lock().contains(&pid) {
-            if let Some((root, at)) = self.ae_roots.lock().get(&pid) {
-                if at.elapsed() < AE_ROOT_CACHE_TTL {
-                    return Ok(*root);
+            if let Some((root, generation, at)) = self.ae_roots.lock().get(&pid) {
+                if *generation == self.store.partition_generation(pid)
+                    && at.elapsed() < AE_ROOT_CACHE_TTL
+                {
+                    return Ok((*root, *generation));
                 }
             }
         }
         // Clear BEFORE scanning: writes landing mid-scan re-mark the pid,
         // so an invalidation can never be lost (worst case: one extra scan).
         self.ae_dirty.lock().remove(&pid);
+        let generation = self.store.partition_generation(pid);
         let root = match ae::partition_root(&self.store, pid).await {
             Ok(root) => root,
             Err(e) => {
@@ -2019,9 +2214,18 @@ impl ReplEngine {
                 return Err(e);
             }
         };
-        self.ae_roots.lock().insert(pid, (root, Instant::now()));
+        if generation == self.store.partition_generation(pid) {
+            self.ae_roots
+                .lock()
+                .insert(pid, (root, generation, Instant::now()));
+        } else {
+            self.ae_dirty.lock().insert(pid);
+            return Err(store::ScanIncomplete(format!(
+                "partition {pid} changed during root computation"
+            )));
+        }
         self.engine.metrics.ae_digest_scans_total.inc();
-        Ok(root)
+        Ok((root, generation))
     }
 
     // ------------------------------------------------------------------
@@ -2037,7 +2241,42 @@ impl ReplEngine {
     }
 
     async fn handle(self: &Arc<Self>, peer: NodeId, msg: PeerMsg) {
+        // Wire pids are u16, but runtime arrays contain exactly 4096 entries.
+        // Drop malformed frames before any generation or placement lookup.
+        if !valid_message_partition(&msg) {
+            tracing::warn!(peer, "ignoring peer message with invalid partition");
+            return;
+        }
         match msg {
+            PeerMsg::ColdProofRequest { pid, nonce } => {
+                if !supports_cold_proof(self.mesh.peer_features(peer)) {
+                    return;
+                }
+                let view = self.cluster.view();
+                if !view.is_owner(pid, self.cluster.replicas_n, self.store.node_id)
+                    || !view.members.iter().any(|m| {
+                        m.node == self.store.node_id
+                            && m.phase == marekvs_cluster::NodePhase::Active
+                    })
+                {
+                    return;
+                }
+                let Ok((root, _)) = self.partition_root_snapshot(pid).await else {
+                    return;
+                };
+                self.mesh
+                    .send_ctl(peer, PeerMsg::ColdProofResponse { pid, nonce, root });
+            }
+            PeerMsg::ColdProofResponse { pid, nonce, root } => {
+                if !supports_cold_proof(self.mesh.peer_features(peer)) {
+                    return;
+                }
+                let pending = self.cold_requests.lock().take(pid, peer, nonce);
+                if let Some(pending) = pending.filter(|pending| pending.root == root) {
+                    self.note_clean_cold_round(pid, peer, pending.generation, pending.view_epoch)
+                        .await;
+                }
+            }
             PeerMsg::Hello { .. } => {}
             PeerMsg::Repl(batch) => {
                 tracing::debug!(peer, n = batch.ops.len(), "recv ReplBatch");
@@ -2226,7 +2465,7 @@ impl ReplEngine {
                 // Cold purge (T2-9): for a partition we no longer own, a match
                 // is direct evidence that an owner holds exactly our bytes —
                 // the evidence the purge fence requires.
-                self.note_clean_cold_round(pid);
+                // Rootless acknowledgements never authorize destructive cleanup.
             }
             PeerMsg::MerkleBuckets { pid, digests } => {
                 let Ok(ours) = ae::bucket_digests(&self.store, pid).await else {
@@ -2467,6 +2706,9 @@ impl ReplEngine {
         let Some(p) = ikey::parse(&op.ikey) else {
             return;
         };
+        if p.pid as usize >= marekvs_core::PARTITIONS as usize {
+            return;
+        }
         // HLC receive rule (Kulkarni): observe every ingested record's
         // timestamp so our next local write sorts after everything we have
         // seen. Without this, a peer with a lagging wall clock loses LWW
@@ -3136,5 +3378,349 @@ mod compaction_guard_tests {
     fn high_water_of_one_still_yields_a_usable_pair() {
         // The clamp must not underflow at the smallest legal high-water.
         assert_eq!(resolve_debt_water_marks(Some(1), None), (1, 0));
+    }
+}
+
+#[cfg(test)]
+mod cold_maintenance_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    fn test_store() -> (std::path::PathBuf, Arc<Store>) {
+        let path = std::env::temp_dir().join(format!(
+            "marekvs-cold-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = Store::open(&store::StoreConfig {
+            data_dir: path.to_string_lossy().into_owned(),
+            node_id: 1,
+            shard_threads: 2,
+            sync_mode: ondadb::SyncMode::Interval,
+        })
+        .unwrap();
+        (path, store)
+    }
+    fn key(pid: Pid) -> Vec<u8> {
+        let mut key = ikey::string_key(b"cold");
+        key[..2].copy_from_slice(&pid.to_be_bytes());
+        key
+    }
+    fn mark(ctx: &store::ShardCtx, pid: Pid) {
+        ctx.db
+            .put(
+                &ctx.meta,
+                &cold_marker_key(pid),
+                &1u64.to_be_bytes(),
+                Duration::ZERO,
+            )
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn purge_once_then_ten_empty_checks_and_new_data_needs_new_proof() {
+        let (path, store) = test_store();
+        store
+            .run(7, |ctx| {
+                mark(ctx, 7);
+                assert_eq!(
+                    purge_if_eligible(ctx, 7, 100, 1, 2, 9, true, None).unwrap(),
+                    PurgeOutcome::Empty
+                );
+                store::put_raw(ctx, &key(7), b"old");
+                let mut proof = ColdEvidence {
+                    generation: ctx.maintenance.generation(7),
+                    view_epoch: 9,
+                    rounds: 2,
+                };
+                assert_eq!(
+                    purge_if_eligible(ctx, 7, 100, 1, 2, 9, true, Some(&mut proof)).unwrap(),
+                    PurgeOutcome::Purged
+                );
+                let count = ctx.data.stats().range_deletes;
+                assert_eq!(count, 1);
+                for _ in 0..10 {
+                    assert_eq!(
+                        purge_if_eligible(ctx, 7, 100, 1, 2, 9, true, Some(&mut proof)).unwrap(),
+                        PurgeOutcome::Empty
+                    );
+                }
+                assert_eq!(ctx.data.stats().range_deletes, count);
+                store::put_raw(ctx, &key(7), b"new");
+                assert_eq!(
+                    purge_if_eligible(ctx, 7, 100, 1, 2, 9, true, Some(&mut proof)).unwrap(),
+                    PurgeOutcome::StaleEvidence
+                );
+                assert_eq!(store::get_raw(ctx, &key(7)).unwrap(), b"new");
+                assert_eq!(
+                    ctx.db.get(&ctx.meta, &cold_marker_key(7)).unwrap(),
+                    1u64.to_be_bytes()
+                );
+            })
+            .await;
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+    }
+    #[tokio::test]
+    async fn changed_generation_view_degraded_ownership_and_restart_fence_purge() {
+        let (path, store) = test_store();
+        store
+            .run(7, |ctx| {
+                mark(ctx, 7);
+                store::put_raw(ctx, &key(7), b"safe");
+                let mut proof = ColdEvidence {
+                    generation: ctx.maintenance.generation(7),
+                    view_epoch: 3,
+                    rounds: 2,
+                };
+                assert_eq!(
+                    purge_if_eligible(ctx, 7, 100, 1, 2, 3, false, Some(&mut proof)).unwrap(),
+                    PurgeOutcome::Ineligible
+                );
+                assert_eq!(
+                    purge_if_eligible(ctx, 7, 100, 1, 2, 4, true, Some(&mut proof)).unwrap(),
+                    PurgeOutcome::StaleEvidence
+                );
+                store::put_raw(ctx, &key(7), b"after-match");
+                assert_eq!(
+                    purge_if_eligible(ctx, 7, 100, 1, 2, 3, true, Some(&mut proof)).unwrap(),
+                    PurgeOutcome::StaleEvidence
+                );
+                // Even legacy persisted counters cannot substitute for runtime proof.
+                ctx.db
+                    .put(
+                        &ctx.meta,
+                        &cold_ae_key(7),
+                        &100u64.to_be_bytes(),
+                        Duration::ZERO,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    purge_if_eligible(ctx, 7, 100, 1, 2, 3, true, None).unwrap(),
+                    PurgeOutcome::StaleEvidence
+                );
+                assert_eq!(ctx.data.stats().range_deletes, 0);
+            })
+            .await;
+        drop(store);
+        let reopened = Store::open(&store::StoreConfig {
+            data_dir: path.to_string_lossy().into_owned(),
+            node_id: 1,
+            shard_threads: 2,
+            sync_mode: ondadb::SyncMode::Interval,
+        })
+        .unwrap();
+        reopened
+            .run(7, |ctx| {
+                assert_eq!(
+                    purge_if_eligible(ctx, 7, 100, 1, 2, 3, true, None).unwrap(),
+                    PurgeOutcome::StaleEvidence
+                );
+                assert_eq!(store::get_raw(ctx, &key(7)).unwrap(), b"after-match");
+            })
+            .await;
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(path);
+    }
+    #[tokio::test]
+    async fn queued_write_between_evidence_and_purge_is_rechecked_on_shard() {
+        let (path, store) = test_store();
+        let proof = store
+            .run(7, |ctx| {
+                mark(ctx, 7);
+                store::put_raw(ctx, &key(7), b"before");
+                ColdEvidence {
+                    generation: ctx.maintenance.generation(7),
+                    view_epoch: 1,
+                    rounds: 3,
+                }
+            })
+            .await;
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        store.spawn_on(7, move |ctx| {
+            store::put_raw(ctx, &key(7), b"after");
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        store.spawn_on(7, move |ctx| {
+            let mut proof = proof;
+            done_tx
+                .send(purge_if_eligible(ctx, 7, 100, 1, 2, 1, true, Some(&mut proof)).unwrap())
+                .unwrap();
+        });
+        assert!(done_rx.try_recv().is_err());
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            PurgeOutcome::StaleEvidence
+        );
+        store
+            .run(7, |ctx| {
+                assert_eq!(store::get_raw(ctx, &key(7)).unwrap(), b"after")
+            })
+            .await;
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+    }
+    #[tokio::test]
+    async fn local_purge_never_emits_point_replication_or_removes_remote_records() {
+        let (path, store) = test_store();
+        let (remote_path, remote) = test_store();
+        let hooks = Arc::new(AtomicU64::new(0));
+        let observed = hooks.clone();
+        store.set_commit_hook(Some(Arc::new(move |_, ops| {
+            observed.fetch_add(ops.len() as u64, Ordering::Relaxed);
+        })));
+        for node in [&store, &remote] {
+            node.run(7, |ctx| store::put_raw(ctx, &key(7), b"replicated"))
+                .await;
+        }
+        let before = hooks.load(Ordering::Relaxed);
+        store
+            .run(7, |ctx| {
+                mark(ctx, 7);
+                let mut proof = ColdEvidence {
+                    generation: ctx.maintenance.generation(7),
+                    view_epoch: 1,
+                    rounds: 2,
+                };
+                assert_eq!(
+                    purge_if_eligible(ctx, 7, 100, 1, 2, 1, true, Some(&mut proof)).unwrap(),
+                    PurgeOutcome::Purged
+                );
+            })
+            .await;
+        assert_eq!(hooks.load(Ordering::Relaxed), before);
+        remote
+            .run(7, |ctx| {
+                assert_eq!(store::get_raw(ctx, &key(7)).unwrap(), b"replicated")
+            })
+            .await;
+        drop(store);
+        drop(remote);
+        let _ = std::fs::remove_dir_all(path);
+        let _ = std::fs::remove_dir_all(remote_path);
+    }
+
+    #[tokio::test]
+    async fn visible_commit_before_observer_cannot_overtake_cold_proof_check() {
+        let (path, store) = test_store();
+        let proof = store
+            .run(7, |ctx| {
+                mark(ctx, 7);
+                store::put_raw(ctx, &key(7), b"before");
+                ColdEvidence {
+                    generation: ctx.maintenance.generation(7),
+                    view_epoch: 1,
+                    rounds: 2,
+                }
+            })
+            .await;
+        let old_generation = store.partition_generation(7);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release = std::sync::Mutex::new(release_rx);
+        store
+            .maintenance
+            .set_observer_barrier_for_tests(Some(Arc::new(move || {
+                entered_tx.send(()).unwrap();
+                release.lock().unwrap().recv().unwrap();
+            })));
+        store.spawn_on(7, |ctx| {
+            store::put_raw(ctx, &key(7), b"visible-before-hook")
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(store.partition_generation(7), old_generation);
+        assert_eq!(
+            store.db.get(&store.data, &key(7)).unwrap(),
+            b"visible-before-hook"
+        );
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        store.spawn_on(7, move |ctx| {
+            let mut proof = proof;
+            done_tx
+                .send(purge_if_eligible(ctx, 7, 100, 1, 2, 1, true, Some(&mut proof)).unwrap())
+                .unwrap();
+        });
+        assert!(done_rx.try_recv().is_err());
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            PurgeOutcome::StaleEvidence
+        );
+        store.maintenance.set_observer_barrier_for_tests(None);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
+#[cfg(test)]
+mod cold_proof_protocol_tests {
+    use super::*;
+    #[test]
+    fn legacy_and_unknown_capabilities_do_not_enable_cold_cleanup_protocol() {
+        assert!(!supports_cold_proof(None));
+        assert!(!supports_cold_proof(Some(0)));
+        assert!(!supports_cold_proof(Some(
+            marekvs_proto::features::COUNTER_FIELD
+        )));
+        assert!(supports_cold_proof(Some(marekvs_proto::features::ALL)));
+    }
+    #[test]
+    fn malformed_peer_pids_are_rejected_before_generation_array_access() {
+        for pid in [4096, u16::MAX] {
+            for message in [
+                PeerMsg::MerkleRoot { pid, root: 0 },
+                PeerMsg::MerkleBuckets {
+                    pid,
+                    digests: vec![0; 256],
+                },
+                PeerMsg::MerkleRootMatch { pid },
+                PeerMsg::ColdProofRequest {
+                    pid,
+                    nonce: [0; 24],
+                },
+                PeerMsg::ColdProofResponse {
+                    pid,
+                    nonce: [0; 24],
+                    root: 0,
+                },
+            ] {
+                assert!(!valid_message_partition(&message));
+            }
+        }
+        assert!(valid_message_partition(&PeerMsg::MerkleRoot {
+            pid: 4095,
+            root: 0
+        }));
+    }
+    #[test]
+    fn replaced_delayed_duplicate_unsolicited_and_wrong_peer_proofs_are_rejected() {
+        let mut requests = ColdProofRequests::new();
+        let old = requests.issue(7, 2, 99, 10, 20).unwrap();
+        let current = requests.issue(7, 2, 99, 11, 21).unwrap();
+        assert_ne!(old, current);
+        assert!(requests.take(7, 2, old).is_none());
+        assert!(requests.take(7, 3, current).is_none());
+        assert!(requests.take(8, 2, current).is_none());
+        let proof = requests.take(7, 2, current).unwrap();
+        assert_eq!(
+            (proof.root, proof.generation, proof.view_epoch),
+            (99, 11, 21)
+        );
+        assert!(requests.take(7, 2, current).is_none());
+    }
+    #[test]
+    fn restart_changes_boot_nonce_and_lack_of_entropy_disables_proof() {
+        let mut first = ColdProofRequests::new();
+        let mut second = ColdProofRequests::new();
+        let old = first.issue(7, 2, 1, 0, 0).unwrap();
+        let new = second.issue(7, 2, 1, 0, 0).unwrap();
+        assert_ne!(old[..16], new[..16]);
+        assert!(second.take(7, 2, old).is_none());
+        second.boot = None;
+        assert!(second.issue(8, 2, 1, 0, 0).is_none());
     }
 }

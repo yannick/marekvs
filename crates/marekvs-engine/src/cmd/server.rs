@@ -427,22 +427,88 @@ pub async fn info(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
         out.push_str(&format!("# Cluster\r\n{cluster}\r\n"));
     }
     if want("keyspace") {
-        let keys = keyspace_count(engine).await;
+        let stats = keyspace_stats(engine).await;
         out.push_str("# Keyspace\r\n");
-        if keys > 0 {
-            out.push_str(&format!("db0:keys={keys},expires=0,avg_ttl=0\r\n"));
+        if stats.keys > 0 {
+            out.push_str(&format!(
+                "db0:keys={},expires={},avg_ttl={}\r\n",
+                stats.keys,
+                stats.expires,
+                stats.avg_ttl_ms()
+            ));
         }
         out.push_str("\r\n");
     }
     Reply::Bulk(out.into_bytes())
 }
 
-/// Distinct visible user keys (same walk as DBSIZE; INFO is not a hot path).
-async fn keyspace_count(engine: &Arc<Engine>) -> i64 {
-    match dbsize(engine).await {
-        Reply::Int(n) => n,
-        _ => 0,
+/// An observed aggregate across shards, not a global read snapshot.
+#[derive(Default)]
+struct KeyspaceStats {
+    keys: u64,
+    expires: u64,
+    remaining_ttl_ms: u128,
+}
+
+impl KeyspaceStats {
+    fn avg_ttl_ms(&self) -> u64 {
+        self.remaining_ttl_ms
+            .checked_div(self.expires as u128)
+            .unwrap_or(0) as u64
     }
+}
+
+/// Enumerate candidates once, then inspect visibility and key-level deadlines
+/// on each key's owning shard. Member deadlines and shadowed physical records
+/// are not logical key expirations. This scan is explicit command work only.
+async fn keyspace_stats(engine: &Arc<Engine>) -> KeyspaceStats {
+    let shard_count = engine.store.shard_count();
+    let groups = engine
+        .store
+        .run(0, move |ctx| {
+            let mut seen = std::collections::HashSet::new();
+            let mut groups = vec![Vec::new(); shard_count];
+            crate::store::scan_prefix_cmd(ctx, &[], |k, _| {
+                if let Some(p) = marekvs_core::ikey::parse(k) {
+                    if p.tag != b'Z'
+                        && p.userkey.first() != Some(&0)
+                        && seen.insert(p.userkey.to_vec())
+                    {
+                        groups[p.pid as usize % shard_count].push(p.userkey.to_vec());
+                    }
+                }
+                true
+            });
+            groups
+        })
+        .await;
+    let mut total = KeyspaceStats::default();
+    for (shard, keys) in groups.into_iter().enumerate() {
+        if keys.is_empty() {
+            continue;
+        }
+        let stats = engine
+            .store
+            .run(shard as u16, move |ctx| {
+                let mut stats = KeyspaceStats::default();
+                let now = crate::store::now_ms();
+                for key in keys {
+                    if let Some(env) = crate::cmd::generic::ttl_envelope(ctx, &key) {
+                        stats.keys += 1;
+                        if env.ttl_deadline_ms > now {
+                            stats.expires += 1;
+                            stats.remaining_ttl_ms += (env.ttl_deadline_ms - now) as u128;
+                        }
+                    }
+                }
+                stats
+            })
+            .await;
+        total.keys += stats.keys;
+        total.expires += stats.expires;
+        total.remaining_ttl_ms += stats.remaining_ttl_ms;
+    }
+    total
 }
 
 /// REPLICAOF host port | REPLICAOF NO ONE (SLAVEOF alias). Reply is immediate;
@@ -468,40 +534,7 @@ pub fn replicaof(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
 }
 
 pub async fn dbsize(engine: &Arc<Engine>) -> Reply {
-    // Approximate: count distinct visible user keys (bounded walk).
-    engine
-        .store
-        .run(0, |ctx| {
-            let mut n = 0i64;
-            let mut last: Option<Vec<u8>> = None;
-            crate::store::scan_prefix_cmd(ctx, &[], |k, v| {
-                if let Some(p) = marekvs_core::ikey::parse(k) {
-                    if p.tag == b'Z' || p.userkey.first() == Some(&0) {
-                        return true;
-                    }
-                    if last.as_deref() == Some(p.userkey) {
-                        return true;
-                    }
-                    if let Some((env, pay)) = marekvs_core::envelope::Envelope::decode(v) {
-                        let now = crate::store::now_ms();
-                        let vis = if p.tag == b'M' {
-                            !env.is_tombstone() && !env.is_expired(now)
-                        } else {
-                            crate::store::visible(&env, pay, 0, now).is_some()
-                                && (!env.rtype().is_or_element()
-                                    || marekvs_core::merge::element_value(pay).is_some())
-                        };
-                        if vis {
-                            last = Some(p.userkey.to_vec());
-                            n += 1;
-                        }
-                    }
-                }
-                true
-            });
-            Reply::Int(n)
-        })
-        .await
+    Reply::Int(keyspace_stats(engine).await.keys.min(i64::MAX as u64) as i64)
 }
 
 pub async fn flushall(engine: &Arc<Engine>) -> Reply {
