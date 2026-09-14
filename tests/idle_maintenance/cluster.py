@@ -78,9 +78,22 @@ def metrics(port):
     return out
 
 
+def local_probe(container, key, name, probe_image, tracked_containers):
+    """Probe localhost without Docker's published-port/gateway routing."""
+    helper = docker("create", "--name", name, "--network", f"container:{container}",
+                    "--tmpfs", "/data", "--entrypoint", "redis-cli", probe_image,
+                    "-e", "-t", "5", "--raw", "-h", "127.0.0.1", "GET", key)
+    tracked_containers.append(helper)
+    # A socket/command timeout must not leave the helper untracked. Outer
+    # teardown removes it even if docker start or this bounded probe fails.
+    return subprocess.check_output(["docker", "start", "--attach", helper],
+                                   text=True, timeout=15).strip()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--image", required=True)
+    ap.add_argument("--probe-image", default="redis:alpine", help="redis-cli image for the isolated localhost repair check")
     ap.add_argument("--shards", type=int, default=10)
     ap.add_argument("--keys", type=int, default=13765)
     ap.add_argument("--warm", type=int, default=180)
@@ -223,16 +236,30 @@ def main():
         metric_ports[2] = int(json.loads(docker("inspect", names[2]))[0]["NetworkSettings"]["Ports"]["9121/tcp"][0]["HostPort"])
         eventually(lambda: metrics(metric_ports[2]).get("marekvs_join_gate_pending_pids") == 0)
         time.sleep(20)  # allow the normal AE bound before a local-only probe
-        # Disconnect only mesh; the separate edge network keeps the published
-        # client port reachable. GET cannot fetch a missing record from peers.
+        # Remove peer connectivity before the first GET. Published host ports
+        # can stop routing when Docker changes gateways on network disconnect;
+        # a helper in the same network namespace reaches localhost directly.
         docker("network", "disconnect", prefix, names[2])
         try:
             time.sleep(4)
-            clients[2] = Client(ports[2])
-            assert clients[2].command("GET", repair_key) == b"value", "autonomous repair missing local home record"
-            report["local_repair_check"] = "passed with mesh disconnected before first GET"
+            value = local_probe(names[2], repair_key, prefix + "-local-probe", args.probe_image, names)
+            assert value == "value", "autonomous repair missing local home record"
+            report["probe_image_digest"] = json.loads(docker("inspect", names[-1]))[0]["Image"]
+            report["local_repair_check"] = "passed via container-namespace localhost with mesh disconnected before first GET"
         finally:
             docker("network", "connect", "--ip", ips[2], prefix, names[2])
+        ports[2] = int(json.loads(docker("inspect", names[2]))[0]["NetworkSettings"]["Ports"]["6379/tcp"][0]["HostPort"])
+        def reconnected():
+            c = Client(ports[2])
+            try:
+                if c.command("PING") != "PONG":
+                    return False
+                clients[2] = c
+                return True
+            finally:
+                if clients[2] is not c:
+                    c.close()
+        eventually(reconnected)
         assert clients[2].command("GET", "ttl-key") is None
         assert clients[2].command("HGET", "ttl-hash", "f") is None
         report["seed_reads"] = {}

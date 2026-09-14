@@ -46,7 +46,12 @@ CPU: low CPU alone cannot show that a scheduler still expires records correctly.
 `--expect-fixed` waits for discovery to settle and requires zero growth in expiry
 iterator and range-delete counters during the idle sample. Restart repair is
 checked with the restarted home disconnected from the peer network before its
-first GET, while the separate client network remains reachable.
+first GET. A short-lived `redis-cli` helper shares that container's network
+namespace and probes localhost, avoiding published-port routing changes during
+mesh disconnect. It is tracked and removed with the test containers. The default
+helper image is `redis:alpine` (override with `--probe-image`); ensure it is available
+locally before running the workload. Reports record its image digest. Host client
+connections are recreated after mesh connectivity is restored.
 
 The script records failure in its JSON report and exits unsuccessfully; it does
 not replace behavioral CI tests with a timing threshold.
