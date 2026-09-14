@@ -7,7 +7,6 @@ use marekvs_engine::{
     store::{Store, StoreConfig},
     Engine,
 };
-use ondadb::{ColumnFamilyConfig, Options, DB};
 use std::time::{Duration, Instant};
 
 fn cpu_seconds() -> f64 {
@@ -43,41 +42,50 @@ fn main() {
             && seconds > 0
     );
     let dir = tempfile::tempdir().unwrap();
-    {
-        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
-        let cf = db
-            .create_column_family("data", ColumnFamilyConfig::default())
-            .unwrap();
-        db.enable_format_capabilities(ondadb::format::CAP_RANGE_DELETES)
-            .unwrap();
-        for i in 0..ranges {
-            let pid = (i % distinct) as u16;
-            db.delete_range(&cf, &pid.to_be_bytes(), &(pid + 1).to_be_bytes())
-                .unwrap();
-        }
-        for i in 0..keys {
-            let key = format!("idle-key-{i}");
-            let env = Envelope {
-                flags: RecordType::String as u8,
-                hlc: 1 << 16,
-                origin: 1,
-                ttl_deadline_ms: 0,
-            };
-            db.put(
-                &cf,
-                &ikey::string_key(key.as_bytes()),
-                &env.encode_with(b"value"),
-                Duration::ZERO,
-            )
-            .unwrap();
-        }
-    }
     let store = Store::open(&StoreConfig {
         data_dir: dir.path().to_string_lossy().into_owned(),
         shard_threads: shards,
         ..StoreConfig::default()
     })
     .unwrap();
+    // Seed the live memtables without closing/flushing them. All writes use
+    // their owning shard, exactly like production commands and repair.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            for shard in 0..shards {
+                store
+                    .run(shard as u16, move |ctx| {
+                        for i in 0..ranges {
+                            let pid = (i % distinct) as u16;
+                            if pid as usize % shards != shard {
+                                continue;
+                            }
+                            marekvs_engine::store::delete_partition_range(ctx, pid).unwrap();
+                        }
+                        for i in 0..keys {
+                            let key = format!("idle-key-{i}");
+                            if marekvs_core::pid_of(key.as_bytes()) as usize % shards != shard {
+                                continue;
+                            }
+                            let env = Envelope {
+                                flags: RecordType::String as u8,
+                                hlc: 1 << 16,
+                                origin: 1,
+                                ttl_deadline_ms: 0,
+                            };
+                            marekvs_engine::store::put_raw(
+                                ctx,
+                                &ikey::string_key(key.as_bytes()),
+                                &env.encode_with(b"value"),
+                            );
+                        }
+                    })
+                    .await;
+            }
+        });
     let engine = Engine::new(store);
     std::thread::sleep(Duration::from_secs(warm as u64));
     println!(
