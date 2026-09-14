@@ -457,6 +457,7 @@ pub enum PurgeOutcome {
     Ineligible,
 }
 
+#[allow(clippy::too_many_arguments)] // one purge = one fully-specified eligibility check
 fn purge_if_eligible(
     ctx: &store::ShardCtx,
     pid: Pid,
