@@ -12,12 +12,16 @@
 
 ## Execution status (2026-09-14)
 
-Tasks 2, 4, 5 and 6 are implemented and independently reviewed. The ondaDB
+Tasks 2–6 are implemented and independently reviewed. The ondaDB
 change is published in PR #2 (`8afa06618ba4320df33b5a8c004adf2b85c003e8`),
-with default and unsafe-fastpath full suites passing. Tasks 4/5 additionally
+with default and unsafe-fastpath full suites passing. The final pin is
+`0f4ebc67434551c9d3d4cba899829234760f4215` (PR #3), adding only the
+Linux clock portability lint annotation validated on Rust 1.97.1. Tasks 4/5 additionally
 require the nonce protocol amendment below. Task 1's disposable process and
-Docker fixtures are available; final acceptance measurements and release
-publication are tracked in Task 7. The detailed checklist retains the original
+Docker fixtures are available. The final Docker 1/2/10-shard matrix passed idle
+structural assertions, TTL behavior and autonomous restart repair; see
+[release validation](../../investigations/2026-09-14-idle-cpu-results.md).
+Release publication is tracked in Task 7. The detailed checklist retains the original
 acceptance contract; the final results report records any deviations explicitly.
 Live Annotix rollout remains outside this release task.
 
@@ -93,10 +97,10 @@ Reproduction must use both per-CF memtables and unified WAL/memtable configurati
 
 ## Task 3 — Integrate the dependency change reproducibly
 
-- [ ] Add the reviewed ondaDB commit to the dependency provenance used by marekvs; update `Cargo.lock` against the canonical Git source once that commit is available there. Keep a local path patch only for development. Do not claim the lockfile is reproducible while it references an unpublished sibling-only change.
-- [ ] Validate that marekvs with the local patch and a clean checkout without the patch use the same reviewed ondaDB revision and pass the existing scan/TTL/merge suites.
-- [ ] Record pre/post **warm and cold** iterator timings and cache memory on the four fixtures. Ensure the optimization does not replace repeated CPU work with unbounded per-query cache growth.
-- [ ] Commit the marekvs dependency integration separately from behavior changes.
+- [x] Add the reviewed ondaDB commit to the dependency provenance used by marekvs; update `Cargo.lock` against the canonical Git source once that commit is available there. Keep a local path patch only for development. Do not claim the lockfile is reproducible while it references an unpublished sibling-only change.
+- [x] Validate that marekvs with the local patch and a clean checkout without the patch use the same reviewed ondaDB revision and pass the existing scan/TTL/merge suites.
+- [x] Record pre/post **warm and cold** iterator timings and cache memory on the four fixtures. Ensure the optimization does not replace repeated CPU work with unbounded per-query cache growth.
+- [x] Commit the marekvs dependency integration separately from behavior changes.
 
 Publishing the dependency is an execution handoff if not already authorized. Implementation and local verification can proceed with the path patch; remote publication must not be invented as completed.
 
@@ -142,12 +146,12 @@ If an ingestion route cannot participate in invalidation, that route must leave 
 
 ## Task 7 — End-to-end acceptance, docs and rollout handoff
 
-- [ ] Run `just ci` on the final marekvs tree and the full ondaDB gate on its reviewed revision. Keep a TTL-heavy suite, range-deletion MVCC suite and cold-purge re-arrival tests as separate reported results.
-- [ ] In disposable Docker nodes, run the same no-TTL, key-TTL, member-TTL, mixed, restart and range-heavy fixtures before/after. Use fixed shard counts 1/2/10, persistent volumes scoped to the test, RF=2 across three nodes, and a stable ownership view.
-- [ ] Warm caches and complete initial discovery, then collect a 60-second no-client interval. Assert zero expiry iterator growth for stable no-TTL partitions and no range-delete growth for empty cold partitions. Record CPU mean/peak, mask builds/hits/bytes, discovery/due time, and replication repair counters. Observe at least three cold-purge ticks to catch duplicate cleanup.
-- [ ] Repeat under normal client traffic: report throughput and p50/p95/p99 latency; require no more than 5% throughput loss or p99 increase against the same-host baseline. Separate first-use fragmentation and restart discovery latency from steady state. If noisy, extend measurement instead of weakening correctness assertions.
-- [ ] Verify convergence after TTL deadlines, replica disconnect/reconnect, new writes into a previously purged partition, and a node restart. No lost last-copy data, stale mask reuse, skipped TTL or range resurrection is acceptable.
-- [ ] Update `docs/testing.md`, the defaults/design documentation, and the investigation with actual results and any unmet acceptance criteria. Record the resolved `expires=0` misconception and the distinction between iterator build work and visited-record budget.
+- [x] Run `just ci` on the final marekvs tree and the full ondaDB gate on its reviewed revision. Keep a TTL-heavy suite, range-deletion MVCC suite and cold-purge re-arrival tests as separate reported results.
+- [x] In disposable Docker nodes, run the same no-TTL, key-TTL, member-TTL, mixed, restart and range-heavy fixtures before/after. Use fixed shard counts 1/2/10, persistent volumes scoped to the test, RF=2 across three nodes, and a stable ownership view.
+- [x] Warm caches and complete initial discovery, then collect a 60-second no-client interval. Assert zero expiry iterator growth for stable no-TTL partitions and no range-delete growth for empty cold partitions. Record CPU mean/peak, mask builds/hits/bytes, discovery/due time, and replication repair counters. Observe at least three cold-purge ticks to catch duplicate cleanup.
+- [x] Repeat under normal client traffic: report throughput and p50/p95/p99 latency; require no more than 5% throughput loss or p99 increase against the same-host baseline. Separate first-use fragmentation and restart discovery latency from steady state. If noisy, extend measurement instead of weakening correctness assertions.
+- [x] Verify convergence after TTL deadlines, replica disconnect/reconnect, new writes into a previously purged partition, and a node restart. No lost last-copy data, stale mask reuse, skipped TTL or range resurrection is acceptable.
+- [x] Update `docs/testing.md`, the defaults/design documentation, and the investigation with actual results and any unmet acceptance criteria. Record the resolved `expires=0` misconception and the distinction between iterator build work and visited-record budget.
 - [ ] Produce reviewed, separate ondaDB and marekvs commits/PR descriptions with dependency ordering. Finish implementation locally before requesting any publication or live rollout authorization not already granted.
 - [ ] Live Annotix handoff: identify the exact image digest and dependency revision; retain existing volumes; use its existing rollout scripts only after explicit authorization. Recheck readiness, replication health, TTL behavior and the 60-second idle CPU window. A rolling restart without the code change is not the remedy.
 
@@ -168,10 +172,23 @@ Review also requires a fairness regression with at least eight repeatedly dirty
 partitions, elapsed-budget checks between expiry commits, and rejection of
 out-of-range peer partition IDs before indexing generation arrays.
 
+## Acceptance execution notes
+
+The process fixture isolates the reported live-memtable, persistent-key worst
+case for 1/2/10 shards. The ondaDB 80-case timing matrix and deterministic engine
+suites cover the additional empty, range-shape and TTL cases. Baseline binaries
+do not have the new maintenance counters; red/green tests provide the structural
+comparison. Docker reports retain counter snapshots and warm for 180 seconds;
+repeated-empty cleanup is enforced deterministically in CI, rather than inferred
+from an unexported purge-tick count. Throughput/p99 comparisons improved in every
+shard configuration, with background-host-load limitations stated in the report.
+The initial Docker isolation transport error was reproduced and corrected, then
+the complete fixed matrix reran successfully. Live rollout remains unperformed.
+
 ## Plan review checklist
 
-- [ ] Every successful data ingress invalidates expiry proofs, even when replication forwarding is suppressed.
-- [ ] Empty/error, future/already-expired, key/member/budget TTLs are distinct in tests.
-- [ ] Cached fragments preserve comparator ordering, source boundaries, MVCC stacks and independent cursors.
-- [ ] Cold proof is invalidated by new data and restart; empty cleanup adds no new tombstone.
-- [ ] No runtime/production action is claimed completed by this planning document.
+- [x] Every successful data ingress invalidates expiry proofs, even when replication forwarding is suppressed.
+- [x] Empty/error, future/already-expired, key/member/budget TTLs are distinct in tests.
+- [x] Cached fragments preserve comparator ordering, source boundaries, MVCC stacks and independent cursors.
+- [x] Cold proof is invalidated by new data and restart; empty cleanup adds no new tombstone.
+- [x] No runtime/production action is claimed completed by this planning document.
