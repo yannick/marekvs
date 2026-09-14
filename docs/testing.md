@@ -34,10 +34,10 @@ score-index key order matches f64 order (including ±0, subnormals, infinities).
 
 These run against a real ondaDB instance, not a mock.
 
-- **Commit-hook contract** — hooks fire exactly once per committed batch, in
-  publish order, with the full op list. Hammered with concurrent committers
-  across shards, asserting the ring sees a gap-free, ordered seq stream. This
-  test is the canary for ondaDB upgrades.
+- **Commit-hook contract** — hooks fire exactly once per committed batch, with the full op list and
+  unique commit sequence numbers. Concurrent callbacks can arrive out of
+  commit order, and metadata writes create sequence gaps; neither ordering nor
+  gap-free delivery is assumed. This test is the canary for ondaDB upgrades.
 - Shard-thread RMW atomicity (INCR storms on one key); TTL sweeper vs lazy expiry
   vs compaction GC; prefix-scan boundary discipline (the iterator stops at prefix
   end); crash-restart WAL replay with `SyncMode::Interval` (bounded loss window,
@@ -45,6 +45,37 @@ These run against a real ondaDB instance, not a mock.
 - **RESP conformance** — the redis-py / ioredis protocol subsets plus a
   golden-file suite for RESP2/RESP3 framing (HELLO switching, map/set/push
   frames, downgrades).
+
+## Idle maintenance regressions
+
+The PR CI workflow runs the workspace tests and the range-deletion tests in the
+exact ondaDB revision recorded in `Cargo.lock`. Image and patch-release builds
+wait for that same test gate before publishing.
+
+The expiry tests use controlled clocks and work counters: after a complete
+TTL-free discovery, advancing 60 seconds must open no further expiry iterators.
+They also exercise shard ownership, writes behind a discovery cursor, replicated
+TTL arrivals, future deadlines, PERSIST, busy command queues and restart. A scan
+error must leave the partition scheduled for another attempt.
+
+Cold-cleanup tests check that an empty partition adds no range tombstone and
+that new data invalidates older cleanup evidence. Delayed anti-entropy responses
+must not authorize deletion of a newer generation. ondaDB tests independently
+check cached fragment reuse, snapshot lifetime, bounds, overlapping sources,
+forward/reverse traversal and MVCC visibility after range deletion/reinsertion.
+
+`INFO keyspace` tests distinguish live key-level deadlines from per-member TTLs
+and exclude deleted collection residue. `expires=0` does not imply that no
+collection member has a deadline, and INFO is never the scheduler's proof that
+expiry work can stop.
+
+CPU thresholds belong to an isolated performance run, not timing-sensitive CI
+assertions. The reproducible harness in `tests/idle_maintenance/` measures
+release-mode process CPU and disposable three-node Docker workloads. It records
+warm-up separately, samples an idle 60-second window, and checks TTL and restart
+behavior without accessing deployment volumes. Initial discovery and the first
+fragment build still cost work; the regression contract removes repeated work
+on unchanged data.
 
 ## Membership churn & chaos (Jepsen-style)
 

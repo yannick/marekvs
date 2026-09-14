@@ -21,16 +21,18 @@ on:
     branches: [main]
     tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      ondadb-ref:
-        description: ondadb ref to build against
-        default: main
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
+  quality:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   build:
+    needs: quality
     strategy:
       fail-fast: true
       matrix:
@@ -49,11 +51,25 @@ jobs:
         with:
           path: marekvs
 
+      - name: resolve pinned ondaDB revision
+        id: ondadb
+        working-directory: marekvs
+        run: |
+          python3 - <<'PYTHON' >> "$GITHUB_OUTPUT"
+          import tomllib
+          with open("Cargo.lock", "rb") as f:
+              lock = tomllib.load(f)
+          package = next(p for p in lock["package"] if p["name"] == "ondadb")
+          revision = package["source"].rsplit("#", 1)[1]
+          assert len(revision) == 40 and all(c in "0123456789abcdef" for c in revision)
+          print(f"ref={revision}")
+          PYTHON
+
       - name: checkout ondadb (path dependency)
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ondadb
-          ref: ${{ inputs.ondadb-ref || 'main' }}
+          ref: ${{ steps.ondadb.outputs.ref }}
           path: ondadb
 
       - name: point cargo at the checked-out ondadb

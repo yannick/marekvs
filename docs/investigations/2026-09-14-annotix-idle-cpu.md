@@ -33,7 +33,10 @@ Compaction, WAL-sync, and DIFF workers were effectively idle.
 Over a 39–40 second metrics interval, no Redis command counters changed and no
 replicated operation counters advanced. Background anti-entropy continued.
 All nodes reported zero SSTable bytes, zero L0 tables, zero open SST readers,
-and zero compaction debt: the observed storage state was memory/WAL resident.
+and zero compaction debt. These reported gauges do not prove that no SST files
+existed: a separate read-only inventory reported similar on-disk shapes on all
+three nodes (58 files, 14 tables, roughly 24–34 MB). The synthetic experiment
+below isolates the memtable cost independently of this reporting discrepancy.
 
 Complete retained logs showed repeated cold purges:
 

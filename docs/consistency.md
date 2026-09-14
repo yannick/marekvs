@@ -119,16 +119,12 @@ off the storage engine's per-key TTL:
   may hold data whose covering tombstone was already purged elsewhere; merging
   it back would resurrect the delete.
 
-```planned
-**The pull-only-until-synced rejoin rule is designed but not yet enforced.**
+The rejoin gate is enforced. An `alive:last` heartbeat persists while the node
+is Active/Leaving. After an absence longer than `gc_grace`, the node stays
+Joining while its data-bearing home partitions synchronize with their
+pre-outage co-owners. Stale extras are dropped locally without replication;
+only after synchronization does the node regain normal push eligibility.
 
-The intended enforcement: on rejoin, if `now − last_alive > gc_grace`, the
-node's home partitions become **pull-only** — it receives AE repairs but never
-pushes, until each partition completes a full Merkle sync against a current home
-(its local data is a warm base; only the diff is pulled). Only then does it
-regain push eligibility. This is the precise rule that prevents resurrection
-across a long absence; today it is not wired into the rejoin path.
-```
 
 Interest replicas cannot resurrect by construction: they never push AE, and
 lease-gated reads revalidate against homes.
@@ -150,6 +146,38 @@ only after `deadline + ttl_skew_grace`, so skewed replicas don't ping-pong
 repairs around the deadline — is **unimplemented**. Today expiry is materialized
 by the sweep as an ordinary tombstone write, with no digest-exclusion grace.
 ```
+
+## Idle expiry and cold data cleanup
+
+Each shard discovers TTLs only in its own partitions, with a quantum of at most
+128 records, eight partitions and a 2 ms elapsed-time target. One iterator step
+or storage commit can exceed that target; the elapsed budget is checked between processed records.
+Discovery also runs between foreground jobs, so busy clients cannot starve it.
+
+A completed partition with no TTLs parks without opening more expiry iterators.
+Partitions with future TTLs wait for their earliest deadline. Committed writes,
+replication, bootstrap and local range deletion invalidate the affected partition;
+restart requires fresh discovery. Wall-clock changes are rechecked within one
+second. This preserves expiry while eliminating repeated scans of persistent data.
+
+Cold data remains available for stranded-record anti-entropy after ownership
+loss. Cleanup requires the configured retention delay (15 minutes by default),
+a healthy full owner set, no active rejoin, and clean proof exchanges (three by default, configured with
+`MAREKVS_COLD_PURGE_CLEAN_ROUNDS`) for
+the current data generation and membership epoch. A feature-negotiated request
+nonce binds each reply to its peer and request; stale, duplicate and prior-boot
+replies cannot authorize deletion. Older peers continue ordinary replication and
+anti-entropy, but cannot supply cleanup proofs until upgraded.
+
+The final eligibility check, bounded empty probe and local range delete run on
+the owning shard under a stable placement view. An already empty partition emits
+no new range tombstone. Clean proofs are rebuilt after restart.
+
+Observe `marekvs_expiry_iterators_total` and `marekvs_expiry_records_total` to
+check that discovery settles. `marekvs_db_range_fragments` counts catalogued SST
+fragments only; the separate memtable and range-cache memory gauges expose
+in-memory range tombstones and retained fragment snapshots. See
+[Testing](../testing/) for deterministic CI regressions and disposable benchmarks.
 
 ## HLC discipline
 
@@ -222,13 +250,13 @@ config).
 | ring high-water persist | 1 s | const (marekvs-repl) | restart resumes seq space +1,000,000 above persisted HW |
 | mesh writer queue | 4096 msgs | const (marekvs-repl) | per-peer, per-lane |
 | mesh reconnect backoff | 100 ms → 5 s | const (marekvs-repl) | exponential |
-| gc_grace | 1 h | const (marekvs-engine `GC_GRACE`) | tombstone TTL; _Planned_ — the pull-only-until-synced rejoin rule is **not yet enforced** |
+| gc_grace | 1 h | const (marekvs-engine `GC_GRACE`) | tombstone TTL; rejoin stays Joining until synchronization with pre-outage co-owners |
 | ttl_skew_grace | — | design (5 s) | _Planned_ — expiry is materialized by the sweep as an ordinary tombstone write; digest-exclusion grace unimplemented |
-| expiry sweep budget | 128 records | const (marekvs-engine) | incremental cursor walk between shard jobs |
+| expiry sweep budget | 128 records / 8 partitions / 2 ms target | const (marekvs-engine) | fair partition discovery and deadline scheduling between shard jobs |
 | max_clock_drift | 5 s | const (marekvs-core `MAX_CLOCK_DRIFT_MS`) | remote HLC clamp + loud log |
 | repair_delay | — | design (30 s + jitter) | _Planned_ — unimplemented; AE repairs fire on the next round |
 | bootstrap chunking | 256 ops/chunk, sequential | const (marekvs-repl) | lz4 bulk lane; _Planned_ — design 8 streams / 64 MiB/s rate cap unimplemented |
-| cold_purge_delay | — | design (15 m) | _Planned_ — unimplemented; data kept after losing ownership (feeds stranded-record AE) |
+| cold_purge_delay | 15 m | env `MAREKVS_COLD_PURGE_SECS` | generation/epoch-fenced local cleanup after fresh clean proofs; see above |
 | terminationGracePeriodSeconds | 60 | manifest (k8s/statefulset.yaml) | drain typically completes in ~3 s |
 | listen addresses | :6379 / :7373 / :7946 / :9121 | env `MAREKVS_{RESP,MESH,GOSSIP,METRICS}_ADDR` | RESP / mesh / gossip(UDP) / metrics+probes |
 | node identity | hostname ordinal, else 0 | env `MAREKVS_NODE_ID` | `marekvs-3` → 3; StatefulSet needs no per-pod config |
@@ -265,10 +293,6 @@ Notes); the design target is what is missing.
 - **`repair_delay`** (30 s + jitter) — repairs fire on the next AE round.
 - **bootstrap 8 streams / 64 MiB/s rate cap** — chunking is 256 ops/chunk,
   sequential.
-- **`cold_purge_delay`** (15 m) — cold data is kept after ownership loss (feeds
-  stranded-record AE).
-- **`gc_grace` pull-only-until-synced rejoin rule** — the resurrection-prevention
-  gate is not yet enforced on rejoin.
 ```
 
 ## Where to go next
