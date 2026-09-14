@@ -281,6 +281,7 @@ impl Engine {
         // 40-hex run id from boot time + node id (unique enough per boot;
         // Redis semantics only need it stable for the process lifetime).
         let metrics = metrics::Metrics::new(store.node_id);
+        store.maintenance.metrics.register(&metrics.registry);
         let now = store::now_ms();
         let run_id = format!(
             "{:016x}{:016x}{:08x}",

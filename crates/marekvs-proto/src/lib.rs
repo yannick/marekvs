@@ -65,7 +65,10 @@ pub mod features {
     pub const COUNTER_FIELD: u32 = 1 << 0;
 
     /// Everything this build can do.
-    pub const ALL: u32 = COUNTER_FIELD;
+    /// Correlated, generation-bound evidence for node-local cold cleanup.
+    /// Legacy Merkle acknowledgements never authorize destructive cleanup.
+    pub const COLD_PROOF: u32 = 1 << 1;
+    pub const ALL: u32 = COUNTER_FIELD | COLD_PROOF;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -227,6 +230,17 @@ pub enum PeerMsg {
     BudgetCloseResp {
         id: u64,
         result: Result<u64, BudgetErrKind>,
+    },
+    // APPEND ONLY: retain every existing postcard discriminant. Send only
+    // after the peer advertises features::COLD_PROOF in Hello.
+    ColdProofRequest {
+        pid: Pid,
+        nonce: [u8; 24],
+    },
+    ColdProofResponse {
+        pid: Pid,
+        nonce: [u8; 24],
+        root: u64,
     },
 }
 
@@ -412,9 +426,35 @@ mod proto_tests {
     fn announced_features_are_implemented() {
         assert_eq!(
             features::ALL,
-            features::COUNTER_FIELD,
+            features::COUNTER_FIELD | features::COLD_PROOF,
             "a capability bit was added to ALL — confirm the code that honours \
              it landed in the same change"
         );
+    }
+}
+
+#[cfg(test)]
+mod cold_proof_wire_tests {
+    use super::*;
+    #[test]
+    fn correlated_cold_proof_round_trips_without_changing_legacy_messages() {
+        for message in [
+            PeerMsg::ColdProofRequest {
+                pid: 4095,
+                nonce: [7; 24],
+            },
+            PeerMsg::ColdProofResponse {
+                pid: 4095,
+                nonce: [7; 24],
+                root: 123,
+            },
+            PeerMsg::MerkleRoot { pid: 17, root: 123 },
+            PeerMsg::MerkleRootMatch { pid: 17 },
+        ] {
+            let bytes = encode(&message).unwrap();
+            let (decoded, consumed) = decode(&bytes).unwrap().unwrap();
+            assert_eq!(decoded, message);
+            assert_eq!(consumed, bytes.len());
+        }
     }
 }

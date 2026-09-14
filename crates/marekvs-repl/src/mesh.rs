@@ -96,6 +96,8 @@ fn is_heavy_lane(msg: &PeerMsg) -> bool {
         msg,
         PeerMsg::MerkleRoot { .. }
             | PeerMsg::MerkleRootMatch { .. }
+            | PeerMsg::ColdProofRequest { .. }
+            | PeerMsg::ColdProofResponse { .. }
             | PeerMsg::MerkleBuckets { .. }
             | PeerMsg::BucketKeys { .. }
             | PeerMsg::RepairOps { .. }

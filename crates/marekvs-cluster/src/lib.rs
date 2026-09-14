@@ -372,6 +372,13 @@ impl Cluster {
         self.view.read().clone()
     }
 
+    /// Execute a short synchronous operation while placement cannot change.
+    /// Used for the final cold-purge eligibility check and local range commit.
+    pub fn with_view<T>(&self, f: impl FnOnce(&View) -> T) -> T {
+        let view = self.view.read();
+        f(&view)
+    }
+
     /// Subscribe to view changes (value = epoch).
     pub fn watch(&self) -> watch::Receiver<u64> {
         self.view_tx.subscribe()

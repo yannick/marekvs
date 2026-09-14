@@ -97,3 +97,34 @@ async fn records_written_after_a_purge_survive() {
     let got = s.run(0, |ctx| get_raw(ctx, &key_in(7, b"back"))).await;
     assert_eq!(got.as_deref(), Some(&b"after"[..]));
 }
+
+#[tokio::test]
+async fn repeated_empty_purge_does_not_add_range_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir);
+    store
+        .run(42, |ctx| put_raw(ctx, &key_in(42, b"one"), b"value"))
+        .await;
+    store
+        .run(42, |ctx| delete_partition_range(ctx, 42))
+        .await
+        .unwrap();
+    let first = store.data.stats().range_deletes;
+    for _ in 0..10 {
+        store
+            .run(42, |ctx| delete_partition_range(ctx, 42))
+            .await
+            .unwrap();
+    }
+    assert_eq!(store.data.stats().range_deletes, first);
+}
+
+#[tokio::test]
+async fn invalid_partition_upper_bound_returns_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir);
+    assert!(store
+        .run(0, |ctx| delete_partition_range(ctx, u16::MAX))
+        .await
+        .is_err());
+}
