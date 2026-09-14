@@ -124,10 +124,11 @@ pub async fn type_cmd(engine: &Arc<Engine>, args: &[Vec<u8>]) -> Reply {
 }
 
 /// The envelope currently carrying this key's TTL (string, list, or head).
-fn ttl_envelope(ctx: &ShardCtx, key: &[u8]) -> Option<Envelope> {
+pub(crate) fn ttl_envelope(ctx: &ShardCtx, key: &[u8]) -> Option<Envelope> {
     // Lists carry their TTL on the collection head now (ctype 5 → `_` arm).
     match key_type(ctx, key)? {
         b's' => read_lww(ctx, &ikey::string_key(key), 0).map(|(e, _)| e),
+        b'l' => read_lww(ctx, &ikey::list_key(key), 0).map(|(e, _)| e),
         _ => get_head(ctx, key).map(|(e, _, _)| e),
     }
 }
