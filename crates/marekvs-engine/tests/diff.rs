@@ -1,6 +1,6 @@
 use marekvs_engine::{
     cmd::{
-        diff::{apply, compare, decide},
+        diff::{apply, compare, decide, snapshot},
         json,
     },
     reply::Reply,
@@ -18,6 +18,39 @@ fn engine() -> (tempfile::TempDir, Arc<Engine>) {
     })
     .unwrap();
     (d, Engine::new(s))
+}
+
+#[tokio::test]
+async fn snapshot_rejects_unsigned_integer_outside_signed_range() {
+    let (_d, e) = engine();
+    let key = b"doc:{overflow}:b:base";
+    assert_eq!(
+        json::set(
+            &e,
+            &args(&[
+                "JSON.SET",
+                std::str::from_utf8(key).unwrap(),
+                "$",
+                r#"{"t":"doc","a":{"n":9223372036854775809}}"#,
+            ]),
+        )
+        .await,
+        Reply::ok()
+    );
+    let stored = json::get(&e, &args(&["JSON.GET", std::str::from_utf8(key).unwrap()])).await;
+    assert!(
+        matches!(stored, Reply::Bulk(ref value) if String::from_utf8_lossy(value).contains("9223372036854775809")),
+        "JSON storage rounded the integer: {stored:?}"
+    );
+    let reply = snapshot::snapshot(
+        &e,
+        &args(&["DIFF.SNAPSHOT", std::str::from_utf8(key).unwrap()]),
+    )
+    .await;
+    assert!(
+        matches!(reply, Reply::Err(ref msg) if msg.starts_with("DIFFMODEL")),
+        "expected DIFFMODEL, got {reply:?}"
+    );
 }
 fn args(parts: &[&str]) -> Vec<Vec<u8>> {
     parts.iter().map(|s| s.as_bytes().to_vec()).collect()

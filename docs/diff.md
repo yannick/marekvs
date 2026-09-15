@@ -53,6 +53,9 @@ uses trimmed, single-space whitespace and explicit newline hard breaks;
 code text preserves whitespace. Normalize Unicode to NFC in the converter:
 the server does not validate NFC. Unknown fields and malformed shapes fail.
 Integer attributes must fit signed 64-bit; encode larger identifiers as strings.
+JSON storage preserves unsigned integer tokens above `i64::MAX` exactly so that
+DIFF commands reject them with `DIFFMODEL` instead of silently rounding them as
+floating-point values.
 
 Every history uses one nonempty hash tag. All explicit and derived keys in a
 DIFF call must use the same tag. Extra braces, empty names, and malformed

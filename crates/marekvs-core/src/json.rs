@@ -160,6 +160,10 @@ pub enum JVal {
     Null,
     Bool(bool),
     Int(i64),
+    /// An integer which JSON parsed as unsigned because it is greater than
+    /// i64::MAX. Keeping it exact lets the diff model reject it instead of
+    /// silently rounding it through f64 during materialization.
+    UInt(u64),
     Float(f64),
     Str(Vec<u8>),
     Obj,
@@ -174,6 +178,7 @@ const JT_FLT: u8 = 4;
 const JT_STR: u8 = 5;
 const JT_OBJ: u8 = 6;
 const JT_ARR: u8 = 7;
+const JT_UINT: u8 = 8;
 
 impl JVal {
     pub fn encode(&self) -> Vec<u8> {
@@ -184,6 +189,12 @@ impl JVal {
             JVal::Int(i) => {
                 let mut v = Vec::with_capacity(9);
                 v.push(JT_INT);
+                v.extend_from_slice(&i.to_be_bytes());
+                v
+            }
+            JVal::UInt(i) => {
+                let mut v = Vec::with_capacity(9);
+                v.push(JT_UINT);
                 v.extend_from_slice(&i.to_be_bytes());
                 v
             }
@@ -211,6 +222,9 @@ impl JVal {
             (JT_TRUE, []) => Some(JVal::Bool(true)),
             (JT_INT, rest) if rest.len() == 8 => {
                 Some(JVal::Int(i64::from_be_bytes(rest.try_into().unwrap())))
+            }
+            (JT_UINT, rest) if rest.len() == 8 => {
+                Some(JVal::UInt(u64::from_be_bytes(rest.try_into().unwrap())))
             }
             (JT_FLT, rest) if rest.len() == 8 => Some(JVal::Float(f64::from_bits(
                 u64::from_be_bytes(rest.try_into().unwrap()),
@@ -331,8 +345,11 @@ pub fn jval_of(v: &serde_json::Value) -> JVal {
         serde_json::Value::Bool(b) => JVal::Bool(*b),
         serde_json::Value::Number(n) => match n.as_i64() {
             Some(i) => JVal::Int(i),
-            // u64 > i64::MAX or fractional: stored as f64 (documented)
-            None => JVal::Float(n.as_f64().unwrap_or(0.0)),
+            None => match n.as_u64() {
+                Some(i) => JVal::UInt(i),
+                // Fractional values remain floating point.
+                None => JVal::Float(n.as_f64().unwrap_or(0.0)),
+            },
         },
         serde_json::Value::String(s) => JVal::Str(s.as_bytes().to_vec()),
         serde_json::Value::Object(_) => JVal::Obj,
@@ -473,6 +490,7 @@ fn scalar_value(val: &JVal) -> serde_json::Value {
         JVal::Null => serde_json::Value::Null,
         JVal::Bool(b) => serde_json::Value::Bool(*b),
         JVal::Int(i) => serde_json::Value::Number((*i).into()),
+        JVal::UInt(i) => serde_json::Value::Number((*i).into()),
         JVal::Float(f) => serde_json::Number::from_f64(*f)
             .map_or(serde_json::Value::Null, serde_json::Value::Number),
         JVal::Str(s) => serde_json::Value::String(String::from_utf8_lossy(s).into_owned()),
@@ -607,6 +625,7 @@ mod tests {
             JVal::Bool(true),
             JVal::Int(-42),
             JVal::Int(i64::MAX),
+            JVal::UInt(i64::MAX as u64 + 1),
             JVal::Float(3.25),
             JVal::Str(b"hello".to_vec()),
             JVal::Str(vec![]),
@@ -618,6 +637,13 @@ mod tests {
         assert!(JVal::decode(&[]).is_none());
         assert!(JVal::decode(&[99]).is_none());
         assert!(JVal::decode(&[3, 0, 0]).is_none()); // short int
+    }
+
+    #[test]
+    fn jval_preserves_unsigned_json_integer() {
+        let value: serde_json::Value =
+            serde_json::from_str(r#"9223372036854775809"#).expect("valid JSON integer");
+        assert_eq!(jval_of(&value), JVal::UInt(9_223_372_036_854_775_809));
     }
 
     #[test]
