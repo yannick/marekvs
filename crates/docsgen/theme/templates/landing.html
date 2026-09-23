@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{title}}</title>
-<meta name="description" content="marekvs — a distributed, Redis-compatible key-value database in Rust. AP by design, disk-native, Kubernetes-native.">
+<meta name="description" content="MareKVS is a distributed, Redis-compatible database that stores data on SSD, reducing the RAM required for large datasets.">
 <link rel="icon" type="image/svg+xml" href="{{base}}/assets/brand/favicon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -56,12 +56,12 @@
           <span class="hero-wordmark"><span class="w1">mare</span><span class="w2">kvs</span></span>
         </div>
         <span class="eyebrow">Distributed · Redis-compatible · Rust</span>
-        <h1>The key-value store that <span class="grad">moves like the tide.</span></h1>
+        <h1>Grow your dataset. <span class="grad">Keep RAM costs down.</span></h1>
         <p class="lede">
-          marekvs speaks the Redis protocol, but underneath it's an
-          <strong>AP, coordination-free</strong> database: no leader, no quorum,
-          no in-memory dataset. Writes are fire-and-forget and converge through
-          hybrid logical clocks and CRDT merges. Any node serves any key.
+          MareKVS is a distributed, Redis-compatible database that stores data
+          on <strong>SSD</strong>. Your full dataset doesn’t need to fit in
+          expensive RAM, helping you control infrastructure costs as it grows.
+          Connect with your existing Redis clients and read or write through any node.
         </p>
         <div class="hero-cta">
           <a class="btn btn-primary" href="{{base}}/docs/quickstart/">Get started</a>
@@ -84,7 +84,7 @@
 <span class="o">(integer) 3</span>
 <span class="c">marekvs&gt;</span> INCR visits
 <span class="o">(integer) 1</span>
-<span class="dim"># … and every node already has it.</span></code></pre>
+<span class="dim"># Writes replicate asynchronously.</span></code></pre>
         </div>
       </div>
     </div>
@@ -93,8 +93,12 @@
   <!-- FEATURES -->
   <section class="band">
     <div class="section-head">
-      <span class="sec-num">01</span><h2>Built for movement, not coordination</h2><div class="rule"></div>
+      <span class="sec-num">01</span><h2>Storage and replication</h2><div class="rule"></div>
     </div>
+    <p class="band-lede"><strong>Reduce memory costs with SSD storage.</strong>
+    Store datasets larger than RAM on SSD. Memory supports active reads, write
+    buffers, and database operations, so you can size RAM for your workload
+    without keeping the entire dataset in memory.</p>
     <div class="feature-grid">
       <div class="feat card">
         <div class="feat-ico">◆</div>
@@ -106,34 +110,34 @@
       <div class="feat card">
         <div class="feat-ico">⇄</div>
         <h3>Convergent replication</h3>
-        <p>Hybrid logical clocks + ORSWOT / PN-counter merges. Concurrent
-        <code>SADD</code>s on different nodes both survive; deletes never resurrect.</p>
+        <p>Hybrid logical clocks and CRDT merge rules reconcile concurrent writes.
+        Set additions and counter increments made on different nodes merge when
+        replicas exchange updates.</p>
       </div>
       <div class="feat card">
         <div class="feat-ico">◎</div>
         <h3>Dynamic replication</h3>
         <p>Any node serves any key. Read a remote key and the node caches it and
-        subscribes to its updates — replication follows demand.</p>
+        subscribes to its updates. Frequently read data stays close to its readers.</p>
       </div>
       <div class="feat card">
         <div class="feat-ico">⬢</div>
         <h3>Protobuf schema store</h3>
         <p>Upload <code>.proto</code> schemas, bind them to key prefixes, and
-        every value written there is validated protobuf — with server-side
-        field access, JSON projection, and <strong>field-level CRDT merge</strong>:
-        concurrent writes to different fields both survive.</p>
+        validate values on write. Access individual fields, read JSON projections,
+        and merge concurrent edits to different fields with field-level CRDTs.</p>
       </div>
       <div class="feat card">
         <div class="feat-ico">☸</div>
-        <h3>Kubernetes-native</h3>
+        <h3>Kubernetes deployment</h3>
         <p>Gossip membership, DNS-seeded discovery, a StatefulSet, and a
-        <code>MarekvsCluster</code> operator with safe scaling and autoscaling.</p>
+        <code>MarekvsCluster</code> operator manage cluster membership and scaling.</p>
       </div>
       <div class="feat card">
         <div class="feat-ico">λ</div>
         <h3>Lua scripting</h3>
-        <p><code>EVAL</code> / <code>EVALSHA</code> with Redis-grade atomicity
-        when keys co-locate via hash tags. Script <em>effects</em> replicate, never the script.</p>
+        <p>Run <code>EVAL</code> and <code>EVALSHA</code> atomically when keys
+        share a hash tag. The resulting writes replicate to other nodes.</p>
       </div>
     </div>
   </section>
@@ -173,10 +177,11 @@
   <!-- GUARANTEES -->
   <section class="band alt">
     <div class="section-head">
-      <span class="sec-num">03</span><h2>What we promise — and what we don't</h2><div class="rule"></div>
+      <span class="sec-num">03</span><h2>Consistency guarantees</h2><div class="rule"></div>
     </div>
-    <p class="band-lede">marekvs is <strong>AP</strong>: available and partition-tolerant, eventually
-    consistent. These are the guarantees the docs stand behind.</p>
+    <p class="band-lede">MareKVS accepts reads and writes during network partitions.
+    Replicas are eventually consistent; clients on different nodes may read different
+    values until updates converge.</p>
     <div class="card table-card">
       <table class="guarantees">
         <thead><tr><th>Guarantee</th><th>What it means</th></tr></thead>
@@ -191,9 +196,9 @@
       </table>
     </div>
     <p class="fineprint">
-      <strong>Not</strong> linearizable, not CP, no cross-node transactions, no
-      Redis Cluster <code>MOVED</code>/<code>ASK</code> redirects. Two clients on
-      two nodes can briefly read different values. See
+      Guarantees depend on the operating conditions described in the
+      documentation. Cross-node transactions, linearizable reads, and Redis Cluster
+      <code>MOVED</code>/<code>ASK</code> redirects are unsupported. See
       <a href="{{base}}/docs/consistency/">Consistency</a>.
     </p>
   </section>
@@ -201,7 +206,7 @@
   <!-- ARCHITECTURE -->
   <section class="band">
     <div class="section-head">
-      <span class="sec-num">04</span><h2>System shape at a glance</h2><div class="rule"></div>
+      <span class="sec-num">04</span><h2>Cluster architecture</h2><div class="rule"></div>
     </div>
     <div class="card diagram-card">
 <pre class="ascii"><code>          Redis clients (redis-cli, any RESP driver)
@@ -218,15 +223,14 @@
       └────────┘     └────────┘     └────────┘
            └──────── chitchat gossip ─────────┘  :7946/udp</code></pre>
     </div>
-    <p class="band-lede">Five subsystems per node — RESP frontend, command engine,
-    disk-native storage (ondaDB LSM), replication engine, and the gossip cluster
-    layer. <a href="{{base}}/docs/architecture/">Read the architecture →</a></p>
+    <p class="band-lede">Each node runs a RESP frontend, command engine,
+    ondaDB storage engine, replication engine, and gossip membership layer. <a href="{{base}}/docs/architecture/">Read the architecture →</a></p>
   </section>
 
   <!-- PERFORMANCE -->
   <section class="band alt">
     <div class="section-head">
-      <span class="sec-num">05</span><h2>Honest about performance</h2><div class="rule"></div>
+      <span class="sec-num">05</span><h2>Performance targets and measurements</h2><div class="rule"></div>
     </div>
     <div class="stat-row">
       <div class="stat card"><div class="stat-num">~100µs</div><div class="stat-lbl">GET p50 target</div></div>
@@ -235,18 +239,18 @@
       <div class="stat card"><div class="stat-num">4096</div><div class="stat-lbl">fixed partitions</div></div>
     </div>
     <p class="fineprint">
-      marekvs is <strong>disk-native</strong> and pays a convergent-merge tax, so
-      it trades raw throughput for durability and coordination-free scale. In the
-      KeyDB comparison harness it lands around 0.4–0.6× of an in-RAM store —
-      by design, with the full methodology in
-      <a href="{{base}}/docs/performance/">Performance</a>.
+      The latency and throughput figures above are design targets. In the
+      documented single-node benchmark, MareKVS reached 0.38–0.59× KeyDB’s
+      throughput while persisting writes; KeyDB ran with persistence disabled.
+      These results come from single runs on Docker for macOS. See the
+      <a href="{{base}}/docs/performance/">measurements and methodology</a>.
     </p>
   </section>
 
   <!-- QUICKSTART -->
   <section class="band">
     <div class="section-head">
-      <span class="sec-num">06</span><h2>Up in one command</h2><div class="rule"></div>
+      <span class="sec-num">06</span><h2>Run a local node</h2><div class="rule"></div>
     </div>
     <div class="quick-grid">
       <div class="card quick-card">
@@ -258,11 +262,11 @@
 redis-cli -p 6379 ping   # PONG</code></pre>
       </div>
       <div class="card quick-card">
-        <span class="label">What you get</span>
+        <span class="label">Local endpoints and cluster setup</span>
         <ul class="quick-list">
           <li>A Redis-compatible endpoint on <code>:6379</code></li>
           <li>Health + Prometheus metrics on <code>:9121</code></li>
-          <li>Scale to 3 nodes with one env var — <a href="{{base}}/docs/quickstart/">see the guide</a></li>
+          <li><a href="{{base}}/docs/quickstart/">Follow the guide to configure a three-node cluster</a></li>
         </ul>
         <a class="btn btn-primary" href="{{base}}/docs/quickstart/">Full quickstart →</a>
       </div>
@@ -271,11 +275,11 @@ redis-cli -p 6379 ping   # PONG</code></pre>
 
   <section class="cta">
     <div class="cta-inner card">
-      <h2>Ready to dive in?</h2>
-      <p>Start with the overview, or jump straight to the API reference.</p>
+      <h2>Build with MareKVS</h2>
+      <p>Read the deployment guide and supported commands before connecting your application.</p>
       <div class="hero-cta">
         <a class="btn btn-primary" href="{{base}}/docs/overview/">Read the docs</a>
-        <a class="btn btn-ghost" href="{{github}}" target="_blank" rel="noopener">Star on GitHub ↗</a>
+        <a class="btn btn-ghost" href="{{github}}" target="_blank" rel="noopener">View source on GitHub ↗</a>
       </div>
     </div>
   </section>
@@ -286,7 +290,7 @@ redis-cli -p 6379 ping   # PONG</code></pre>
   <div class="sitefoot-inner">
     <div class="foot-brand">
       <img src="{{base}}/assets/brand/marekvs-icon.svg" width="22" height="22" alt="">
-      <span><span class="w1">mare</span><span class="w2">kvs</span> — distributed, Redis-compatible KV.</span>
+      <span><span class="w1">mare</span><span class="w2">kvs</span> · Distributed, Redis-compatible storage.</span>
     </div>
     <div class="foot-links">
       <a href="{{base}}/docs/overview/">Documentation</a>

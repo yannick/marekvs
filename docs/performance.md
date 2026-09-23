@@ -1,20 +1,21 @@
 ---
 title: Performance
-description: Latency and throughput targets, the hot paths that keep them, and honest measured numbers against KeyDB.
+description: Latency and throughput targets, storage costs, and benchmark results against KeyDB.
 status: mixed
 ---
 
-marekvs is **disk-native**: every write lands in the [ondaDB](https://github.com/yannick/ondadb)
-LSM engine, not in RAM. That is the whole point — durability and datasets larger
-than memory — and it is also the thing you pay for on the write path. This page
-states the targets, explains how the hot paths stay fast, and reports the
-measured numbers plainly, including where a RAM store beats us.
+MareKVS persists writes through the [ondaDB](https://github.com/yannick/ondadb)
+LSM engine and can store datasets larger than RAM. SSD storage reduces the need
+to provision expensive memory for the full dataset. Caches and write buffers
+still need RAM; their size affects latency and throughput.
+
+This page separates design targets from measured results and describes the
+storage and replication work performed on each request.
 
 ```note
-The comparison numbers below are a **point-in-time** snapshot from the KeyDB
-comparison harness (`just bench` → `bench/report.md`) and are reproducible.
-They are smoke-level — single run per config, Docker-on-macOS — not a paper.
-See [Benchmark methodology](#benchmark-methodology) for the caveats.
+The comparison results are a snapshot from the KeyDB benchmark harness
+(`just bench` → `bench/report.md`). Each configuration was run once in Docker
+on macOS. See [Benchmark methodology](#benchmark-methodology) for limitations.
 ```
 
 ## Targets
@@ -32,7 +33,7 @@ regressions over 10 % fail CI.
 | Remote first-read (fetch + subscribe) | ≤ 2 ms p99 | one ctl RTT + local commit |
 | Bootstrap streaming | ≥ 64 MiB/s/stream sustained | matches the cap in the defaults table |
 
-## Hot paths & how they stay fast
+## Request processing
 
 ### RESP → storage → RESP
 
@@ -95,14 +96,12 @@ shard/tokio boundary and is explicitly deferred.
 
 ## Measured findings vs KeyDB
 
-The `just bench` harness compares single-node marekvs against
-[KeyDB](https://docs.keydb.dev/) — the multithreaded Redis fork — with identical
-`redis-benchmark` workloads. **This is disk vs RAM on purpose.** marekvs persists
-every write into ondaDB (WAL + memtable + compaction) and carries a 19-byte
-envelope through convergent-merge logic so that multi-node replication works;
-KeyDB holds everything in memory with persistence off and does none of that in
-single-node mode. KeyDB *should* win. The interesting question is the margin —
-especially for reads, which marekvs serves from memtable + block cache.
+The `just bench` harness compares single-node MareKVS against
+[KeyDB](https://docs.keydb.dev/) with identical `redis-benchmark` workloads.
+MareKVS persists writes through ondaDB and processes replication metadata.
+KeyDB runs with persistence disabled and holds the dataset in memory.
+These configurations have different durability and memory requirements, which
+should be considered alongside the throughput results.
 
 Geometric mean of throughput ratios (marekvs ÷ KeyDB), from `bench/report.md`:
 
@@ -112,30 +111,25 @@ Geometric mean of throughput ratios (marekvs ÷ KeyDB), from `bench/report.md`:
 | 100 B values, pipeline 16 | 0.38× |
 | 1024 B values, pipeline 1 | 0.55× |
 
-```warning Read these as a fair comparison, not a win
-marekvs trades raw single-node throughput for durability and coordination-free
-multi-node scale. On unpipelined point workloads it lands around 0.55–0.59× of a
-RAM store's throughput while writing every operation to disk. Pipelining widens
-KeyDB's lead (0.38×) because the disk write path has less slack to hide behind.
+```warning Benchmark scope
+On these single-node workloads, MareKVS reached 0.55–0.59× KeyDB throughput
+without pipelining and 0.38× with pipelining. These results do not measure
+multi-node scaling or quantify infrastructure cost savings.
 ```
 
-The per-command shape is uneven and worth reading honestly:
+Results vary by command:
 
-- **Reads and hot writes reach parity.** GET, SADD, HSET, and the PING baselines
-  sit at ~1.00× at P=1 — the block cache serves them as fast as RAM within the
-  Docker-on-macOS ceiling.
-- **Plain SET is ~0.40× (P=1).** Every write hits the LSM plus the envelope/merge
-  path; that gap is the disk-native tax, by design.
-- **Scan-shaped pops are the worst cells.** SPOP ~0.17× and ZPOPMIN ~0.15× (P=1)
-  are dominated by per-op ondaDB iterator construction (see the changelog below).
-- **MSET is ~0.10×.** One command is 10 distributed writes by design, so it is
-  10× the work, not a regression.
+- **GET, SADD, HSET, and PING:** approximately 1.00× KeyDB throughput at P=1
+  within the Docker-on-macOS test environment.
+- **SET:** approximately 0.40× at P=1, including LSM writes and merge processing.
+- **SPOP and ZPOPMIN:** approximately 0.17× and 0.15× at P=1. Iterator construction
+  accounts for much of the overhead; see the optimization history below.
+- **MSET:** approximately 0.10×. Each benchmark command performs ten distributed writes.
 
 ## Optimization changelog
 
-The numbers above are the current state of an ongoing, profile-driven effort.
-The log is kept honest — each round names what the profiler showed and what
-moved.
+The following entries record profiling results and the changes measured after
+each optimization.
 
 ### Round 3 (2026-07-03): profile-driven point-op + list overhaul
 
@@ -195,10 +189,10 @@ applies equally to both.
 - Matrix: 14 command types × {100 B P=1, 100 B P=16, 1 KiB P=1}, 50 clients,
   100 k random-key keyspace, `FLUSHALL` between engines.
 
-```caution Absolute numbers are capped by the rig
+```caution Benchmark environment
 Docker port mapping and the macOS VM hold absolute throughput well below
 bare-metal Linux; only the *relative* comparison is meaningful here. There is one
-run per config and no confidence intervals. For serious numbers: run on Linux
+run per config and no confidence intervals. For deployment sizing, run on Linux
 bare metal, repeat ≥ 5×, and alternate engine order.
 ```
 
@@ -213,4 +207,4 @@ sustained-write soak watching compaction debt, ring occupancy, and p99 drift.
 
 - The guarantees behind the numbers: [Consistency & anti-entropy](../consistency/).
 - How faults are exercised: [Testing](../testing/).
-- The system shape: [Architecture](../architecture/).
+- System components: [Architecture](../architecture/).

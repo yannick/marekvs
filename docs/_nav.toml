@@ -3,7 +3,7 @@
 
 [site]
 title = "marekvs"
-tagline = "Data that moves like the tide."
+tagline = "Grow your dataset. Keep RAM costs down."
 github = "https://github.com/yannick/marekvs"
 # Base path for a GitHub Pages *project* site (e.g. "/marekvs"). Leave empty for
 # a user/org or custom-domain site; override at build time with DOCS_BASE.

@@ -1,31 +1,31 @@
 ---
 title: Overview
-description: What marekvs is, what it guarantees, and what it deliberately is not.
+description: MareKVS storage, replication, consistency guarantees, and Redis compatibility.
 status: mixed
 ---
 
-**marekvs** is a distributed key-value database with a **Redis-compatible API**,
-written in Rust. It is **AP by design** — available and partition-tolerant,
-eventually consistent, and coordination-free — and **disk-native**: it stores
-everything in the [ondaDB](https://github.com/yannick/ondadb) LSM engine rather
-than keeping the dataset in RAM.
+**MareKVS** is a distributed key-value database written in Rust with a
+**Redis-compatible API**. It stores data on SSD through the
+[ondaDB](https://github.com/yannick/ondadb) LSM engine. The full dataset does not
+need to fit in RAM, reducing the memory capacity required as data grows.
+RAM supports the block cache, write buffers, and database operations.
 
-You talk to it with `redis-cli` or any RESP driver. Underneath, there is no
-leader, no quorum, and no consensus protocol on the data path. Writes are
-fire-and-forget and converge through hybrid logical clocks and CRDT-style
-merges. Any node can serve any key.
+Connect with `redis-cli` or a RESP driver. Any node can serve any key.
+Writes replicate asynchronously, and hybrid logical clocks and CRDT merge
+rules reconcile concurrent updates. The database prioritizes availability
+during network partitions and provides eventual consistency.
 
-## What it is
+## Features
 
-- **A Redis protocol front-end** — RESP2 and RESP3 over `:6379`, with strings,
+- **Redis protocol support:** RESP2 and RESP3 on port `6379`, with strings,
   hashes, sets, sorted sets, lists, streams, pub/sub, and HyperLogLog.
-- **A convergent replicated store** — concurrent writes on different nodes merge
-  deterministically instead of one clobbering the other.
-- **Demand-driven replication** — a node that reads a remote key caches it and
-  subscribes to its updates, so hot data spreads to where it is used.
-- **Kubernetes-native** — gossip membership, a StatefulSet, and an operator that
-  scales the cluster without losing data.
-- **Tiny** — a static binary in a `FROM scratch` container image.
+- **Convergent replication:** deterministic merge rules reconcile concurrent
+  writes according to each data type’s semantics.
+- **Demand-driven replication:** a node that reads a remote key caches it and
+  subscribes to updates.
+- **Kubernetes deployment:** gossip membership, StatefulSets, and a cluster
+  operator support discovery and scaling.
+- **Container packaging:** a static binary in a `FROM scratch` image.
 
 ## Document review over the Redis protocol
 
@@ -39,32 +39,30 @@ Use it for version review or reconciling edited branches. Start with the
 [complete review example](../diff/#try-a-complete-review), or browse the
 [command reference](../redis-api/#document-comparison-marekvs-extension).
 
-## Goals
+## Design goals
 
-1. **Redis-compatible API** — drop-in for the command subset we implement.
-2. **Disk-native** — durability and datasets larger than RAM, via ondaDB.
-3. **Dynamic, interest-based replication** — replicate what is actually read.
-4. **Fire-and-forget writes** — no synchronous cross-node round-trips on the hot path.
-5. **Bounded staleness** — divergence heals within seconds, not "eventually."
-6. **Kubernetes elasticity** — nodes join and leave; the cluster rebalances safely.
-7. **Performance first** — per-key lock-free RMW on shard threads.
-8. **Minimal images** — an OS-less static binary.
+1. **Client compatibility:** support existing Redis clients for the implemented commands.
+2. **Storage capacity:** persist datasets larger than RAM through ondaDB.
+3. **Local reads:** cache remote keys where applications read them.
+4. **Asynchronous replication:** avoid synchronous cross-node round trips on writes.
+5. **Replica repair:** limit divergence through background anti-entropy.
+6. **Cluster scaling:** redistribute data as nodes join and leave.
+7. **Command performance:** serialize per-key read-modify-write operations on shard threads.
+8. **Small deployments:** ship a static binary without a base operating system image.
 
-## Non-goals
+## Compatibility limits
 
-marekvs deliberately does **not** try to be everything Redis is:
-
-- **Not linearizable / not CP.** There are no quorum reads or writes and no Raft
-  for data. Two clients on two nodes can briefly read different values.
-- **Not the Redis Cluster protocol.** No `MOVED` / `ASK` redirects, no slot map.
-- **No TLS and no ACLs** beyond `AUTH` with a single password.
-- **No RDB/AOF file compatibility.** Recovery is via replication and
-  anti-entropy, not by loading a Redis dump.
+- **Consistency:** reads and writes do not use quorums. Two clients on different
+  nodes may observe different values until replicas converge.
+- **Redis Cluster:** `MOVED` / `ASK` redirects and client-side slot routing are unsupported.
+- **Access control:** authentication uses a single password. TLS and ACLs are unsupported.
+- **Persistence format:** Redis RDB/AOF files are unsupported. Recovery uses
+  ondaDB storage, replication, and anti-entropy.
 
 ## Published guarantees
 
-These are the promises the rest of the docs stand behind. They hold **per
-connection** unless stated otherwise.
+These guarantees apply **per connection** unless stated otherwise, under the
+operating conditions documented in [Consistency & anti-entropy](../consistency/).
 
 | Guarantee | What it means |
 |---|---|
@@ -73,17 +71,17 @@ connection** unless stated otherwise.
 | Convergence | With no new writes, every replica reaches the same value. |
 | Exact counters | Concurrent `INCR`/`DECR` across nodes are never lost (an explicit `SET` resets). |
 | Bounded staleness | Cross-node divergence heals within seconds; **15 s worst case**, milliseconds typical. |
-| No resurrection | A deleted key stays deleted — tombstones outlive the repair window. |
+| No resurrection | Tombstones prevent deleted values from returning during the repair window. |
 | TTL convergence | Expiry is decided once at the origin and converges cluster-wide. |
 | Durability | ondaDB WAL; a crash may lose only the last fsync window on that one node. |
 
 ```note
-"Bounded staleness" is a real, derived number — not a hope. The derivation lives
-in [Consistency & anti-entropy](../consistency/), and the assumptions behind it are
-tracked by the chaos test suite.
+The staleness bound depends on repair intervals and operating conditions.
+See [Consistency & anti-entropy](../consistency/) for the derivation and the
+assumptions checked by the chaos test suite.
 ```
 
-## System shape at a glance
+## Cluster architecture
 
 ```text
           Redis clients (redis-cli, any RESP driver)
@@ -101,7 +99,7 @@ tracked by the chaos test suite.
                                                   :9121 metrics + health
 ```
 
-Each node runs five subsystems — a RESP frontend, a shard-threaded command
+Each node runs five subsystems: a RESP frontend, a shard-threaded command
 engine, disk-native storage, a replication engine, and the gossip cluster layer.
 The [architecture](../architecture/) page walks through each one.
 
@@ -113,12 +111,11 @@ The [architecture](../architecture/) page walks through each one.
 | **Home replicas** | The `N` nodes that own a partition by rendezvous hashing. |
 | **Interest replica** | A node caching a key it read but does not own. |
 | **Envelope** | The 19-byte per-record header (flags, HLC, origin, TTL). |
-| **HLC** | Hybrid logical clock — a packed `[physical ms | logical]` timestamp. |
+| **HLC** | Hybrid logical clock; a packed `[physical ms | logical]` timestamp. |
 | **Tombstone** | A delete marker retained for `gc_grace` to prevent resurrection. |
 
 ## Where to go next
 
-- New here? Continue to the [Quickstart](../quickstart/).
-- Want the internals? Start with the [Architecture](../architecture/), then the
-  [Data model](../data-model/).
-- Looking for a command? Jump to the [Redis API reference](../redis-api/).
+- Run a local node with the [Quickstart](../quickstart/).
+- Read the [Architecture](../architecture/) and [Data model](../data-model/).
+- Look up supported commands in the [Redis API reference](../redis-api/).
