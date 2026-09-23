@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{title}}</title>
-<meta name="description" content="MareKVS is a distributed, Redis-compatible database that stores data on SSD, reducing the RAM required for large datasets.">
+<meta name="description" content="MareKVS combines SSD-backed storage with JSON and Protobuf CRDTs, Redis-compatible clients, and partition-safe distributed budgets.">
 <link rel="icon" type="image/svg+xml" href="{{base}}/assets/brand/favicon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -61,17 +61,18 @@
           MareKVS is a distributed, Redis-compatible database that stores data
           on <strong>SSD</strong>. Your full dataset doesn’t need to fit in
           expensive RAM, helping you control infrastructure costs as it grows.
-          Connect with your existing Redis clients and read or write through any node.
+          Use JSON and Protobuf CRDTs for concurrent updates, plus distributed
+          budgets that cannot overspend during a network partition.
         </p>
         <div class="hero-cta">
           <a class="btn btn-primary" href="{{base}}/docs/quickstart/">Get started</a>
           <a class="btn btn-ghost" href="{{github}}" target="_blank" rel="noopener">View on GitHub ↗</a>
         </div>
         <div class="hero-chips">
-          <span class="chip">RESP2 + RESP3</span>
-          <span class="chip">:6379</span>
-          <span class="chip"><code>FROM scratch</code> image</span>
-          <span class="chip">Kubernetes operator</span>
+          <span class="chip">JSON CRDTs</span>
+          <span class="chip">Protobuf CRDTs</span>
+          <span class="chip">Escrow budgets</span>
+          <span class="chip">Redis protocol</span>
         </div>
       </div>
       <div class="hero-art">
@@ -93,51 +94,57 @@
   <!-- FEATURES -->
   <section class="band">
     <div class="section-head">
-      <span class="sec-num">01</span><h2>Storage and replication</h2><div class="rule"></div>
+      <span class="sec-num">01</span><h2>Structured data that survives concurrent writes</h2><div class="rule"></div>
     </div>
-    <p class="band-lede"><strong>Reduce memory costs with SSD storage.</strong>
-    Store datasets larger than RAM on SSD. Memory supports active reads, write
-    buffers, and database operations, so you can size RAM for your workload
-    without keeping the entire dataset in memory.</p>
+    <p class="band-lede">MareKVS stores JSON documents and Protobuf messages as
+    fine-grained CRDT records. Updates to different fields merge instead of
+    replacing an entire document. Escrow-based budgets protect quantities that
+    must never exceed a fixed limit.</p>
     <div class="feature-grid">
       <div class="feat card">
+        <div class="feat-ico">{ }</div>
+        <h3>JSON document CRDTs</h3>
+        <p>Use the RedisJSON command surface with one CRDT record per path.
+        Concurrent edits to different fields survive, and concurrent array
+        appends converge without interleaving each writer’s run.</p>
+        <a href="{{base}}/docs/json/">Explore JSON commands →</a>
+      </div>
+      <div class="feat card">
+        <div class="feat-ico">⬢</div>
+        <h3>Protobuf field CRDTs</h3>
+        <p>Register schemas, bind message types to key prefixes, and validate
+        writes on the server. Concurrent updates to different message fields
+        merge; repeated fields and maps use CRDT semantics.</p>
+        <a href="{{base}}/docs/protobuf/">Explore Protobuf values →</a>
+      </div>
+      <div class="feat card">
+        <div class="feat-ico">◉</div>
+        <h3>Distributed budgets</h3>
+        <p>Reserve and commit capacity from any node. Escrow accounting prevents
+        overspending through partitions and crashes; unsafe reservations fail
+        closed instead of exceeding the budget.</p>
+        <a href="{{base}}/docs/budget/">Explore budget commands →</a>
+      </div>
+      <div class="feat card">
+        <div class="feat-ico">▤</div>
+        <h3>SSD-backed datasets</h3>
+        <p>Keep datasets larger than RAM on SSD. Size memory for active reads,
+        write buffers, and database operations without holding every value in
+        process memory.</p>
+      </div>
+      <div class="feat card">
         <div class="feat-ico">◆</div>
-        <h3>Redis protocol</h3>
-        <p>RESP2 &amp; RESP3 over the same <code>:6379</code> your clients already
-        use. Strings, hashes, sets, sorted sets, lists, streams, pub/sub,
-        HyperLogLog, JSON documents.</p>
+        <h3>Redis client compatibility</h3>
+        <p>Connect over RESP2 or RESP3 on port <code>6379</code>. Use supported
+        string, hash, set, sorted-set, list, stream, pub/sub, HyperLogLog,
+        JSON, Protobuf, and budget commands.</p>
       </div>
       <div class="feat card">
         <div class="feat-ico">⇄</div>
         <h3>Convergent replication</h3>
-        <p>Hybrid logical clocks and CRDT merge rules reconcile concurrent writes.
-        Set additions and counter increments made on different nodes merge when
-        replicas exchange updates.</p>
-      </div>
-      <div class="feat card">
-        <div class="feat-ico">◎</div>
-        <h3>Dynamic replication</h3>
-        <p>Any node serves any key. Read a remote key and the node caches it and
-        subscribes to its updates. Frequently read data stays close to its readers.</p>
-      </div>
-      <div class="feat card">
-        <div class="feat-ico">⬢</div>
-        <h3>Protobuf schema store</h3>
-        <p>Upload <code>.proto</code> schemas, bind them to key prefixes, and
-        validate values on write. Access individual fields, read JSON projections,
-        and merge concurrent edits to different fields with field-level CRDTs.</p>
-      </div>
-      <div class="feat card">
-        <div class="feat-ico">☸</div>
-        <h3>Kubernetes deployment</h3>
-        <p>Gossip membership, DNS-seeded discovery, a StatefulSet, and a
-        <code>MarekvsCluster</code> operator manage cluster membership and scaling.</p>
-      </div>
-      <div class="feat card">
-        <div class="feat-ico">λ</div>
-        <h3>Lua scripting</h3>
-        <p>Run <code>EVAL</code> and <code>EVALSHA</code> atomically when keys
-        share a hash tag. The resulting writes replicate to other nodes.</p>
+        <p>Any node serves any key. Hybrid logical clocks and data-type-specific
+        CRDT merge rules reconcile concurrent writes as replicas exchange
+        updates.</p>
       </div>
     </div>
   </section>

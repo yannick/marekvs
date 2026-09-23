@@ -1,6 +1,6 @@
 ---
 title: Overview
-description: MareKVS storage, replication, consistency guarantees, and Redis compatibility.
+description: SSD-backed storage with JSON and Protobuf CRDTs, distributed budgets, Redis compatibility, and convergent replication.
 status: mixed
 ---
 
@@ -17,6 +17,12 @@ during network partitions and provides eventual consistency.
 
 ## Features
 
+- **JSON document CRDTs:** use the RedisJSON command surface while storing each
+  path separately, so concurrent edits to different fields survive.
+- **Protobuf field CRDTs:** register schemas, validate typed values, and merge
+  concurrent updates at field level instead of replacing the whole message.
+- **Distributed budgets:** reserve capacity from any node with escrow accounting
+  that prevents overspending during partitions and crashes.
 - **Redis protocol support:** RESP2 and RESP3 on port `6379`, with strings,
   hashes, sets, sorted sets, lists, streams, pub/sub, and HyperLogLog.
 - **Convergent replication:** deterministic merge rules reconcile concurrent
