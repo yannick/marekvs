@@ -6,10 +6,12 @@
 //! and awaits a oneshot.
 
 pub mod expiry;
+pub mod layout;
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
 use crossbeam_channel::{Receiver, Sender};
 use marekvs_core::envelope::{head, Envelope, RecordType};
 use marekvs_core::ikey::{self, Pid, Tag};
@@ -396,7 +398,15 @@ impl Store {
             cfg.node_id,
             ikey::LIST_POS_STRIDE.trailing_zeros(),
         );
-        let mut opts = Options::new(&cfg.data_dir);
+        // The database lives one level below the data directory (a volume
+        // mount root in every deployment) so ondaDB can swap it by rename; a
+        // ≤ 0.3.4 flat layout is moved there first. See `layout`.
+        let db_dir = layout::prepare(std::path::Path::new(&cfg.data_dir))
+            .with_context(|| format!("preparing data directory {}", cfg.data_dir))?;
+        let db_dir = db_dir
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("data directory {} is not UTF-8", cfg.data_dir))?;
+        let mut opts = Options::new(db_dir);
         // Pinned, not inherited. These bound resident memory and background IO,
         // and their ondaDB defaults have moved between releases (0.7.0 added a
         // reader count bound, 0.7.5 a 1 GiB byte bound, and num_flush_threads
