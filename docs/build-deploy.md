@@ -141,7 +141,7 @@ default:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MAREKVS_DATA_DIR` | `.data/n0` | ondaDB data directory (mount a PVC/volume for durability). |
+| `MAREKVS_DATA_DIR` | `.data/n0` | Data directory (mount a PVC/volume for durability). The ondaDB database lives in its `db/` subdirectory — see below. |
 | `MAREKVS_NODE_ID` | hostname ordinal, else `0` | Stable `u16` node id. Unset in a StatefulSet — parsed from the pod hostname (`marekvs-3` → `3`). |
 | `MAREKVS_RESP_ADDR` | `0.0.0.0:6379` | Redis client (RESP2/RESP3) listener. |
 | `MAREKVS_MESH_ADDR` | `0.0.0.0:7373` | Peer replication-mesh listener. |
@@ -160,6 +160,18 @@ A few settings are **live-reconfigurable** at runtime via `CONFIG SET`, without
 a restart: `requirepass`, `lua-time-limit` (alias `busy-reply-threshold`,
 backing `MAREKVS_SCRIPT_TIME_LIMIT_MS`), and `loglevel` (which reloads the
 `RUST_LOG` filter). The environment values are re-applied on the next restart.
+```
+
+```note title="Data directory layout (0.3.5)"
+The ondaDB database lives in `$MAREKVS_DATA_DIR/db`, one level below the
+directory the volume is mounted at. ondaDB's format upgrades rebuild a database
+next to it and swap it in by renaming the directory, which cannot work on a
+mount point. On its first start, 0.3.5 moves a flat (≤ 0.3.4) data directory
+into `db/` by same-filesystem renames — nothing is copied, and a crash mid-move
+is finished by the next start. It refuses to move a database another process
+has open, and refuses a directory holding both layouts. **Rolling back** to
+≤ 0.3.4 after that first start requires moving the contents of `db/` back up
+one level first; an older binary would otherwise start with an empty database.
 ```
 
 ```note title="Licensing"
